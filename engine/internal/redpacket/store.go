@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	storeVersion         = 5
+	storeVersion         = 7
 	unknownProbeInterval = 10 * time.Second
 	offlineProbeInterval = 60 * time.Second
 	livePacketInterval   = 15 * time.Second
@@ -62,28 +62,30 @@ type Monitor struct {
 }
 
 type Event struct {
-	ID               string `json:"id"`
-	MonitorID        string `json:"monitor_id"`
-	AccountID        string `json:"account_id,omitempty"`
-	AccountName      string `json:"account_name,omitempty"`
-	RoomID           string `json:"room_id"`
-	RoomName         string `json:"room_name,omitempty"`
-	StreamerName     string `json:"streamer_name,omitempty"`
-	WebRID           string `json:"web_rid,omitempty"`
-	PacketID         string `json:"packet_id"`
-	Title            string `json:"title,omitempty"`
-	Prize            string `json:"prize,omitempty"`
-	Source           string `json:"source"`
-	DetectedAt       string `json:"detected_at"`
-	DrawAt           string `json:"draw_at,omitempty"`
-	ExpiresAt        string `json:"expires_at,omitempty"`
-	ParticipantCount int    `json:"participant_count,omitempty"`
-	ActualRoomID     string `json:"-"`
-	JoinBoxID        string `json:"-"`
-	AnchorID         string `json:"-"`
-	BoxType          string `json:"-"`
-	SendTime         string `json:"-"`
-	DelayTime        string `json:"-"`
+	ID               string  `json:"id"`
+	MonitorID        string  `json:"monitor_id"`
+	AccountID        string  `json:"account_id,omitempty"`
+	AccountName      string  `json:"account_name,omitempty"`
+	RoomID           string  `json:"room_id"`
+	RoomName         string  `json:"room_name,omitempty"`
+	StreamerName     string  `json:"streamer_name,omitempty"`
+	WebRID           string  `json:"web_rid,omitempty"`
+	PacketID         string  `json:"packet_id"`
+	Title            string  `json:"title,omitempty"`
+	Prize            string  `json:"prize,omitempty"`
+	Source           string  `json:"source"`
+	DetectedAt       string  `json:"detected_at"`
+	DrawAt           string  `json:"draw_at,omitempty"`
+	ExpiresAt        string  `json:"expires_at,omitempty"`
+	ParticipantCount int     `json:"participant_count,omitempty"`
+	TotalDiamonds    float64 `json:"total_diamonds,omitempty"`
+	ShareCount       int     `json:"share_count,omitempty"`
+	ActualRoomID     string  `json:"-"`
+	JoinBoxID        string  `json:"-"`
+	AnchorID         string  `json:"-"`
+	BoxType          string  `json:"-"`
+	SendTime         string  `json:"-"`
+	DelayTime        string  `json:"-"`
 }
 
 // ParticipationRecord is safe audit metadata for one account/event attempt.
@@ -144,12 +146,32 @@ type ParticipationTask struct {
 	EndReason string `json:"end_reason,omitempty"`
 }
 
+// ParticipationTrace is a credential-free native request audit row. Request
+// signatures, URLs, headers, Cookies and raw unfiltered responses are never
+// stored or exposed through this type.
+type ParticipationTrace struct {
+	ID             string            `json:"id"`
+	TaskID         string            `json:"task_id,omitempty"`
+	EventID        string            `json:"event_id"`
+	AccountID      string            `json:"account_id"`
+	AccountName    string            `json:"account_name,omitempty"`
+	Action         string            `json:"action"`
+	Endpoint       string            `json:"endpoint,omitempty"`
+	HTTPStatus     int               `json:"http_status,omitempty"`
+	RequestParams  map[string]string `json:"request_params"`
+	ResponseParams string            `json:"response_params,omitempty"`
+	Error          string            `json:"error,omitempty"`
+	CreatedAt      string            `json:"created_at"`
+}
+
 // ParticipationSettings are safe global limits applied independently to each
 // participation account. Zero keeps the corresponding limit disabled.
 type ParticipationSettings struct {
-	StopAfterJoins  int `json:"stop_after_joins"`
-	CooldownSeconds int `json:"cooldown_seconds"`
-	StopAfterWins   int `json:"stop_after_wins"`
+	StopAfterJoins           int `json:"stop_after_joins"`
+	CooldownSeconds          int `json:"cooldown_seconds"`
+	StopAfterWins            int `json:"stop_after_wins"`
+	DrawResultTimeoutSeconds int `json:"draw_result_timeout_seconds"`
+	MinimumDiamonds          int `json:"minimum_diamonds"`
 }
 
 // Activity is safe sidebar history. It never contains credentials, request
@@ -169,22 +191,24 @@ type file struct {
 	ParticipationRecords  []*ParticipationRecord `json:"participation_records,omitempty"`
 	ParticipationSettings ParticipationSettings  `json:"participation_settings"`
 	ParticipationTasks    []*ParticipationTask   `json:"participation_tasks,omitempty"`
+	ParticipationTraces   []*ParticipationTrace  `json:"participation_traces,omitempty"`
 	Activities            []*Activity            `json:"activities,omitempty"`
 }
 
 type Store struct {
-	mu                 sync.Mutex
-	path               string
-	monitors           map[string]*Monitor
-	events             map[string]*Event
-	participations     map[string]*ParticipationRecord
-	participationTasks map[string]*ParticipationTask
-	settings           ParticipationSettings
-	activities         map[string]*Activity
-	runtime            map[string]context.CancelFunc
-	pool               *accountPool
-	requestRecorder    func(accountID string, requestErr error)
-	eventHandler       func(Event)
+	mu                  sync.Mutex
+	path                string
+	monitors            map[string]*Monitor
+	events              map[string]*Event
+	participations      map[string]*ParticipationRecord
+	participationTasks  map[string]*ParticipationTask
+	participationTraces map[string]*ParticipationTrace
+	settings            ParticipationSettings
+	activities          map[string]*Activity
+	runtime             map[string]context.CancelFunc
+	pool                *accountPool
+	requestRecorder     func(accountID string, requestErr error)
+	eventHandler        func(Event)
 }
 
 type monitorJob struct {
@@ -204,13 +228,15 @@ func NewStore(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("创建红包监测数据目录失败: %w", err)
 	}
 	s := &Store{
-		path:               filepath.Join(dataDir, "red_packet_monitors.json"),
-		monitors:           map[string]*Monitor{},
-		events:             map[string]*Event{},
-		participations:     map[string]*ParticipationRecord{},
-		participationTasks: map[string]*ParticipationTask{},
-		activities:         map[string]*Activity{},
-		runtime:            map[string]context.CancelFunc{},
+		path:                filepath.Join(dataDir, "red_packet_monitors.json"),
+		monitors:            map[string]*Monitor{},
+		events:              map[string]*Event{},
+		participations:      map[string]*ParticipationRecord{},
+		participationTasks:  map[string]*ParticipationTask{},
+		participationTraces: map[string]*ParticipationTrace{},
+		activities:          map[string]*Activity{},
+		runtime:             map[string]context.CancelFunc{},
+		settings:            normalizeParticipationSettings(ParticipationSettings{}),
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -274,11 +300,41 @@ func (s *Store) load() error {
 			s.participationTasks[task.AccountID] = task
 		}
 	}
+	for _, trace := range payload.ParticipationTraces {
+		if trace != nil && trace.ID != "" {
+			s.participationTraces[trace.ID] = trace
+		}
+	}
 	s.settings = normalizeParticipationSettings(payload.ParticipationSettings)
+	migrated := payload.Version < storeVersion
+	deadlineGrace := time.Duration(s.settings.DrawResultTimeoutSeconds) * time.Second
+	for _, record := range s.participations {
+		if !record.Joined || participationDrawTerminal(record.Status) {
+			continue
+		}
+		deadlineText := firstNonEmpty(record.DrawAt, record.ExpiresAt)
+		if deadlineText == "" {
+			if event := s.events[record.EventID]; event != nil {
+				deadlineText = firstNonEmpty(event.DrawAt, event.ExpiresAt)
+			}
+		}
+		deadline, parseErr := time.Parse(time.RFC3339Nano, deadlineText)
+		if parseErr != nil || time.Now().Before(deadline.Add(deadlineGrace)) {
+			continue
+		}
+		record.Status = "draw_error"
+		record.Message = fmt.Sprintf("开奖异常：超过开奖时间 %d 秒仍未获取到结果", s.settings.DrawResultTimeoutSeconds)
+		record.Endpoint = "receive"
+		record.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+		migrated = true
+	}
 	for _, activity := range payload.Activities {
 		if activity != nil && activity.ID != "" && activity.Label != "" {
 			s.activities[activity.ID] = activity
 		}
+	}
+	if migrated {
+		return s.saveLocked()
 	}
 	return nil
 }
@@ -304,6 +360,12 @@ func (s *Store) saveLocked() error {
 		copy := *item
 		participationTasks = append(participationTasks, &copy)
 	}
+	participationTraces := make([]*ParticipationTrace, 0, len(s.participationTraces))
+	for _, item := range s.participationTraces {
+		copy := *item
+		copy.RequestParams = cloneStringMap(item.RequestParams)
+		participationTraces = append(participationTraces, &copy)
+	}
 	activities := make([]*Activity, 0, len(s.activities))
 	for _, item := range s.activities {
 		copy := *item
@@ -312,13 +374,17 @@ func (s *Store) saveLocked() error {
 	sort.Slice(monitors, func(i, j int) bool { return monitors[i].Name < monitors[j].Name })
 	sort.Slice(events, func(i, j int) bool { return events[i].DetectedAt > events[j].DetectedAt })
 	sort.Slice(participations, func(i, j int) bool { return participations[i].UpdatedAt > participations[j].UpdatedAt })
+	sort.Slice(participationTraces, func(i, j int) bool { return participationTraces[i].CreatedAt > participationTraces[j].CreatedAt })
+	if len(participationTraces) > 500 {
+		participationTraces = participationTraces[:500]
+	}
 	sort.Slice(activities, func(i, j int) bool { return activities[i].CreatedAt > activities[j].CreatedAt })
 	if len(activities) > 50 {
 		activities = activities[:50]
 	}
 	payload, err := json.MarshalIndent(file{
 		Version: storeVersion, Monitors: monitors, Events: events, ParticipationRecords: participations,
-		ParticipationSettings: s.settings, ParticipationTasks: participationTasks, Activities: activities,
+		ParticipationSettings: s.settings, ParticipationTasks: participationTasks, ParticipationTraces: participationTraces, Activities: activities,
 	}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("序列化红包监测数据失败: %w", err)
@@ -419,6 +485,18 @@ func normalizeParticipationSettings(settings ParticipationSettings) Participatio
 	if settings.StopAfterWins > 100000 {
 		settings.StopAfterWins = 100000
 	}
+	if settings.DrawResultTimeoutSeconds <= 0 {
+		settings.DrawResultTimeoutSeconds = 10
+	}
+	if settings.DrawResultTimeoutSeconds > 300 {
+		settings.DrawResultTimeoutSeconds = 300
+	}
+	if settings.MinimumDiamonds <= 0 {
+		settings.MinimumDiamonds = 1
+	}
+	if settings.MinimumDiamonds > 1000000 {
+		settings.MinimumDiamonds = 1000000
+	}
 	return settings
 }
 
@@ -487,7 +565,7 @@ func (s *Store) participationStateLocked(accountID string, now time.Time) (Parti
 		if record.Won {
 			wins++
 		}
-		if record.Joined && !record.Won && record.Status != "won" && record.Status != "not_won" {
+		if record.Joined && !record.Won && !participationDrawTerminal(record.Status) {
 			waitingDraws++
 		}
 	}
@@ -529,7 +607,7 @@ func (s *Store) PendingDraws(accountID string) []Event {
 	}
 	items := make([]Event, 0)
 	for _, record := range s.participations {
-		if record.AccountID != accountID || record.TaskID != task.ID || !record.Joined || record.Won || record.Status == "won" || record.Status == "not_won" {
+		if record.AccountID != accountID || record.TaskID != task.ID || !record.Joined || record.Won || participationDrawTerminal(record.Status) {
 			continue
 		}
 		item := Event{
@@ -555,6 +633,15 @@ func (s *Store) PendingDraws(accountID string) []Event {
 	return items
 }
 
+func participationDrawTerminal(status string) bool {
+	switch strings.TrimSpace(status) {
+	case "won", "not_won", "draw_error":
+		return true
+	default:
+		return false
+	}
+}
+
 // ResolveParticipationDraw persists one definitive personal result. It returns
 // true only when the record newly transitions into a confirmed win.
 func (s *Store) ResolveParticipationDraw(eventID, accountID, status, message, award string, attempts int) (bool, error) {
@@ -564,7 +651,7 @@ func (s *Store) ResolveParticipationDraw(eventID, accountID, status, message, aw
 	if record == nil {
 		return false, errors.New("红包参与记录不存在")
 	}
-	if record.Status == "won" || record.Status == "not_won" {
+	if participationDrawTerminal(record.Status) {
 		return false, nil
 	}
 	newWin := status == "won" && !record.Won
@@ -685,6 +772,139 @@ func (s *Store) ParticipationRecords() []ParticipationRecord {
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].UpdatedAt > items[j].UpdatedAt })
 	return items
+}
+
+// RecordParticipationTrace persists only allowlisted request parameters and a
+// recursively redacted JSON response. It must be called before the response is
+// reduced into user-facing participation status.
+func (s *Store) RecordParticipationTrace(task PageParticipationTask, response PageParticipationResponse) error {
+	now := time.Now()
+	sum := sha256.Sum256([]byte(task.AccountID + "\x00" + task.EventID + "\x00" + task.Action + "\x00" + now.Format(time.RFC3339Nano)))
+	params := map[string]string{
+		"aid": "6383", "app_name": "douyin_web", "device_platform": "web", "live_id": "1",
+		"web_rid": task.WebRID, "room_id": task.ActualRoomID, "box_id": task.BoxID,
+	}
+	for key, value := range map[string]string{
+		"anchor_id": task.AnchorID, "box_type": task.BoxType, "send_time": task.SendTime, "delay_time": task.DelayTime,
+	} {
+		if strings.TrimSpace(value) != "" {
+			params[key] = strings.TrimSpace(value)
+		}
+	}
+	trace := &ParticipationTrace{
+		ID: hex.EncodeToString(sum[:12]), EventID: task.EventID, AccountID: task.AccountID,
+		AccountName: strings.TrimSpace(task.AccountName), Action: firstNonEmpty(task.Action, "join"),
+		Endpoint: strings.TrimSpace(response.Endpoint), HTTPStatus: response.HTTPStatus,
+		RequestParams: params, ResponseParams: safeParticipationResponse(response.Body),
+		Error: safeParticipationLogText(response.Error), CreatedAt: now.Format(time.RFC3339Nano),
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if current := s.participationTasks[task.AccountID]; current != nil {
+		trace.TaskID = current.ID
+	}
+	s.participationTraces[trace.ID] = trace
+	return s.saveLocked()
+}
+
+func (s *Store) ParticipationTraces() []ParticipationTrace {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := make([]ParticipationTrace, 0, len(s.participationTraces))
+	for _, trace := range s.participationTraces {
+		copy := *trace
+		copy.RequestParams = cloneStringMap(trace.RequestParams)
+		items = append(items, copy)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt > items[j].CreatedAt })
+	return items
+}
+
+func (s *Store) ClearParticipationTraces() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.participationTraces
+	s.participationTraces = map[string]*ParticipationTrace{}
+	if err := s.saveLocked(); err != nil {
+		s.participationTraces = previous
+		return err
+	}
+	return nil
+}
+
+func cloneStringMap(source map[string]string) map[string]string {
+	copy := make(map[string]string, len(source))
+	for key, value := range source {
+		copy[key] = value
+	}
+	return copy
+}
+
+func safeParticipationResponse(body string) string {
+	if strings.TrimSpace(body) == "" {
+		return ""
+	}
+	var payload any
+	if json.Unmarshal([]byte(body), &payload) != nil {
+		return `{"unparsed":true}`
+	}
+	cleaned := sanitizeParticipationValue(payload, 0)
+	encoded, err := json.Marshal(cleaned)
+	if err != nil {
+		return `{"unparsed":true}`
+	}
+	if len(encoded) > 16000 {
+		return `{"truncated":true}`
+	}
+	return string(encoded)
+}
+
+func sanitizeParticipationValue(value any, depth int) any {
+	if depth > 6 {
+		return "[truncated]"
+	}
+	switch item := value.(type) {
+	case map[string]any:
+		cleaned := make(map[string]any, len(item))
+		for key, child := range item {
+			if participationLogKeyForbidden(key) {
+				continue
+			}
+			cleaned[key] = sanitizeParticipationValue(child, depth+1)
+		}
+		return cleaned
+	case []any:
+		limit := len(item)
+		if limit > 100 {
+			limit = 100
+		}
+		cleaned := make([]any, 0, limit)
+		for _, child := range item[:limit] {
+			cleaned = append(cleaned, sanitizeParticipationValue(child, depth+1))
+		}
+		return cleaned
+	case string:
+		return safeParticipationLogText(item)
+	default:
+		return item
+	}
+}
+
+func participationLogKeyForbidden(key string) bool {
+	lower := strings.ToLower(strings.TrimSpace(key))
+	return containsAny(lower, "cookie", "token", "bogus", "signature", "authorization", "session", "csrf", "passport", "header", "device_id", "fingerprint")
+}
+
+func safeParticipationLogText(value string) string {
+	value = strings.TrimSpace(value)
+	lower := strings.ToLower(value)
+	if containsAny(lower, "sessionid", "a_bogus", "mstoken", "cookie:", "authorization:") {
+		return "[已隐藏敏感原生参数]"
+	}
+	if len(value) > 1000 {
+		return value[:1000] + "…"
+	}
+	return value
 }
 
 func participationRecordID(accountID, eventID string) string {
@@ -1314,6 +1534,10 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 			if packet.participants > 0 {
 				existing.ParticipantCount = packet.participants
 			}
+			if packet.totalDiamonds > 0 && packet.shareCount > 0 {
+				existing.TotalDiamonds = packet.totalDiamonds
+				existing.ShareCount = packet.shareCount
+			}
 			// activity_id is a grouping key and may be a shared non-numeric
 			// business identifier (for example AC2025...). Participation must
 			// use the row's real numeric box_id_str instead.
@@ -1333,7 +1557,8 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 			Source: snapshot.Source, DetectedAt: now,
 			DrawAt: packet.drawAt, ExpiresAt: packet.expiresAt,
 			ParticipantCount: packet.participants,
-			ActualRoomID:     firstNonEmpty(snapshot.ActualRoomID, monitor.ActualRoomID),
+			TotalDiamonds:    packet.totalDiamonds, ShareCount: packet.shareCount,
+			ActualRoomID: firstNonEmpty(snapshot.ActualRoomID, monitor.ActualRoomID),
 			JoinBoxID: firstNonEmpty(packet.boxID, func() string {
 				if validLuckyboxID(packet.id) {
 					return packet.id
@@ -1374,6 +1599,8 @@ type packetMeta struct {
 	id, boxID, title, prize, drawAt, expiresAt string
 	anchorID, boxType, sendTime, delayTime     string
 	participants                               int
+	totalDiamonds                              float64
+	shareCount                                 int
 }
 
 var redMarkers = []string{"红包", "red_packet", "redpacket", "luckybox", "lucky_box", "抢红包", "领红包"}
@@ -1414,6 +1641,7 @@ func extractRedPacket(data map[string]any) (packetMeta, bool) {
 	meta.delayTime = firstPairValue(pairs, "delay_time", "delayTime", "duration", "duration_s")
 	meta.title = firstPairValue(pairs, "title", "display_name", "displayName", "name", "activity_name", "activityName")
 	meta.prize = formatPacketPrize(pairs)
+	meta.totalDiamonds, meta.shareCount = packetDiamondShares(pairs)
 	meta.drawAt = normalizePacketTime(firstPairValue(pairs,
 		"draw_time", "drawTime", "lottery_draw_time", "lotteryDrawTime", "open_time", "openTime",
 	))
@@ -1444,6 +1672,28 @@ func extractRedPacket(data map[string]any) (packetMeta, bool) {
 	}
 	meta.participants = firstPairInt(pairs, "participant_count", "participantCount", "candidate_user_num", "candidateUserNum", "user_count", "userCount")
 	return meta, true
+}
+
+func packetDiamondShares(pairs []pair) (float64, int) {
+	diamondText := firstPositivePairNumber(pairs,
+		"total_diamond_count", "totalDiamondCount", "total_diamond", "totalDiamond",
+		"total_amount", "totalAmount", "total_diamond_num", "totalDiamondNum",
+		"diamond_count", "diamondCount", "diamond_num", "diamondNum", "diamond_amount", "diamondAmount",
+		"diamond", "diamonds", "amount", "content_amount", "contentAmount",
+		"content_diamond_count", "contentDiamondCount", "prize_count", "prizeCount",
+	)
+	shareText := firstPositivePairNumber(pairs,
+		"box_count", "boxCount", "lucky_box_count", "luckyBoxCount", "packet_count", "packetCount",
+		"red_packet_count", "redPacketCount", "redpack_count", "redpackCount",
+		"share_count", "shareCount", "content_count", "contentCount", "content_num", "contentNum", "quantity",
+		"box_num", "boxNum", "lucky_box_num", "luckyBoxNum", "winner_count", "winnerCount", "total_count", "totalCount",
+	)
+	diamonds, diamondErr := strconv.ParseFloat(diamondText, 64)
+	shares64, shareErr := strconv.ParseFloat(shareText, 64)
+	if diamondErr != nil || shareErr != nil || diamonds <= 0 || shares64 <= 0 || shares64 != float64(int(shares64)) {
+		return 0, 0
+	}
+	return diamonds, int(shares64)
 }
 
 func validLuckyboxID(value string) bool {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -13,6 +14,11 @@ import (
 
 	"fubao.ccvar.com/engine/internal/accounts"
 	"fubao.ccvar.com/engine/internal/live/httpclient"
+)
+
+var (
+	packetTotalSharePattern = regexp.MustCompile(`总\s*([0-9]+(?:\.[0-9]+)?)\s*钻\s*[,，]\s*([0-9]+)\s*份`)
+	packetPerSharePattern   = regexp.MustCompile(`每份\s*([0-9]+(?:\.[0-9]+)?)\s*钻`)
 )
 
 const (
@@ -52,6 +58,14 @@ type participationEventBacklogStore interface {
 type participationTaskLifecycleStore interface {
 	GetParticipationState(accountID string, now time.Time) ParticipationState
 	FinishParticipationTask(accountID, reason string) error
+}
+
+type participationSettingsStore interface {
+	GetParticipationSettings() ParticipationSettings
+}
+
+type participationTraceStore interface {
+	RecordParticipationTrace(task PageParticipationTask, response PageParticipationResponse) error
 }
 
 type participationAccountStopper interface {
@@ -190,9 +204,44 @@ func (p *Participant) HandleEvent(event Event) {
 		strings.TrimSpace(event.JoinBoxID) == "" || strings.TrimSpace(event.ActualRoomID) == "" {
 		return
 	}
+	if !p.meetsMinimumDiamonds(event) {
+		return
+	}
 	for _, credential := range p.store.RedPacketParticipationCredentials(time.Now()) {
 		p.dispatch(event, credential)
 	}
+}
+
+func (p *Participant) meetsMinimumDiamonds(event Event) bool {
+	settingsStore, ok := p.recordStore.(participationSettingsStore)
+	if !ok {
+		return true
+	}
+	minimum := settingsStore.GetParticipationSettings().MinimumDiamonds
+	if minimum <= 0 {
+		minimum = 1
+	}
+	perShare, known := eventDiamondsPerShare(event)
+	return !known || perShare >= float64(minimum)
+}
+
+func eventDiamondsPerShare(event Event) (float64, bool) {
+	if event.TotalDiamonds > 0 && event.ShareCount > 0 {
+		return event.TotalDiamonds / float64(event.ShareCount), true
+	}
+	prize := strings.TrimSpace(event.Prize)
+	if matches := packetPerSharePattern.FindStringSubmatch(prize); len(matches) == 2 {
+		value, err := strconv.ParseFloat(matches[1], 64)
+		return value, err == nil && value > 0
+	}
+	if matches := packetTotalSharePattern.FindStringSubmatch(prize); len(matches) == 3 {
+		total, totalErr := strconv.ParseFloat(matches[1], 64)
+		shares, shareErr := strconv.Atoi(matches[2])
+		if totalErr == nil && shareErr == nil && total > 0 && shares > 0 {
+			return total / float64(shares), true
+		}
+	}
+	return 0, false
 }
 
 func (p *Participant) dispatch(event Event, credential accounts.RedPacketParticipationCredential) {
@@ -376,45 +425,76 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 		return
 	}
 	target := drawResultTime(event)
+	timeout := 10 * time.Second
+	if settingsStore, ok := p.recordStore.(participationSettingsStore); ok {
+		seconds := settingsStore.GetParticipationSettings().DrawResultTimeoutSeconds
+		if seconds > 0 {
+			timeout = time.Duration(seconds) * time.Second
+		}
+	}
+	deadline := target.Add(timeout)
 	if delay := time.Until(target); delay > 0 {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
 		<-timer.C
 	}
-	delays := []time.Duration{0, 3 * time.Second, 8 * time.Second, 15 * time.Second, 30 * time.Second, 60 * time.Second}
-	for attempt, delay := range delays {
-		if delay > 0 {
-			time.Sleep(delay)
-		}
+	attempts := 0
+	for time.Now().Before(deadline) {
 		if !p.pageExecutor.Ready(accountID) {
-			return
+			if wait := minDuration(time.Second, time.Until(deadline)); wait > 0 {
+				time.Sleep(wait)
+			}
+			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-		response := p.pageExecutor.Execute(ctx, PageParticipationTask{
+		requestTimeout := time.Until(deadline)
+		if requestTimeout > 25*time.Second {
+			requestTimeout = 25 * time.Second
+		}
+		if requestTimeout <= 0 {
+			break
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		task := PageParticipationTask{
 			Action: "receive", EventID: event.ID, AccountID: accountID, AccountName: accountName,
 			WebRID: event.WebRID, ActualRoomID: event.ActualRoomID, BoxID: event.JoinBoxID, AnchorID: event.AnchorID,
-		})
+		}
+		response := p.pageExecutor.Execute(ctx, task)
 		cancel()
+		attempts++
+		if traceStore, ok := p.recordStore.(participationTraceStore); ok {
+			_ = traceStore.RecordParticipationTrace(task, response)
+		}
 		if response.LoginExpired || response.HTTPStatus == http.StatusUnauthorized || response.HTTPStatus == http.StatusForbidden || containsLoginFailure(strings.ToLower(response.Body)) {
 			p.store.RecordRedPacketParticipation(accountID, "login_expired", "CK 已失效：开奖结果接口返回未登录", false, false, 0, true)
-			return
+			if wait := time.Until(deadline); wait > 0 {
+				time.Sleep(wait)
+			}
+			break
 		}
 		bodyLower := strings.ToLower(response.Body)
 		if response.HTTPStatus == http.StatusTooManyRequests || response.HTTPStatus == 444 || containsAny(bodyLower, "风控", "操作频繁", "rush_spam", "rush_too_often", "验证码") {
 			p.store.RecordRedPacketParticipation(accountID, "risk_control", "开奖结果查询触发风控，账号已进入冷却", false, false, defaultRiskCooldown, false)
-			return
 		}
 		if response.ContextMissing {
-			return
+			if wait := minDuration(time.Second, time.Until(deadline)); wait > 0 {
+				time.Sleep(wait)
+			}
+			continue
 		}
 		if strings.TrimSpace(response.Error) != "" || response.HTTPStatus < 200 || response.HTTPStatus >= 300 {
+			if wait := minDuration(2*time.Second, time.Until(deadline)); wait > 0 {
+				time.Sleep(wait)
+			}
 			continue
 		}
 		outcome := classifyReceiveResponse(response.Body, event.JoinBoxID)
 		if outcome.status == "" {
+			if wait := minDuration(2*time.Second, time.Until(deadline)); wait > 0 {
+				time.Sleep(wait)
+			}
 			continue
 		}
-		newWin, err := drawStore.ResolveParticipationDraw(event.ID, accountID, outcome.status, outcome.message, outcome.award, attempt+1)
+		newWin, err := drawStore.ResolveParticipationDraw(event.ID, accountID, outcome.status, outcome.message, outcome.award, attempts)
 		if err == nil {
 			if accountStore, ok := p.store.(participationDrawAccountStore); ok && (newWin || outcome.status == "not_won") {
 				accountStore.RecordRedPacketDrawResult(accountID, outcome.message, newWin)
@@ -424,6 +504,24 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 		}
 		return
 	}
+	message := fmt.Sprintf("开奖异常：超过开奖时间 %d 秒仍未获取到结果", int(timeout/time.Second))
+	if traceStore, ok := p.recordStore.(participationTraceStore); ok {
+		_ = traceStore.RecordParticipationTrace(PageParticipationTask{
+			Action: "receive_timeout", EventID: event.ID, AccountID: accountID, AccountName: accountName,
+			WebRID: event.WebRID, ActualRoomID: event.ActualRoomID, BoxID: event.JoinBoxID, AnchorID: event.AnchorID,
+		}, PageParticipationResponse{Endpoint: "receive", Error: message, Attempts: attempts})
+	}
+	if _, err := drawStore.ResolveParticipationDraw(event.ID, accountID, "draw_error", message, "", attempts); err == nil {
+		p.retryCurrentEventsForAccount(accountID)
+		p.finishTaskIfComplete(accountID)
+	}
+}
+
+func minDuration(first, second time.Duration) time.Duration {
+	if first < second {
+		return first
+	}
+	return second
 }
 
 func (p *Participant) finishTaskIfComplete(accountID string) {
@@ -473,7 +571,7 @@ func (p *Participant) retryCurrentEventsForAccount(accountID string) {
 func drawResultTime(event Event) time.Time {
 	for _, value := range []string{event.DrawAt, event.ExpiresAt} {
 		if parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value)); err == nil {
-			return parsed.Add(3 * time.Second)
+			return parsed
 		}
 	}
 	return time.Now().Add(5 * time.Second)
@@ -617,7 +715,7 @@ func (p *Participant) attempt(event Event, credential accounts.RedPacketParticip
 func (p *Participant) attemptInPage(event Event, credential accounts.RedPacketParticipationCredential) participationResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
-	response := p.pageExecutor.Execute(ctx, PageParticipationTask{
+	task := PageParticipationTask{
 		Action:       "join",
 		EventID:      event.ID,
 		AccountID:    credential.AccountID,
@@ -629,7 +727,11 @@ func (p *Participant) attemptInPage(event Event, credential accounts.RedPacketPa
 		BoxType:      strings.TrimSpace(event.BoxType),
 		SendTime:     strings.TrimSpace(event.SendTime),
 		DelayTime:    strings.TrimSpace(event.DelayTime),
-	})
+	}
+	response := p.pageExecutor.Execute(ctx, task)
+	if traceStore, ok := p.recordStore.(participationTraceStore); ok {
+		_ = traceStore.RecordParticipationTrace(task, response)
+	}
 	if response.ContextMissing {
 		return participationResult{
 			status: "context_required", message: firstNonEmpty(response.Error, "请先在浏览器实例中启用红包参与页面"),

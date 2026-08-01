@@ -148,6 +148,78 @@ func TestParticipationSettingsPolicyAndActivityPersist(t *testing.T) {
 	}
 }
 
+func TestParticipationSettingsDefaultDrawTimeoutAndSafeTrace(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.GetParticipationSettings().DrawResultTimeoutSeconds; got != 10 {
+		t.Fatalf("default draw-result timeout=%d, want 10", got)
+	}
+	if got := store.GetParticipationSettings().MinimumDiamonds; got != 1 {
+		t.Fatalf("default minimum diamonds=%d, want 1", got)
+	}
+	if err := store.RecordParticipationStarted("account-log", "日志账号"); err != nil {
+		t.Fatal(err)
+	}
+	task := PageParticipationTask{
+		Action: "join", EventID: "event-log", AccountID: "account-log", AccountName: "日志账号",
+		WebRID: "123456", ActualRoomID: "700001", BoxID: "7669063194534955828", AnchorID: "anchor",
+	}
+	response := PageParticipationResponse{
+		Endpoint: "join", HTTPStatus: 200,
+		Body: `{"status_code":0,"data":{"succeed":true,"diamond_count":8,"msToken":"secret-token","nested":{"a_bogus":"secret-sign","cookie":"sessionid=secret"}}}`,
+	}
+	if err := store.RecordParticipationTrace(task, response); err != nil {
+		t.Fatal(err)
+	}
+	traces := store.ParticipationTraces()
+	if len(traces) != 1 || traces[0].RequestParams["room_id"] != "700001" || traces[0].RequestParams["box_id"] == "" {
+		t.Fatalf("safe request trace missing business params: %+v", traces)
+	}
+	encoded, err := json.Marshal(traces)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"secret-token", "secret-sign", "sessionid=secret", "a_bogus", "msToken"} {
+		if strings.Contains(string(encoded), forbidden) {
+			t.Fatalf("participation trace leaked %q: %s", forbidden, encoded)
+		}
+	}
+}
+
+func TestReloadMigratesOverduePendingDrawToError(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordParticipationStarted("account-overdue", "过期账号"); err != nil {
+		t.Fatal(err)
+	}
+	event := Event{
+		ID: "event-overdue", WebRID: "123456", ActualRoomID: "700001", JoinBoxID: "7669063194534955828",
+		ExpiresAt: time.Now().Add(-20 * time.Second).Format(time.RFC3339Nano),
+	}
+	if reserved, err := store.ReserveParticipation(event, "account-overdue", "过期账号"); err != nil || !reserved {
+		t.Fatalf("reserve overdue event: %v %v", reserved, err)
+	}
+	if err := store.CompleteParticipation(event.ID, "account-overdue", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishParticipationTask("account-overdue", "客户端关闭"); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := reloaded.ParticipationRecords()
+	if len(records) != 1 || records[0].Status != "draw_error" || !strings.Contains(records[0].Message, "10 秒") {
+		t.Fatalf("overdue pending draw was not migrated: %+v", records)
+	}
+}
+
 func TestParticipationPolicyStopsAtJoinAndWinLimits(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {
@@ -361,6 +433,9 @@ func TestAggregateLuckyboxItemsMatchesFubaoPrizeRule(t *testing.T) {
 	if packet.prize != "总99钻，3份红包" {
 		t.Fatalf("unexpected grouped prize: %q (%#v)", packet.prize, items[0])
 	}
+	if packet.totalDiamonds != 99 || packet.shareCount != 3 {
+		t.Fatalf("authoritative diamond/share metadata missing: diamonds=%v shares=%d", packet.totalDiamonds, packet.shareCount)
+	}
 }
 
 func TestExtractRedPacketKeepsActivityForGroupingButUsesNumericBoxForParticipation(t *testing.T) {
@@ -407,6 +482,9 @@ func TestAggregateLuckyboxItemsReadsShareCountFromBizExtraTags(t *testing.T) {
 	}
 	if packet.prize != "总25钻，15份红包" {
 		t.Fatalf("biz_extra share count must match 福包: %q (%#v)", packet.prize, items[0])
+	}
+	if packet.totalDiamonds != 25 || packet.shareCount != 15 {
+		t.Fatalf("biz_extra diamond/share metadata missing: diamonds=%v shares=%d", packet.totalDiamonds, packet.shareCount)
 	}
 }
 

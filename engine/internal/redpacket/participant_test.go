@@ -223,6 +223,62 @@ func TestParticipantSkipsEventWithoutExplicitBoxID(t *testing.T) {
 	}
 }
 
+func TestParticipantMinimumDiamondsOnlyBlocksKnownBelowThreshold(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{MinimumDiamonds: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationStarted("account-minimum", "门槛账号"); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeParticipationStore{
+		credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-minimum", Cookie: "sessionid_ss=ok"}},
+		notify:      make(chan struct{}, 1),
+	}
+	poster := &fakePoster{responses: []*http.Response{jsonResponse(200, `{"status_code":0,"data":{"succeed":true}}`)}}
+	participant := newParticipant(store, 1, func(Event, accounts.RedPacketParticipationCredential) signedPoster { return poster }, recordStore)
+
+	participant.HandleEvent(Event{
+		ID: "event-below-minimum", JoinBoxID: "10001", ActualRoomID: "7001",
+		TotalDiamonds: 20, ShareCount: 15,
+	})
+	time.Sleep(20 * time.Millisecond)
+	poster.mu.Lock()
+	belowCalls := poster.calls
+	poster.mu.Unlock()
+	if belowCalls != 0 {
+		t.Fatalf("known %.2f diamonds per share must be blocked by threshold 2, calls=%d", 20.0/15.0, belowCalls)
+	}
+	if records := recordStore.ParticipationRecords(); len(records) != 0 {
+		t.Fatalf("blocked packet must not create a request record: %+v", records)
+	}
+
+	participant.HandleEvent(Event{
+		ID: "event-unknown-amount", JoinBoxID: "10002", ActualRoomID: "7001", Prize: "红包金额待解析",
+	})
+	select {
+	case <-store.notify:
+	case <-time.After(time.Second):
+		t.Fatal("unknown prize amount must remain eligible")
+	}
+	poster.mu.Lock()
+	unknownCalls := poster.calls
+	poster.mu.Unlock()
+	if unknownCalls != 1 {
+		t.Fatalf("unknown prize amount should not be guessed or blocked, calls=%d", unknownCalls)
+	}
+
+	if perShare, known := eventDiamondsPerShare(Event{Prize: "每份3钻"}); !known || perShare != 3 {
+		t.Fatalf("explicit per-share amount not parsed: value=%v known=%v", perShare, known)
+	}
+	if perShare, known := eventDiamondsPerShare(Event{Prize: "总40钻，15份红包"}); !known || perShare != 40.0/15.0 {
+		t.Fatalf("total/share prize not parsed: value=%v known=%v", perShare, known)
+	}
+}
+
 func TestPageParticipantWaitsForPreparedLiveContext(t *testing.T) {
 	store := &fakeParticipationStore{
 		credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-page", AccountName: "页面账号"}},
@@ -492,6 +548,47 @@ func TestReceiveResponseClassification(t *testing.T) {
 				t.Fatalf("unexpected receive classification: %+v", got)
 			}
 		})
+	}
+}
+
+func TestDrawResultTimeoutMarksErrorAndReleasesNextRound(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{DrawResultTimeoutSeconds: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationStarted("account-timeout", "超时账号"); err != nil {
+		t.Fatal(err)
+	}
+	event := Event{
+		ID: "event-timeout", WebRID: "123456", ActualRoomID: "700001", JoinBoxID: "7669063194534955828",
+		ExpiresAt: time.Now().Add(-100 * time.Millisecond).Format(time.RFC3339Nano),
+	}
+	if reserved, err := recordStore.ReserveParticipation(event, "account-timeout", "超时账号"); err != nil || !reserved {
+		t.Fatalf("reserve timeout draw: %v %v", reserved, err)
+	}
+	if err := recordStore.CompleteParticipation(event.ID, "account-timeout", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeParticipationStore{credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-timeout"}}}
+	executor := &fakePageParticipationExecutor{
+		ready:    true,
+		response: PageParticipationResponse{Endpoint: "receive", HTTPStatus: 200, Body: `{"status_code":0,"data":{}}`, Attempts: 1},
+	}
+	participant := NewPageParticipant(store, executor, recordStore)
+	participant.resolveDraw(event, "account-timeout", "超时账号")
+	records := recordStore.ParticipationRecords()
+	if len(records) != 1 || records[0].Status != "draw_error" || !strings.Contains(records[0].Message, "1 秒") {
+		t.Fatalf("draw timeout was not persisted as abnormal: %+v", records)
+	}
+	state := recordStore.GetParticipationState("account-timeout", time.Now())
+	if state.WaitingDraw {
+		t.Fatalf("draw timeout still blocks the next round: %+v", state)
+	}
+	if allowed, _ := recordStore.ParticipationPolicy("account-timeout", time.Now()); !allowed {
+		t.Fatal("draw timeout must release the account for the next round")
 	}
 }
 

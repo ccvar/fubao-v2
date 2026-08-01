@@ -139,6 +139,34 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+#[cfg(windows)]
+fn apply_windows_titlebar_palette(window: &tauri::WebviewWindow) {
+    use windows_sys::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TEXT_COLOR,
+    };
+
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    // COLORREF is encoded as 0x00BBGGRR. Keep native window controls while
+    // matching the warm sidebar/topbar palette used by the web surface.
+    let attributes = [
+        (DWMWA_CAPTION_COLOR, 0x00F7F9FA_u32), // #faf9f7
+        (DWMWA_TEXT_COLOR, 0x00272B2D_u32),    // #2d2b27
+        (DWMWA_BORDER_COLOR, 0x00DFE5E8_u32),  // #e8e5df
+    ];
+    for (attribute, color) in attributes {
+        unsafe {
+            let _ = DwmSetWindowAttribute(
+                hwnd.0,
+                attribute,
+                (&color as *const u32).cast(),
+                std::mem::size_of_val(&color) as u32,
+            );
+        }
+    }
+}
+
 fn setup_system_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "tray-show-main", "打开福宝控制台", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "tray-quit", "彻底退出", true, None::<&str>)?;
@@ -1879,6 +1907,41 @@ async fn open_monitor_log(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn open_participation_log(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("participation-log") {
+        window
+            .show()
+            .map_err(|error| format!("显示参与日志窗口失败：{error}"))?;
+        window
+            .set_focus()
+            .map_err(|error| format!("聚焦参与日志窗口失败：{error}"))?;
+        return Ok(());
+    }
+    let builder = WebviewWindowBuilder::new(
+        &app,
+        "participation-log",
+        WebviewUrl::App("index.html?window=participation-log".into()),
+    )
+    .title("红包参与详细日志")
+    .inner_size(780.0, 560.0)
+    .min_inner_size(460.0, 280.0)
+    .resizable(true)
+    .decorations(true)
+    .center()
+    .focused(true);
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(LogicalPosition::new(15.0, 20.0))
+        .background_color(tauri::webview::Color(255, 255, 255, 255));
+    builder
+        .build()
+        .map(|_| ())
+        .map_err(|error| format!("打开参与日志窗口失败：{error}"))
+}
+
+#[tauri::command]
 async fn open_page_window(app: tauri::AppHandle, view: String) -> Result<(), String> {
     let view = view.trim();
     let title = match view {
@@ -1960,6 +2023,10 @@ pub fn run() {
                 eprintln!("{error}");
             }
             setup_system_tray(app.handle())?;
+            #[cfg(windows)]
+            if let Some(window) = app.get_webview_window("main") {
+                apply_windows_titlebar_palette(&window);
+            }
             #[cfg(debug_assertions)]
             if std::env::var("FUBAO_OPEN_DEVTOOLS").as_deref() == Ok("1") {
                 if let Some(window) = app.get_webview_window("main") {
@@ -1985,6 +2052,7 @@ pub fn run() {
             frontend_log,
             refresh_window_surface,
             open_monitor_log,
+            open_participation_log,
             open_page_window,
             open_live_room,
             close_monitor_log,

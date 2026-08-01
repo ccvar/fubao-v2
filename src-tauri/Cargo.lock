@@ -854,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "fubao-desktop"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "cookie",
  "futures-util",
@@ -868,6 +868,7 @@ dependencies = [
  "tauri-plugin-shell",
  "tokio",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

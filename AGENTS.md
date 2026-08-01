@@ -36,6 +36,8 @@ Single-press dragging and double-press maximize/restore must both work from non-
 
 Keep persistent desktop chrome very compact: the main top bar should stay around 60px high, the primary sidebar navigation should use dense 34px rows with no unnecessary inter-row gaps, and the bottom workspace/status footer should stay around 48px high. Keep page titles near 16px, title-bar and footer icon hover boxes near 24px with minimal internal padding, the sidebar toggle hover box near 22px, and the primary title-bar action near 24px high. In both expanded and collapsed states, the native macOS traffic lights, sidebar toggle, page-title row, and right-side toolbar must share the same horizontal center axis; the subtitle sits on the second line.
 
+Do not append the decorative “本机运行” phrase to any main top-bar subtitle. Browser-instance resource metrics such as CPU and memory remain visible because they carry real runtime data.
+
 Primary sidebar pages support desktop-style detached windows: normal left-click switches the current window, while the row context menu, Command/Ctrl-click, and middle-click open that page in its own native window. Reopening the same page focuses its existing detached window. Detached windows show only the selected business page and share the same Go engine/account store; native child WebViews for browser cards and account login/rebind flows must attach to the invoking page window rather than being hard-coded to `main`.
 
 Use one compact modal-footer button standard across every dialog: right-align actions, use a 30px control height, 8px radius, 6px gap, and content-sized widths with a small minimum; the destructive confirmation dialog follows the same dimensions.
@@ -46,7 +48,9 @@ In the expanded desktop layout, use the same 34px left and right inset for the m
 
 Keep the compact sidebar footer permanently visible at the bottom of the window. The recent-activity list owns the flexible/scrollable space above it; it must never push the footer below the viewport. Do not hide the footer settings button at narrow breakpoints.
 
-The sidebar names its live counters section “数据概览”. A separate “最近活动” section sits below it, reuses the same compact icon-and-copy row language, owns the remaining scrollable space above the fixed footer, and may use clearly local sample entries until a real activity event source is connected.
+The recent-activity section must never render demo or sample events. A fresh local store with no persisted activity shows only the low-contrast text “暂无活动”; real persisted activity replaces that empty state.
+
+The sidebar names its live counters section “数据概览”. A separate “最近活动” section sits below it, reuses the same compact icon-and-copy row language, and owns the remaining scrollable space above the fixed footer.
 
 The DY-KIRO-derived application icon uses a flat pure-white interior tile while preserving transparent outer corners and the original colored artwork. Background replacement must not redraw, resize, move, or simplify the heart line, circular arcs, dots, envelope, coin, highlights, or shadows.
 
@@ -112,6 +116,8 @@ Every explicit browser-card red-packet start creates one independent participati
 
 One participation account may have only one unresolved accepted red packet at a time. Until that packet has a definitive personal draw result, do not send the account into a later red-packet round. Once the result is resolved, re-check the configured cooldown and stop limits, then retry only newer red packets that are still unexpired; result lookup for the accepted packet must remain allowed while join assignment is blocked.
 
+The personal draw-result query has a configurable post-draw timeout in the participation settings, defaulting to 10 seconds. If no definitive matching result is available when that window expires, persist the record as “开奖异常”, release the unresolved-result gate, and continue the current participation task according to its cooldown and stop limits. The participation-record tab exposes a native utility-window log entry matching the room-monitor log affordance. Participation logs may show only safe business request parameters and recursively redacted response JSON; Cookies, tokens, signatures, signed URLs, headers, device fingerprints, and other native credentials must never be persisted in or sent to that log window.
+
 Browser-instance refinements: the identity-row instance tile is 20px. Account names and Douyin IDs expose the shared dark in-app Tooltip only when the rendered text is actually truncated. Cards expose compact icon-only “打开实例” and “关闭实例” actions with shared in-app tooltips; closing always requires the compact confirmation dialog, then destroys the mounted child WebView and removes the card while preserving the account-keyed profile for later reuse. The CK-expired badge keeps its coral surface unchanged on hover and does not add a gray hover fill. The “新建实例” dialog supports multi-select batch creation for eligible participation accounts, while accounts that already own an instance remain excluded.
 
 Each browser-instance identity row may show the number of accounts currently live among that instance account's Douyin follows. Read it through the Go engine with the instance's canonical participation credential, never through frontend Cookie access. Clicking the count opens safe room metadata only: avatar, account name, live title, room number, room identifier, viewer count, and an external room action. Legacy 福宝 discovery/seed-room code and `similar_room_by_anchor` are references for signing and resilient parsing only; similar-room expansion must never be presented as the current account's followed-live list.
@@ -124,7 +130,7 @@ Red-packet prize parsing follows 福宝's luckybox grouping rule: group every bo
 
 The 红包 tab defaults to current, unexpired red packets only. Its tab badge and the main title subtitle count only unexpired red packets. Keep expired records behind a compact right-aligned “历史红包” entry; history mode shows non-current records and provides an equally compact return to current red packets.
 
-Differentiate red-packet kinds in the event list: use a compact faceted gemstone icon for “钻石红包” (never a plain filled rhombus) and retain the gift icon for gift/other red packets. In the “账号与直播间” title subtitle, report the live runtime workload as `x 个房间正在监测` rather than repeating the total canonical room count; the 直播间 tab badge remains the total room count.
+Differentiate red-packet kinds in the event list: use a compact faceted gemstone icon for “钻石红包” (never a plain filled rhombus) and retain the gift icon for gift/other red packets. In the “账号与直播间” title subtitle, report the live runtime workload as `x 个房间正在监测` rather than repeating the total canonical room count; whenever that monitored count is positive, append `y 个正在直播` using only monitored rooms whose current engine-probed live status is live. The 直播间 tab badge remains the total room count.
 
 Expired red-packet rows must say “已过期” instead of freezing the countdown at `00:00`; keep the absolute expiry timestamp beside that label.
 
@@ -140,9 +146,13 @@ Every successful followed-live account snapshot is authoritative only for that a
 
 Windows in-app upgrades follow Pilot/Tauri Updater behavior: launch the NSIS package in passive update mode with `/P /R /UPDATE`, never as a normal installer that shows the “Already Installed” uninstall-choice wizard. Keep the PowerShell update helper hidden, wait for the current client to exit, preserve local application data, and let the installer relaunch the upgraded client.
 
-Keep the native Windows title bar instead of replacing the system minimize/maximize/close controls merely to host the sidebar toggle. On Windows, remove the macOS-only web title strip entirely so primary navigation starts directly below the native title bar. Keep the sidebar toggle inside the main top bar immediately before the page title at the same position in both expanded and collapsed states, with its shared dark Tooltip opening below. Preserve the existing macOS title strip, traffic-light alignment, and right-opening toggle Tooltip.
+Keep the native Windows title bar instead of replacing the system minimize/maximize/close controls merely to host the sidebar toggle. On Windows, remove the macOS-only web title strip entirely so primary navigation starts directly below the native title bar. Keep the sidebar toggle at the far left of the main top bar in both expanded and collapsed states, remove the otherwise adjacent page-title icon so the compact anatomy is unambiguously `sidebar toggle + page title`, and left-align the subtitle with that title. Its shared dark Tooltip opens below. Preserve the existing macOS title strip, traffic-light alignment, page-title icon, and right-opening toggle Tooltip.
+
+On Windows, retain the native caption and system window controls but use DWM caption, text, and border colors that match the warm `--sidebar`/topbar palette. The Windows sidebar and main topbar share that same opaque surface so the native title bar and both web chrome regions read as one continuous Pilot-like frame; do not switch to a custom-drawn Windows title bar merely for this blend.
 
 参与账号拥有持久化的红包接口参与开关，默认关闭；灰色表示关闭、红色表示开启。只有开关开启、CK 有效且不在冷却期的参与账号才能被 Go 引擎分配红包参与任务。参与请求按账号和红包事件幂等去重；关闭开关仅阻止未来分配，不中断已发出的请求。原始 CK 和签名请求始终留在 Go/Rust 原生层。
+
+红包参与设置包含持久化的“最低钻石”门槛，默认 1 钻。只有在红包数据能够可靠给出总钻石数与份数或明确的每份钻石数时，Go 引擎才在原生请求前按每份金额执行门槛；金额未知或信息不完整时不得猜测，也不得因此拦截参与。
 
 红包接口参与必须使用参与账号专属浏览器实例的真实直播页面上下文。实例卡片提供紧凑的红包图标；点击后先将该账号的原生子 WebView 切换到已确认开播的直播间并验证登录，再允许 Go 调度红包参与。`join/rush` 必须由直播页面中的 `bdms.js`/`window.fetch` 生成动态签名，禁止回退到脱离页面上下文的 Go HTTP 直连。页面上下文未准备好时不要创建误导性的参与失败记录；原始 Cookie、签名 URL 和原始接口响应不得进入前端 JavaScript。
 

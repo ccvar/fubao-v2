@@ -115,6 +115,11 @@ button {
   display: none;
 }
 
+.windows-platform .sidebar,
+.windows-platform .topbar {
+  background: var(--sidebar);
+}
+
 .icon-button {
   display: inline-grid;
   width: 34px;
@@ -399,6 +404,14 @@ button {
 
 .recent-activity-row .quick-status {
   padding-top: 1px;
+}
+
+.recent-activity-empty {
+  margin: 0;
+  padding: 4px 10px;
+  color: #aaa69e;
+  font-size: 11px;
+  line-height: 18px;
 }
 
 .recent-activity-copy {

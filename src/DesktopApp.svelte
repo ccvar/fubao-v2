@@ -305,10 +305,27 @@
     updated_at: string;
   };
 
+  type ParticipationTrace = {
+	id: string;
+	task_id?: string;
+	event_id: string;
+	account_id: string;
+	account_name?: string;
+	action: string;
+	endpoint?: string;
+	http_status?: number;
+	request_params: Record<string, string>;
+	response_params?: string;
+	error?: string;
+	created_at: string;
+  };
+
   type ParticipationSettings = {
 	stop_after_joins: number;
 	cooldown_seconds: number;
 	stop_after_wins: number;
+	draw_result_timeout_seconds: number;
+	minimum_diamonds: number;
   };
 
   type SidebarActivity = {
@@ -350,13 +367,6 @@
   const navItems = [
     { key: "browsers" as NavKey, label: "浏览器实例", icon: Browser },
     { key: "accounts" as NavKey, label: "账号与直播间", icon: UserFocus },
-  ];
-
-  const sampleRecentActivityItems = [
-    { id: "sample-red-packet", label: "发现 2 个新红包", time: "刚刚", icon: Gift, tone: "live", view: "accounts" as NavKey },
-    { id: "sample-monitor", label: "星选福利直播间恢复监测", time: "3 分钟前", icon: Radio, tone: "live", view: "accounts" as NavKey },
-    { id: "sample-account", label: "参与账号“川、”恢复可用", time: "12 分钟前", icon: UserCircle, tone: "neutral", view: "accounts" as NavKey },
-    { id: "sample-browser", label: "浏览器实例完成登录同步", time: "18 分钟前", icon: Browser, tone: "neutral", view: "browsers" as NavKey },
   ];
 
   const viewMeta: Record<NavKey, { title: string; subtitle: string }> = {
@@ -410,6 +420,8 @@
 	stop_after_joins: 0,
 	cooldown_seconds: 0,
 	stop_after_wins: 0,
+	draw_result_timeout_seconds: 10,
+	minimum_diamonds: 1,
   };
   let sidebarActivities: SidebarActivity[] = [];
   $: licenseDaysRemaining = getLicenseDaysRemaining(licenseStatus.expires_at);
@@ -474,6 +486,7 @@
   let redPacketEventError = "";
   let redPacketRenderLimit = 300;
   let participationRecords: ParticipationRecord[] = [];
+  let participationRuntimeLogs: ParticipationTrace[] = [];
   let participationRecordsLoading = false;
   let participationRecordError = "";
   let participationRecordRenderLimit = 300;
@@ -571,16 +584,14 @@
   });
   $: monitoringAccounts = accounts.filter((account) => account.roles.includes("monitoring"));
   $: participationAccounts = accounts.filter((account) => account.roles.includes("participation"));
-  $: recentActivityItems = sidebarActivities.length > 0
-	? sidebarActivities.slice(0, 4).map((activity) => ({
+  $: recentActivityItems = sidebarActivities.slice(0, 4).map((activity) => ({
 		id: activity.id,
 		label: activity.label,
 		time: formatMonitorTime(activity.created_at, redPacketClock),
 		icon: activity.kind === "participation_started" ? Gift : Radio,
 		tone: activity.kind === "participation_started" ? "live" : "neutral",
 		view: activity.kind === "participation_started" ? ("browsers" as NavKey) : ("accounts" as NavKey),
-	}))
-	: sampleRecentActivityItems;
+	}));
   $: filteredRooms = rooms.filter((room) => {
     const followAccounts = (room.follow_sources ?? []).map((source) => source.account_name).join(" ");
     const haystack = `${room.name ?? ""} ${room.streamer_name ?? ""} ${room.web_rid ?? ""} ${room.actual_room_id ?? ""} ${room.id} ${followAccounts}`.toLowerCase();
@@ -618,11 +629,14 @@
   $: visibleRooms = sortedRooms.slice(0, roomRenderLimit);
   $: enabledRedPacketMonitors = redPacketMonitors.filter((monitor) => monitor.enabled);
   $: runningRedPacketMonitorCount = enabledRedPacketMonitors.filter((monitor) => redPacketMonitorUiStatus(monitor) === "running").length;
+  $: liveRunningRedPacketMonitorCount = enabledRedPacketMonitors.filter(
+    (monitor) => redPacketMonitorUiStatus(monitor) === "running" && monitor.live_status === "live",
+  ).length;
   $: canStartAnyRedPacketMonitor = enabledRedPacketMonitors.some((monitor) => redPacketMonitorUiStatus(monitor) !== "running");
   $: canStopAnyRedPacketMonitor = runningRedPacketMonitorCount > 0;
 	$: activeRedPacketCount = redPacketEvents.filter((event) => redPacketEventIsActive(event, redPacketClock)).length;
 	$: historicalRedPacketCount = redPacketEvents.length - activeRedPacketCount;
-	$: accountSubtitle = `${activeRedPacketCount} 个红包 · ${runningRedPacketMonitorCount} 个房间正在监测 · ${participationAccounts.length} 个参与 · ${monitoringAccounts.length} 个监测`;
+	$: accountSubtitle = `${activeRedPacketCount} 个红包 · ${runningRedPacketMonitorCount} 个房间正在监测${runningRedPacketMonitorCount > 0 ? ` · ${liveRunningRedPacketMonitorCount} 个正在直播` : ""} · ${participationAccounts.length} 个参与 · ${monitoringAccounts.length} 个监测`;
 	$: expiredParticipationAccountCount = participationAccounts.filter((account) => accountCookieStatus(account, "participation") === "expired").length;
 	$: expiredMonitoringAccountCount = monitoringAccounts.filter((account) => accountCookieStatus(account, "monitoring") === "expired").length;
 	$: scopedRedPacketEvents = redPacketEvents.filter((event) => redPacketHistoryVisible
@@ -796,6 +810,8 @@
 		stop_after_joins: normalizedParticipationSetting(participationSettings.stop_after_joins, 100000),
 		cooldown_seconds: normalizedParticipationSetting(participationSettings.cooldown_seconds, 86400),
 		stop_after_wins: normalizedParticipationSetting(participationSettings.stop_after_wins, 100000),
+		draw_result_timeout_seconds: Math.max(1, normalizedParticipationSetting(participationSettings.draw_result_timeout_seconds, 300)),
+		minimum_diamonds: Math.max(1, normalizedParticipationSetting(participationSettings.minimum_diamonds, 1000000)),
 	};
 	if (!isTauriDesktop()) {
 		participationSettings = next;
@@ -2359,6 +2375,48 @@
     }
   }
 
+  function participationLogStatePayload() {
+	return {
+		logs: participationRuntimeLogs,
+		join: participationRuntimeLogs.filter((item) => item.action === "join").length,
+		receive: participationRuntimeLogs.filter((item) => item.action.startsWith("receive")).length,
+		error: participationRuntimeLogs.filter((item) => item.error || (item.http_status && (item.http_status < 200 || item.http_status >= 300))).length,
+	};
+  }
+
+  async function emitParticipationLogState() {
+	if (!("__TAURI_INTERNALS__" in window)) return;
+	try {
+		await emit("participation-log://state", participationLogStatePayload());
+	} catch {
+		// The native participation-log window may already be closed.
+	}
+  }
+
+  async function loadParticipationRuntimeLogs() {
+	if (!engineListenerReady) return;
+	try {
+		participationRuntimeLogs = await engineRequest<ParticipationTrace[]>("red_packet_participation.logs");
+		void emitParticipationLogState();
+	} catch {
+		// Keep the last safe trace snapshot during a transient engine refresh.
+	}
+  }
+
+  async function openParticipationRuntimeLog() {
+	if (!("__TAURI_INTERNALS__" in window)) {
+		showToast("参与日志窗口仅支持桌面端");
+		return;
+	}
+	try {
+		await loadParticipationRuntimeLogs();
+		await invoke("open_participation_log");
+		window.setTimeout(() => void emitParticipationLogState(), 120);
+	} catch (error) {
+		showToast(error instanceof Error ? error.message : String(error));
+	}
+  }
+
   async function loadRedPacketMonitors(force = false) {
     if (redPacketMonitorsLoading && !force) return;
     const requestSeq = ++redPacketMonitorListRequestSeq;
@@ -2422,6 +2480,7 @@
     if (record.status === "pending") return { label: "等待中", tone: "pending" };
     if (record.status === "won") return { label: record.award ? `已中${record.award}` : "已中奖", tone: "success" };
     if (record.status === "not_won") return { label: "未中奖", tone: "muted" };
+    if (record.status === "draw_error") return { label: "开奖异常", tone: "warning" };
     if (record.status === "joined") return { label: "参与成功", tone: "success" };
     if (record.status === "already_joined") return { label: "已参与", tone: "success" };
     if (record.status === "risk_control") return { label: "风控冷却", tone: "warning" };
@@ -3232,6 +3291,8 @@
     let unlistenEngine: (() => void) | undefined;
     let unlistenMonitorLogReady: (() => void) | undefined;
     let unlistenMonitorLogClear: (() => void) | undefined;
+    let unlistenParticipationLogReady: (() => void) | undefined;
+    let unlistenParticipationLogClear: (() => void) | undefined;
     let unlistenBrowserWebviewReady: (() => void) | undefined;
     let unlistenBrowserWebviewLoadError: (() => void) | undefined;
     let unlistenUpdateProgress: (() => void) | undefined;
@@ -3266,6 +3327,20 @@
       }).then((unlisten) => {
         unlistenMonitorLogClear = unlisten;
       });
+      void listen("participation-log://ready", () => void emitParticipationLogState()).then((unlisten) => {
+		unlistenParticipationLogReady = unlisten;
+	  });
+      void listen("participation-log://clear", async () => {
+		try {
+			await engineRequest("red_packet_participation.clear_logs");
+			participationRuntimeLogs = [];
+			void emitParticipationLogState();
+		} catch (error) {
+			showToast(error instanceof Error ? error.message : String(error));
+		}
+	  }).then((unlisten) => {
+		unlistenParticipationLogClear = unlisten;
+	  });
       void listen<BrowserWebviewEvent>("browser-webview://ready", (event) => {
         const instanceId = event.payload.instance_id?.trim();
         if (!instanceId) return;
@@ -3315,7 +3390,10 @@
       void loadRedPacketMonitors();
       void loadRedPacketEvents();
 	  void loadSidebarActivities();
-      if (managementTab === "participation-records") void loadParticipationRecords();
+      if (managementTab === "participation-records") {
+		void loadParticipationRecords();
+		void loadParticipationRuntimeLogs();
+	  }
     }, 5000);
     const redPacketClockTimer = window.setInterval(() => {
       redPacketClock = Date.now();
@@ -3361,6 +3439,8 @@
       unlistenEngine?.();
       unlistenMonitorLogReady?.();
       unlistenMonitorLogClear?.();
+      unlistenParticipationLogReady?.();
+      unlistenParticipationLogClear?.();
       unlistenBrowserWebviewReady?.();
       unlistenBrowserWebviewLoadError?.();
       unlistenUpdateProgress?.();
@@ -3442,17 +3522,21 @@
 
     <div class="quick-list sidebar-recent-activity">
       <p class="section-label">最近活动</p>
-      {#each recentActivityItems as activity (activity.id)}
-        <button class="quick-row recent-activity-row" onclick={() => switchView(activity.view)}>
-          <span class:live={activity.tone === "live"} class="quick-status">
-            <svelte:component this={activity.icon} size={14} weight={activity.tone === "live" ? "fill" : "regular"} />
-          </span>
-          <span class="recent-activity-copy">
-            <span>{activity.label}</span>
-            <small>{activity.time}</small>
-          </span>
-        </button>
-      {/each}
+      {#if recentActivityItems.length === 0}
+        <p class="recent-activity-empty">暂无活动</p>
+      {:else}
+        {#each recentActivityItems as activity (activity.id)}
+          <button class="quick-row recent-activity-row" onclick={() => switchView(activity.view)}>
+            <span class:live={activity.tone === "live"} class="quick-status">
+              <svelte:component this={activity.icon} size={14} weight={activity.tone === "live" ? "fill" : "regular"} />
+            </span>
+            <span class="recent-activity-copy">
+              <span>{activity.label}</span>
+              <small>{activity.time}</small>
+            </span>
+          </button>
+        {/each}
+      {/if}
     </div>
 
     <div class="sidebar-footer">
@@ -3547,7 +3631,6 @@
         </div>
         <p data-tauri-drag-region>
           {activeView === "accounts" ? accountSubtitle : browserSubtitle}
-          <span data-tauri-drag-region>·</span>本机运行
           {#if activeView === "browsers"}
             <span data-tauri-drag-region>·</span>
             <span
@@ -3910,6 +3993,12 @@
                   <Pause size={12} weight="fill" />{redPacketBatchAction === "stop" ? "停止中…" : "全部停止"}
                 </button>
               {/if}
+            </div>
+          {:else if managementTab === "participation-records"}
+            <div class="room-monitor-bulk-actions" aria-label="红包参与日志操作">
+              <button class="monitor-log-button" aria-label="查看红包参与详细日志" data-tooltip="查看红包参与详细日志" data-tooltip-placement="top" onclick={openParticipationRuntimeLog}>
+                <TerminalWindow size={13} />
+              </button>
             </div>
           {:else if managementTab === "participation" || managementTab === "monitoring"}
             <div class="menu-anchor filter-anchor account-filter-anchor">
@@ -4457,6 +4546,14 @@
         <label class="participation-setting-row">
           <span><strong>中奖停止</strong><small>累计中奖达到指定次数后，不再分配后续红包任务</small></span>
           <span class="number-field"><input type="number" min="0" max="100000" step="1" bind:value={participationSettings.stop_after_wins} /><em>次</em></span>
+        </label>
+        <label class="participation-setting-row">
+          <span><strong>开奖异常等待</strong><small>超过开奖时间仍未取得结果时，标记开奖异常并继续下一轮</small></span>
+          <span class="number-field"><input type="number" min="1" max="300" step="1" bind:value={participationSettings.draw_result_timeout_seconds} /><em>秒</em></span>
+        </label>
+        <label class="participation-setting-row">
+          <span><strong>最低钻石</strong><small>能明确计算每份红包钻石数时，低于该门槛不参与</small></span>
+          <span class="number-field"><input type="number" min="1" max="1000000" step="1" bind:value={participationSettings.minimum_diamonds} /><em>钻</em></span>
         </label>
       </div>
 

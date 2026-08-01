@@ -803,6 +803,22 @@ func main() {
 				continue
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.ParticipationRecords()})
+		case "red_packet_participation.logs":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.ParticipationTraces()})
+		case "red_packet_participation.clear_logs":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			if err := redPacketStore.ClearParticipationTraces(); err != nil {
+				writeError(encoder, req.ID, "participation_log_clear_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{"cleared": true}})
 		case "red_packet_participation.settings":
 			if redPacketStoreErr != nil {
 				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
