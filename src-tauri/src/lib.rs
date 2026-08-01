@@ -1848,7 +1848,7 @@ async fn open_monitor_log(app: tauri::AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut builder = WebviewWindowBuilder::new(
+    let builder = WebviewWindowBuilder::new(
         &app,
         "monitor-log",
         WebviewUrl::App("index.html?window=monitor-log".into()),
@@ -1862,15 +1862,15 @@ async fn open_monitor_log(app: tauri::AppHandle) -> Result<(), String> {
     .focused(true);
 
     #[cfg(target_os = "macos")]
-    {
+    let builder = {
         // Let the HTML header share the white surface with the native traffic
         // lights instead of showing a second gray title strip.
-        builder = builder
+        builder
             .title_bar_style(tauri::TitleBarStyle::Overlay)
             .hidden_title(true)
             .traffic_light_position(LogicalPosition::new(15.0, 20.0))
-            .background_color(tauri::webview::Color(255, 255, 255, 255));
-    }
+            .background_color(tauri::webview::Color(255, 255, 255, 255))
+    };
 
     builder
         .build()
@@ -1899,7 +1899,7 @@ async fn open_page_window(app: tauri::AppHandle, view: String) -> Result<(), Str
     }
 
     let route = format!("index.html?window=page&view={view}");
-    let mut builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(route.into()))
+    let builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(route.into()))
         .title(format!("福宝控制台 · {title}"))
         .inner_size(1080.0, 720.0)
         .min_inner_size(680.0, 500.0)
@@ -1909,13 +1909,13 @@ async fn open_page_window(app: tauri::AppHandle, view: String) -> Result<(), Str
         .focused(true);
 
     #[cfg(target_os = "macos")]
-    {
-        builder = builder
+    let builder = {
+        builder
             .title_bar_style(tauri::TitleBarStyle::Overlay)
             .hidden_title(true)
             .traffic_light_position(LogicalPosition::new(15.0, 20.0))
-            .background_color(tauri::webview::Color(255, 255, 255, 255));
-    }
+            .background_color(tauri::webview::Color(255, 255, 255, 255))
+    };
 
     builder
         .build()
@@ -2011,6 +2011,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("福宝控制台初始化失败")
         .run(|app, event| match event {
+            #[cfg(target_os = "macos")]
             RunEvent::Reopen { .. } => show_main_window(app),
             RunEvent::Exit => stop_engine(app),
             _ => {}
