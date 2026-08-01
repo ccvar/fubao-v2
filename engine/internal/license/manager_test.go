@@ -73,3 +73,46 @@ func TestActivatePersistsProfessionalStatus(t *testing.T) {
 		t.Fatalf("license state permissions = %o, want 600", info.Mode().Perm())
 	}
 }
+
+func TestActivateFallsBackToProductValidationForLegacyPolicy(t *testing.T) {
+	var validations atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.api+json")
+		switch r.URL.Path {
+		case "/test/machines":
+			w.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(w).Encode(map[string]any{"errors": []any{map[string]any{
+				"detail": "License key authentication is not allowed by policy",
+				"code":   "LICENSE_NOT_ALLOWED",
+			}}})
+		case "/test/licenses/actions/validate-key":
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				t.Fatal(err)
+			}
+			meta, _ := payload["meta"].(map[string]any)
+			scope, _ := meta["scope"].(map[string]any)
+			call := validations.Add(1)
+			valid := call >= 3 && scope["fingerprint"] == nil
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"meta": map[string]any{"valid": valid, "code": map[bool]string{true: "VALID", false: "NO_MACHINES"}[valid]},
+				"data": map[string]any{"id": "license-legacy", "attributes": map[string]any{"metadata": map[string]any{"plan": "专业版"}}},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	m, err := New(t.TempDir(), "0.1.0", Config{Account: "test", Product: "product-1", APIBase: server.URL, HTTPClient: server.Client()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := m.Activate(context.Background(), "LEGACY-LICENSE-KEY-1234", "Legacy Mac")
+	if !result.Success || result.Status.Edition != "专业版" {
+		t.Fatalf("legacy policy fallback failed: %+v", result)
+	}
+	if m.state.MachineID != "" {
+		t.Fatalf("product-only fallback must not invent a machine id: %q", m.state.MachineID)
+	}
+}

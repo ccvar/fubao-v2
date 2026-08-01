@@ -133,6 +133,9 @@ func (m *Manager) Activate(ctx context.Context, key, machineName string) Operati
 		m.saveValidation(key, validation, result{})
 		return Operation{true, "授权已激活。", m.Status()}
 	}
+	if validation.Code == "PRODUCT_SCOPE_MISMATCH" {
+		return Operation{false, validation.message("激活码不属于当前产品。"), m.Status()}
+	}
 	if validation.LicenseID == "" {
 		return Operation{false, validation.message("激活码无效。"), m.Status()}
 	}
@@ -143,11 +146,25 @@ func (m *Manager) Activate(ctx context.Context, key, machineName string) Operati
 			m.saveValidation(key, follow, activation)
 			return Operation{true, "授权已激活。", m.Status()}
 		}
+		// Some legacy Keygen policies deliberately disallow license-key
+		// authentication for machine creation.  The original 福宝 client
+		// treats a successful product-scoped validation as the compatible
+		// fallback, so existing activation codes continue to work.
+		simple := m.validate(ctx, key, "")
+		if simple.HTTP && simple.Valid {
+			m.saveValidation(key, simple, result{})
+			return Operation{true, "授权已激活。", m.Status()}
+		}
 		return Operation{false, activation.message("设备激活失败。"), m.Status()}
 	}
 	validation = m.validate(ctx, key, fp)
 	if validation.HTTP && validation.Valid {
 		m.saveValidation(key, validation, activation)
+		return Operation{true, "授权已激活。", m.Status()}
+	}
+	simple := m.validate(ctx, key, "")
+	if simple.HTTP && simple.Valid {
+		m.saveValidation(key, simple, result{})
 		return Operation{true, "授权已激活。", m.Status()}
 	}
 	return Operation{false, validation.message("设备已提交，但授权校验未通过。"), m.Status()}
@@ -157,7 +174,11 @@ func (m *Manager) Refresh(ctx context.Context) Operation {
 	if m.state.LicenseKey == "" {
 		return Operation{false, "当前没有已保存的激活码。", m.Status()}
 	}
-	r := m.validate(ctx, m.state.LicenseKey, m.machineFingerprint())
+	fingerprint := ""
+	if m.state.MachineID != "" {
+		fingerprint = m.machineFingerprint()
+	}
+	r := m.validate(ctx, m.state.LicenseKey, fingerprint)
 	if !r.HTTP || !r.Valid {
 		return Operation{false, r.message("授权刷新失败。"), m.Status()}
 	}
