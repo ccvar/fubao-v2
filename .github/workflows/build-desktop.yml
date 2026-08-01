@@ -2,6 +2,21 @@ name: Build Desktop Clients
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version. Leave empty to use the desktop app version."
+        required: false
+        type: string
+      notes:
+        description: "Release notes stored in latest.json."
+        required: false
+        default: "福宝控制台自动构建发布包。"
+        type: string
+      publish:
+        description: "Publish packages to ccvar/fubao-v2-releases."
+        required: true
+        default: true
+        type: boolean
   push:
     branches:
       - main
@@ -10,6 +25,9 @@ on:
 
 permissions:
   contents: read
+
+env:
+  RELEASE_REPOSITORY: ccvar/fubao-v2-releases
 
 jobs:
   build:
@@ -83,36 +101,170 @@ jobs:
           retention-days: 14
 
   release:
-    name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/')
+    name: Publish packages repository
+    if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish)
     needs: build
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
       - name: Download installers
         uses: actions/download-artifact@v4
         with:
           path: release-assets
           merge-multiple: true
 
-      - name: Create or update release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+      - name: Prepare release packages and manifest
+        id: metadata
         shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+          NOTES_INPUT: ${{ inputs.notes }}
         run: |
           set -euo pipefail
-          mapfile -d '' assets < <(find release-assets -type f -print0)
-          if [[ ${#assets[@]} -eq 0 ]]; then
-            echo "No release assets were downloaded." >&2
+
+          if [[ -n "${VERSION_INPUT}" ]]; then
+            VERSION="${VERSION_INPUT#v}"
+          elif [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="$(node -p "require('./src-tauri/tauri.conf.json').version")"
+          fi
+          TAG="v${VERSION}"
+          NOTES="${NOTES_INPUT:-福宝控制台自动构建发布包。}"
+
+          MACOS_SOURCE="$(find release-assets -type f -name '*.dmg' -print -quit)"
+          WINDOWS_SOURCE="$(find release-assets -type f -name '*.exe' -print -quit)"
+          if [[ -z "$MACOS_SOURCE" || -z "$WINDOWS_SOURCE" ]]; then
+            echo "Both macOS and Windows installers are required." >&2
+            find release-assets -maxdepth 2 -type f -print >&2
             exit 1
           fi
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "${assets[@]}" --clobber
+          MACOS_FILE="fubao-console-${VERSION}-macos-universal.dmg"
+          WINDOWS_FILE="fubao-console-${VERSION}-windows-x64-setup.exe"
+          mv "$MACOS_SOURCE" "release-assets/$MACOS_FILE"
+          mv "$WINDOWS_SOURCE" "release-assets/$WINDOWS_FILE"
+
+          export VERSION TAG NOTES MACOS_FILE WINDOWS_FILE
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          assets = Path("release-assets")
+          repository = os.environ["RELEASE_REPOSITORY"]
+          tag = os.environ["TAG"]
+
+          def package(filename: str) -> dict:
+              path = assets / filename
+              return {
+                  "url": f"https://github.com/{repository}/releases/download/{tag}/{filename}",
+                  "filename": filename,
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                  "size": path.stat().st_size,
+              }
+
+          manifest = {
+              "version": os.environ["VERSION"],
+              "force": False,
+              "notes": os.environ["NOTES"],
+              "packages": {
+                  "windows": package(os.environ["WINDOWS_FILE"]),
+                  "macos": package(os.environ["MACOS_FILE"]),
+              },
+          }
+          (assets / "latest.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "macos_file=$MACOS_FILE"
+            echo "windows_file=$WINDOWS_FILE"
+          } >> "$GITHUB_OUTPUT"
+          cat release-assets/latest.json
+
+      - name: Initialize packages repository
+        env:
+          RELEASE_TOKEN: ${{ secrets.FUBAO_RELEASES_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${RELEASE_TOKEN}" ]]; then
+            echo "Missing required secret: FUBAO_RELEASES_TOKEN" >&2
+            exit 1
+          fi
+          git clone "https://x-access-token:${RELEASE_TOKEN}@github.com/${RELEASE_REPOSITORY}.git" release-repo
+          cd release-repo
+          git checkout -B main
+          if [[ ! -f README.md ]]; then
+            {
+              printf '%s\n' '# 福宝控制台发布仓库'
+              printf '\n'
+              printf '%s\n' '此仓库用于托管客户端更新清单，安装包发布在 GitHub Releases。'
+            } > README.md
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add README.md
+            git commit -m "chore: initialize releases repository"
+            git push origin HEAD:main
+          fi
+
+      - name: Create or update packages release
+        env:
+          GH_TOKEN: ${{ secrets.FUBAO_RELEASES_TOKEN }}
+          RELEASE_NOTES: ${{ inputs.notes }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "Missing required secret: FUBAO_RELEASES_TOKEN" >&2
+            exit 1
+          fi
+          TAG="${{ steps.metadata.outputs.tag }}"
+          NOTES="${RELEASE_NOTES:-福宝控制台自动构建发布包。}"
+          NOTES_FILE="$(mktemp)"
+          printf '%s\n' "$NOTES" > "$NOTES_FILE"
+
+          if gh release view "$TAG" --repo "$RELEASE_REPOSITORY" >/dev/null 2>&1; then
+            echo "Updating existing release: $TAG"
           else
-            gh release create "$RELEASE_TAG" "${assets[@]}" \
-              --title "福宝控制台 $RELEASE_TAG" \
-              --generate-notes
+            gh release create "$TAG" \
+              --repo "$RELEASE_REPOSITORY" \
+              --title "福宝控制台 $TAG" \
+              --notes-file "$NOTES_FILE" \
+              --draft
+          fi
+
+          gh release upload "$TAG" \
+            "release-assets/${{ steps.metadata.outputs.macos_file }}" \
+            "release-assets/${{ steps.metadata.outputs.windows_file }}" \
+            release-assets/latest.json \
+            --repo "$RELEASE_REPOSITORY" \
+            --clobber
+          gh release edit "$TAG" \
+            --repo "$RELEASE_REPOSITORY" \
+            --draft=false \
+            --latest
+
+      - name: Update latest manifest in packages repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp release-assets/latest.json release-repo/latest.json
+          cd release-repo
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md latest.json
+          if git diff --cached --quiet; then
+            echo "latest.json unchanged"
+          else
+            git commit -m "release: update latest.json for ${{ steps.metadata.outputs.tag }}"
+            git push origin HEAD:main
           fi
