@@ -14,7 +14,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::AsyncWriteExt;
 
 const UPDATE_MANIFEST_URL: &str =
-    "https://github.com/ccvar/fubao-v2-releases/releases/latest/download/latest.json";
+    "https://raw.githubusercontent.com/ccvar/fubao-v2-releases/main/latest.json";
 
 #[derive(Default)]
 pub struct UpdaterRuntime {
