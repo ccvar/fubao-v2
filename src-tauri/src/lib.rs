@@ -151,9 +151,9 @@ fn apply_windows_titlebar_palette(window: &tauri::WebviewWindow) {
     // COLORREF is encoded as 0x00BBGGRR. Keep native window controls while
     // matching the warm sidebar/topbar palette used by the web surface.
     let attributes = [
-        (DWMWA_CAPTION_COLOR, 0x00F7F9FA_u32), // #faf9f7
-        (DWMWA_TEXT_COLOR, 0x00272B2D_u32),    // #2d2b27
-        (DWMWA_BORDER_COLOR, 0x00DFE5E8_u32),  // #e8e5df
+        (DWMWA_CAPTION_COLOR as u32, 0x00F7F9FA_u32), // #faf9f7
+        (DWMWA_TEXT_COLOR as u32, 0x00272B2D_u32),    // #2d2b27
+        (DWMWA_BORDER_COLOR as u32, 0x00DFE5E8_u32),  // #e8e5df
     ];
     for (attribute, color) in attributes {
         unsafe {
