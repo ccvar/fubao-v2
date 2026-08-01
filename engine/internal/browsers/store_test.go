@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -141,6 +142,86 @@ func TestSerializeBrowserCookies(t *testing.T) {
 	}
 	if strings.Count(got, "sid_guard=") != 1 {
 		t.Fatalf("duplicate cookies were not collapsed: %q", got)
+	}
+}
+
+func TestRecognizesCurrentDouyinLoginCookieVariants(t *testing.T) {
+	for _, name := range []string{
+		"sessionid", "sessionid_ss", "sid_guard", "sid_tt", "sid_ucp_v1",
+		"ssid_ucp_v1", "uid_tt", "uid_tt_ss", "passport_assist_user",
+	} {
+		if !hasBrowserLoginCookie([]browserCookie{{Name: name, Value: "present"}}) {
+			t.Fatalf("login cookie %q was not recognized", name)
+		}
+	}
+	if hasBrowserLoginCookie([]browserCookie{{Name: "ttwid", Value: "present"}}) {
+		t.Fatal("non-login cookie was accepted as authenticated")
+	}
+}
+
+func TestRealDouyinChromeCookieRestore(t *testing.T) {
+	dataDir := strings.TrimSpace(os.Getenv("FUBAO_REAL_BROWSER_DATA_DIR"))
+	instanceID := strings.TrimSpace(os.Getenv("FUBAO_REAL_BROWSER_INSTANCE_ID"))
+	rawCookie := strings.TrimSpace(os.Getenv("FUBAO_REAL_BROWSER_COOKIE"))
+	if dataDir == "" || instanceID == "" || rawCookie == "" {
+		t.Skip("set FUBAO_REAL_BROWSER_DATA_DIR, FUBAO_REAL_BROWSER_INSTANCE_ID, and FUBAO_REAL_BROWSER_COOKIE to run the native Chrome restore check")
+	}
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.SetCookieUpdater(func(_ string, _ string) error { return nil })
+	accountID, err := store.AccountID(instanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profileDir := store.profileDir(accountID)
+	t.Cleanup(func() {
+		_ = stopProfileBrowserProcesses(profileDir)
+	})
+	opened, err := store.Open(instanceID, rawCookie)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opened.Status != StatusOnline || opened.PID <= 0 {
+		t.Fatalf("real browser did not reach online state: status=%q pid=%d", opened.Status, opened.PID)
+	}
+	if err := stopProfileBrowserProcesses(profileDir); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, item := range store.List() {
+			if item.ID == instanceID && item.Status == StatusStopped {
+				deadline = time.Time{}
+				break
+			}
+		}
+		if deadline.IsZero() {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	reopened, err := store.Open(instanceID, rawCookie)
+	if err != nil {
+		t.Fatalf("reopening the same account profile failed: %v", err)
+	}
+	if reopened.Status != StatusOnline || reopened.PID <= 0 || reopened.AccountID != accountID {
+		t.Fatalf("real browser did not reuse the account profile: status=%q pid=%d account=%q", reopened.Status, reopened.PID, reopened.AccountID)
+	}
+}
+
+func TestProcessUsesOnlyMatchingAccountProfile(t *testing.T) {
+	profile := "/Users/test/Library/Application Support/福宝控制台/browser-profiles/account-a"
+	matching := "/Applications/Google Chrome --user-data-dir=" + profile + " --app=http://127.0.0.1:1234/bootstrap"
+	quoted := `/Applications/Google Chrome --user-data-dir="` + profile + `" --app=https://www.douyin.com/`
+	other := "/Applications/Google Chrome --user-data-dir=/Users/test/Library/Application Support/福宝控制台/browser-profiles/account-b"
+	prefixCollision := matching[:strings.Index(matching, " --app=")] + "-secondary --app=http://127.0.0.1:1234/bootstrap"
+	if !processUsesProfile(matching, profile) || !processUsesProfile(quoted, profile) {
+		t.Fatal("expected matching profile process")
+	}
+	if processUsesProfile(other, profile) || processUsesProfile(prefixCollision, profile) || processUsesProfile(matching, "") {
+		t.Fatal("must not match another or empty profile")
 	}
 }
 

@@ -14,10 +14,12 @@ import (
 	"time"
 )
 
-// storeVersion 2 starts monitoring request statistics from this client.
+// storeVersion 3 adds the opt-in API red-packet participation state. Existing
+// accounts intentionally default to off; participation must always be an
+// explicit user choice in this client.
 // The legacy app's counters describe a different runtime, so carrying them
 // across makes the current desktop numbers misleading.
-const storeVersion = 2
+const storeVersion = 3
 
 type Role string
 
@@ -42,14 +44,26 @@ type MonitoringProfile struct {
 }
 
 type ParticipationProfile struct {
-	Enabled              bool     `json:"enabled"`
-	JoinCount            int      `json:"join_count"`
-	WinCount             int      `json:"win_count"`
-	LastJoinAt           string   `json:"last_join_at,omitempty"`
-	LastError            string   `json:"last_error,omitempty"`
-	ProxyID              int      `json:"proxy_id"`
-	FingerprintProfileID int      `json:"fingerprint_profile_id"`
-	Tags                 []string `json:"tags,omitempty"`
+	Enabled                bool     `json:"enabled"`
+	RedPacketAPIEnabled    bool     `json:"red_packet_api_enabled"`
+	RedPacketCooldownUntil string   `json:"red_packet_cooldown_until,omitempty"`
+	LastRedPacketStatus    string   `json:"last_red_packet_status,omitempty"`
+	LastRedPacketMessage   string   `json:"last_red_packet_message,omitempty"`
+	JoinCount              int      `json:"join_count"`
+	WinCount               int      `json:"win_count"`
+	LastJoinAt             string   `json:"last_join_at,omitempty"`
+	LastError              string   `json:"last_error,omitempty"`
+	ProxyID                int      `json:"proxy_id"`
+	FingerprintProfileID   int      `json:"fingerprint_profile_id"`
+	Tags                   []string `json:"tags,omitempty"`
+}
+
+// RedPacketParticipationCredential is private engine-only data used by the Go
+// scheduler. It is never returned by an IPC list API.
+type RedPacketParticipationCredential struct {
+	AccountID   string
+	AccountName string
+	Cookie      string
 }
 
 type Account struct {
@@ -158,7 +172,8 @@ func (s *Store) load() error {
 	if err := json.Unmarshal(data, &file); err != nil {
 		return fmt.Errorf("解析账号数据失败: %w", err)
 	}
-	resetLegacyUsage := file.Version < storeVersion
+	resetLegacyUsage := file.Version < 2
+	needsUpgrade := file.Version < storeVersion
 	for _, account := range file.Accounts {
 		if account == nil || account.ID == "" {
 			continue
@@ -176,7 +191,7 @@ func (s *Store) load() error {
 		}
 		s.accounts[account.ID] = account
 	}
-	if resetLegacyUsage {
+	if needsUpgrade {
 		if err := s.saveLocked(); err != nil {
 			return err
 		}
@@ -318,6 +333,96 @@ func (s *Store) ParticipationCredential(accountID string) (BrowserCredential, er
 		Cookie:       account.Cookie,
 		CookieStatus: account.CookieStatus,
 	}, nil
+}
+
+// SetRedPacketAPIEnabled persists the per-account opt-in controlled by the
+// compact gift icon in the participation account table.
+func (s *Store) SetRedPacketAPIEnabled(accountID string, enabled bool) (AccountView, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account := s.accounts[accountID]
+	if account == nil {
+		return AccountView{}, errors.New("账号不存在")
+	}
+	if !hasRole(account, RoleParticipation) || account.Participation == nil {
+		return AccountView{}, errors.New("只能为参与账号设置红包接口参与")
+	}
+	previousProfile := *account.Participation
+	previousUpdatedAt := account.UpdatedAt
+	account.Participation.RedPacketAPIEnabled = enabled
+	if !enabled {
+		account.Participation.RedPacketCooldownUntil = ""
+		account.Participation.LastRedPacketStatus = "disabled"
+		account.Participation.LastRedPacketMessage = "已关闭红包接口参与"
+	} else {
+		account.Participation.LastRedPacketStatus = "ready"
+		account.Participation.LastRedPacketMessage = "已启用红包接口参与"
+	}
+	account.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+	if err := s.saveLocked(); err != nil {
+		*account.Participation = previousProfile
+		account.UpdatedAt = previousUpdatedAt
+		return AccountView{}, err
+	}
+	return safeView(account), nil
+}
+
+// RedPacketParticipationCredentials returns only explicitly opted-in accounts
+// that are enabled, CK-valid and outside their persisted cooldown window.
+func (s *Store) RedPacketParticipationCredentials(now time.Time) []RedPacketParticipationCredential {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := make([]RedPacketParticipationCredential, 0)
+	for _, account := range s.accounts {
+		profile := account.Participation
+		if profile == nil || !profile.Enabled || !profile.RedPacketAPIEnabled || !hasRole(account, RoleParticipation) {
+			continue
+		}
+		if strings.TrimSpace(account.Cookie) == "" || account.CookieStatus != cookieStatusValid {
+			continue
+		}
+		if until, err := time.Parse(time.RFC3339Nano, profile.RedPacketCooldownUntil); err == nil && now.Before(until) {
+			continue
+		}
+		items = append(items, RedPacketParticipationCredential{
+			AccountID:   account.ID,
+			AccountName: firstNonEmpty(account.Nickname, account.Name, account.UserID, "抖音账号"),
+			Cookie:      account.Cookie,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].AccountName < items[j].AccountName })
+	return items
+}
+
+// RecordRedPacketParticipation stores only safe result metadata and counters.
+// Raw response bodies and Cookie values never enter the account view.
+func (s *Store) RecordRedPacketParticipation(accountID, status, message string, joined bool, cooldown time.Duration, cookieExpired bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account := s.accounts[accountID]
+	if account == nil || account.Participation == nil {
+		return
+	}
+	now := time.Now()
+	profile := account.Participation
+	profile.LastRedPacketStatus = strings.TrimSpace(status)
+	profile.LastRedPacketMessage = strings.TrimSpace(message)
+	if joined {
+		profile.JoinCount++
+		profile.LastJoinAt = now.Format(time.RFC3339Nano)
+	}
+	if cooldown > 0 {
+		profile.RedPacketCooldownUntil = now.Add(cooldown).Format(time.RFC3339Nano)
+	} else {
+		profile.RedPacketCooldownUntil = ""
+	}
+	if cookieExpired {
+		account.CookieStatus = cookieStatusExpired
+		account.CookieMessage = "CK 已失效：红包接口返回未登录"
+		account.CookieChecked = now.Format(time.RFC3339Nano)
+	}
+	account.UpdatedAt = now.Format(time.RFC3339Nano)
+	_ = s.saveLocked()
 }
 
 // MonitoringCredential returns the internal credential used by the local Go
@@ -642,6 +747,17 @@ func (s *Store) MigrateLegacy(legacyDir string) (MigrationResult, error) {
 }
 
 func safeView(account *Account) AccountView {
+	var monitoring *MonitoringProfile
+	if account.Monitoring != nil {
+		copy := *account.Monitoring
+		monitoring = &copy
+	}
+	var participation *ParticipationProfile
+	if account.Participation != nil {
+		copy := *account.Participation
+		copy.Tags = append([]string(nil), account.Participation.Tags...)
+		participation = &copy
+	}
 	return AccountView{
 		ID:            account.ID,
 		Name:          account.Name,
@@ -652,8 +768,8 @@ func safeView(account *Account) AccountView {
 		CookieChecked: account.CookieChecked,
 		Source:        account.Source,
 		Roles:         append([]Role(nil), account.Roles...),
-		Monitoring:    account.Monitoring,
-		Participation: account.Participation,
+		Monitoring:    monitoring,
+		Participation: participation,
 		CreatedAt:     account.CreatedAt,
 		UpdatedAt:     account.UpdatedAt,
 	}

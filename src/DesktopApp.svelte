@@ -8,12 +8,14 @@
   import {
     PulseIcon as Activity,
     ArrowClockwiseIcon as ArrowClockwise,
+    ArrowsDownUpIcon as ArrowsDownUp,
     ArrowSquareOutIcon as ArrowSquareOut,
     BrowserIcon as Browser,
     CaretDownIcon as CaretDown,
     CheckCircleIcon as CheckCircle,
     ClockCountdownIcon as ClockCountdown,
     ClipboardTextIcon as ClipboardText,
+    DiamondIcon as Diamond,
     DotsThreeIcon as DotsThree,
     DownloadSimpleIcon as DownloadSimple,
     FileArrowUpIcon as FileArrowUp,
@@ -23,6 +25,7 @@
     MagnifyingGlassIcon as MagnifyingGlass,
     MonitorIcon as Monitor,
     PauseIcon as Pause,
+    PencilSimpleIcon as PencilSimple,
     PlayIcon as Play,
     PlusIcon as Plus,
     QrCodeIcon as QrCode,
@@ -43,8 +46,9 @@
   type NavKey = "overview" | "tasks" | "browsers" | "accounts";
   type MonitorState = "running" | "paused" | "warning";
   type AccountRole = "monitoring" | "participation";
-  type ManagementTab = "redpackets" | "rooms" | AccountRole;
+  type ManagementTab = "redpackets" | "rooms" | "participation-records" | AccountRole;
   type AccountStatusFilter = "all" | "available" | "expired" | "cooldown";
+  type RoomSortMode = "default" | "instance-first" | "live-first" | "recent-live" | "recent-redpacket";
 
   type LicenseStatus = {
     state: "inactive" | "active" | "expired" | "stale" | "machine_mismatch";
@@ -87,6 +91,10 @@
     last_use_status?: string;
     total_request_count?: number;
     today_request_count?: number;
+	red_packet_api_enabled?: boolean;
+	red_packet_cooldown_until?: string;
+	last_red_packet_status?: string;
+	last_red_packet_message?: string;
     join_count?: number;
     win_count?: number;
     last_join_at?: string;
@@ -158,6 +166,37 @@
     capacity: BrowserCapacity;
   };
 
+  type FollowingLiveItem = {
+    room_id: string;
+    web_rid: string;
+    user_id?: string;
+    sec_uid?: string;
+    nickname: string;
+    avatar_url?: string;
+    title?: string;
+    viewer_count?: string;
+  };
+
+  type FollowingLiveResult = {
+    account_id: string;
+    total: number;
+    items: FollowingLiveItem[];
+    refreshed_at: string;
+    stale?: boolean;
+  };
+
+  type RoomFollowSource = {
+    account_id: string;
+    account_name: string;
+    last_seen_live_at: string;
+    is_live?: boolean;
+  };
+
+  type BrowserWebviewEvent = {
+    instance_id: string;
+    message?: string;
+  };
+
   type RoomItem = {
     id: string;
     web_rid?: string;
@@ -168,6 +207,9 @@
     connection_status: string;
     enabled: boolean;
     source?: string;
+    follow_sources?: RoomFollowSource[];
+    following_live?: boolean;
+    last_seen_live_at?: string;
     created_at: string;
     updated_at: string;
   };
@@ -189,6 +231,7 @@
     enabled: boolean;
     last_checked_at?: string;
     last_live_checked_at?: string;
+    live_started_at?: string;
     last_red_packet_checked_at?: string;
     last_event_at?: string;
     last_error?: string;
@@ -217,6 +260,28 @@
     draw_at?: string;
 	expires_at?: string;
     participant_count?: number;
+  };
+
+  type ParticipationRecord = {
+	id: string;
+	event_id: string;
+	account_id: string;
+	account_name: string;
+	room_id?: string;
+	web_rid?: string;
+	room_name?: string;
+	streamer_name?: string;
+	packet_id: string;
+	title?: string;
+	prize?: string;
+	endpoint?: "join" | "rush" | string;
+	status: string;
+	message?: string;
+	attempt_count: number;
+	joined: boolean;
+	cooldown_until?: string;
+	created_at: string;
+	updated_at: string;
   };
 
   type MonitorRuntimeLog = {
@@ -261,6 +326,9 @@
     accounts: { title: "账号与直播间", subtitle: "直播间与账号数据" },
   };
 
+  const isWindowsPlatform =
+    typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
+
   let activeView: NavKey = "overview";
   let clientVersion = __APP_VERSION__;
   let updateStatus: UpdateStatus | null = null;
@@ -283,6 +351,8 @@
   let licenseKey = "";
   let licenseBusy = false;
   let licenseError = "";
+  let licenseReplacing = false;
+  $: licenseDaysRemaining = getLicenseDaysRemaining(licenseStatus.expires_at);
   let query = "";
   let searchOpen = false;
   let topbarSearchInput: HTMLInputElement;
@@ -301,7 +371,17 @@
   let browserCreating = false;
   let browserOpeningId = "";
   let browserClosingId = "";
+  let browserPendingClose: BrowserInstance | null = null;
+  let browserFollowingLive: Record<string, FollowingLiveResult> = {};
+  let browserFollowingLiveLoadingIds: string[] = [];
+  let browserFollowingLiveErrors: Record<string, string> = {};
+  let followingLiveModalInstance: BrowserInstance | null = null;
   let browserWebviewMountingIds: string[] = [];
+  let browserWebviewLoadingIds: string[] = [];
+  // Keep a lightweight ready marker after the native surface is released so
+  // returning to this view can describe the operation as a restore. The real
+  // WebView is still destroyed off-screen to release its runtime lease.
+  let browserWebviewReadyIds: string[] = [];
   let browserWebviewMountedIds: string[] = [];
   let browserWebviewReleasingIds: string[] = [];
   let browserWebviewErrors: Record<string, string> = {};
@@ -309,6 +389,7 @@
   let browserViewSettled = false;
   let browserColumns = 2;
   let browserColumnSyncTimer = 0;
+  let browserNativeLayoutChain: Promise<void> = Promise.resolve();
   let browserLayoutRevision = 0;
   let browserLayoutChanging = false;
   let selectedParticipationAccountIds: string[] = [];
@@ -332,7 +413,14 @@
   let redPacketEventsLoading = false;
   let redPacketEventError = "";
   let redPacketRenderLimit = 300;
+	let participationRecords: ParticipationRecord[] = [];
+	let participationRecordsLoading = false;
+	let participationRecordError = "";
+	let participationRecordRenderLimit = 300;
   let redPacketClock = Date.now();
+  let redPacketHistoryVisible = false;
+  let roomSortMode: RoomSortMode = "default";
+  let roomSortMenuOpen = false;
   let redPacketBatchAction: "start" | "stop" | "" = "";
   let redPacketMonitorActionId = "";
   let monitorRuntimeLogs: MonitorRuntimeLog[] = [];
@@ -348,6 +436,7 @@
   let accountFolderInput: HTMLInputElement;
   let accountPendingDelete: AccountItem | null = null;
   let accountDeleting = false;
+	let redPacketAPITogglingAccountIds: string[] = [];
   let accountRebinding: AccountItem | null = null;
 	let accountRebindRole: AccountRole = "participation";
   let accountCreateSessionId = "";
@@ -422,20 +511,54 @@
   });
   $: monitoringAccounts = accounts.filter((account) => account.roles.includes("monitoring"));
   $: participationAccounts = accounts.filter((account) => account.roles.includes("participation"));
-  $: accountSubtitle = `${rooms.length} 个直播间 · ${participationAccounts.length} 个参与 · ${monitoringAccounts.length} 个监测`;
   $: filteredRooms = rooms.filter((room) => {
-    const haystack = `${room.name ?? ""} ${room.streamer_name ?? ""} ${room.web_rid ?? ""} ${room.actual_room_id ?? ""} ${room.id}`.toLowerCase();
+    const followAccounts = (room.follow_sources ?? []).map((source) => source.account_name).join(" ");
+    const haystack = `${room.name ?? ""} ${room.streamer_name ?? ""} ${room.web_rid ?? ""} ${room.actual_room_id ?? ""} ${room.id} ${followAccounts}`.toLowerCase();
     return haystack.includes(query.trim().toLowerCase());
   });
-  $: visibleRooms = filteredRooms.slice(0, roomRenderLimit);
+  $: sortedRooms = filteredRooms
+    .map((room, index) => ({ room, index }))
+    .sort((left, right) => {
+      if (roomSortMode === "instance-first") {
+        const instanceDifference = Number(!roomWasDiscoveredByInstance(left.room))
+          - Number(!roomWasDiscoveredByInstance(right.room));
+        const currentLiveDifference = Number(!roomIsFollowingLive(left.room, redPacketClock))
+          - Number(!roomIsFollowingLive(right.room, redPacketClock));
+        const recentDifference = roomFollowingLiveTimestamp(right.room) - roomFollowingLiveTimestamp(left.room);
+        return instanceDifference || currentLiveDifference || recentDifference || left.index - right.index;
+      }
+      if (roomSortMode === "live-first") {
+        const liveDifference = Number(!roomIsCurrentlyLive(left.room, redPacketMonitors, redPacketMonitorOverrides, redPacketClock))
+          - Number(!roomIsCurrentlyLive(right.room, redPacketMonitors, redPacketMonitorOverrides, redPacketClock));
+        return liveDifference || left.index - right.index;
+      }
+      if (roomSortMode === "recent-live") {
+        const recentDifference = roomLastLiveStartedAt(right.room, redPacketMonitors)
+          - roomLastLiveStartedAt(left.room, redPacketMonitors);
+        return recentDifference || left.index - right.index;
+      }
+      if (roomSortMode === "recent-redpacket") {
+        const recentDifference = roomLastRedPacketAt(right.room, redPacketMonitors, redPacketEvents)
+          - roomLastRedPacketAt(left.room, redPacketMonitors, redPacketEvents);
+        return recentDifference || left.index - right.index;
+      }
+      return left.index - right.index;
+    })
+    .map(({ room }) => room);
+  $: visibleRooms = sortedRooms.slice(0, roomRenderLimit);
   $: enabledRedPacketMonitors = redPacketMonitors.filter((monitor) => monitor.enabled);
   $: runningRedPacketMonitorCount = enabledRedPacketMonitors.filter((monitor) => redPacketMonitorUiStatus(monitor) === "running").length;
   $: canStartAnyRedPacketMonitor = enabledRedPacketMonitors.some((monitor) => redPacketMonitorUiStatus(monitor) !== "running");
   $: canStopAnyRedPacketMonitor = runningRedPacketMonitorCount > 0;
-  $: activeRedPacketCount = redPacketEvents.filter(redPacketEventIsActive).length;
+	$: activeRedPacketCount = redPacketEvents.filter((event) => redPacketEventIsActive(event, redPacketClock)).length;
+	$: historicalRedPacketCount = redPacketEvents.length - activeRedPacketCount;
+	$: accountSubtitle = `${activeRedPacketCount} 个红包 · ${runningRedPacketMonitorCount} 个房间正在监测 · ${participationAccounts.length} 个参与 · ${monitoringAccounts.length} 个监测`;
 	$: expiredParticipationAccountCount = participationAccounts.filter((account) => accountCookieStatus(account, "participation") === "expired").length;
 	$: expiredMonitoringAccountCount = monitoringAccounts.filter((account) => accountCookieStatus(account, "monitoring") === "expired").length;
-  $: filteredRedPacketEvents = redPacketEvents.filter((event) => {
+	$: scopedRedPacketEvents = redPacketEvents.filter((event) => redPacketHistoryVisible
+		? !redPacketEventIsActive(event, redPacketClock)
+		: redPacketEventIsActive(event, redPacketClock));
+  $: filteredRedPacketEvents = scopedRedPacketEvents.filter((event) => {
     const needle = query.trim().toLowerCase();
     if (!needle) return true;
     return [event.title, event.prize, event.room_name, event.streamer_name, event.web_rid, event.room_id]
@@ -443,6 +566,14 @@
       .some((value) => String(value).toLowerCase().includes(needle));
   });
   $: visibleRedPacketEvents = filteredRedPacketEvents.slice(0, redPacketRenderLimit);
+	$: filteredParticipationRecords = participationRecords.filter((record) => {
+		const needle = query.trim().toLowerCase();
+		if (!needle) return true;
+		return [record.account_name, record.room_name, record.streamer_name, record.web_rid, record.room_id, record.title, record.prize, record.message]
+			.filter(Boolean)
+			.some((value) => String(value).toLowerCase().includes(needle));
+	});
+	$: visibleParticipationRecords = filteredParticipationRecords.slice(0, participationRecordRenderLimit);
   $: browserSubtitle = browserCapacity
     ? `${browserInstances.length} 个实例 · ${browserCapacity.running} 个运行 · 建议上限 ${browserCapacity.recommended_limit}${browserCapacity.waiting > 0 ? ` · ${browserCapacity.waiting} 个等待` : ""}`
     : `${browserInstances.length} 个实例 · ${browserInstances.filter((item) => item.status === "online").length} 个在线 · ${browserInstances.filter(browserCookieExpired).length} 个失效`;
@@ -463,7 +594,7 @@
     (account) => {
       const haystack = `${account.name} ${account.nickname ?? ""} ${account.user_id ?? ""}`.toLowerCase();
       const searchMatches = haystack.includes(query.trim().toLowerCase());
-      const status = accountStatus(account);
+      const status = accountStatus(account, redPacketClock);
       const statusMatches =
         accountStatusFilter === "all" ||
         (accountStatusFilter === "available" && status === "可用") ||
@@ -546,7 +677,37 @@
     licenseModalOpen = false;
     licenseKey = "";
     licenseError = "";
+    licenseReplacing = false;
     scheduleEmbeddedBrowserSync();
+  }
+
+  function beginLicenseReplacement() {
+    licenseKey = "";
+    licenseError = "";
+    licenseReplacing = true;
+  }
+
+  function cancelLicenseReplacement() {
+    if (licenseBusy) return;
+    licenseKey = "";
+    licenseError = "";
+    licenseReplacing = false;
+  }
+
+  function formatLicenseDate(value?: string, emptyLabel = "永久有效") {
+    const text = value?.trim();
+    if (!text) return emptyLabel;
+    const timestamp = Date.parse(text);
+    if (!Number.isFinite(timestamp)) return text;
+    return new Date(timestamp).toLocaleString("zh-CN", { hour12: false });
+  }
+
+  function getLicenseDaysRemaining(value?: string) {
+    const timestamp = value ? Date.parse(value) : Number.NaN;
+    if (!Number.isFinite(timestamp)) return null;
+    const remaining = timestamp - Date.now();
+    if (remaining <= 0) return 0;
+    return Math.ceil(remaining / 86_400_000);
   }
 
   async function activateLicense() {
@@ -561,6 +722,7 @@
         return;
       }
       licenseKey = "";
+      licenseReplacing = false;
       toast = result.message;
       window.setTimeout(() => (toast = ""), 2200);
     } catch (error) {
@@ -686,15 +848,19 @@
     return Number.isFinite(parsed) ? parsed : 0;
   }
 
-  function redPacketEventIsActive(event: RedPacketEvent) {
+  function redPacketEventIsActive(event: RedPacketEvent, clock = Date.now()) {
     const drawAt = eventTimestamp(event.expires_at || event.draw_at);
-    return drawAt > redPacketClock;
+    return drawAt > clock;
   }
 
-  function redPacketEventExpiryParts(event: RedPacketEvent) {
+  function redPacketEventIsDiamond(event: RedPacketEvent) {
+    return (event.title || "").includes("钻石");
+  }
+
+  function redPacketEventExpiryParts(event: RedPacketEvent, clock = Date.now()) {
     const value = event.expires_at || event.draw_at;
     const timestamp = eventTimestamp(value);
-    if (!timestamp) return { countdown: "", absolute: "", text: "过期时间待解析" };
+    if (!timestamp) return { countdown: "", absolute: "", text: "过期时间待解析", expired: false };
     const absolute = new Date(timestamp).toLocaleString("zh-CN", {
       month: "numeric",
       day: "numeric",
@@ -703,7 +869,10 @@
       second: "2-digit",
       hour12: false,
     });
-    const seconds = Math.max(0, Math.ceil((timestamp - redPacketClock) / 1000));
+    if (timestamp <= clock) {
+      return { countdown: "已过期", absolute, text: `已过期 · ${absolute}`, expired: true };
+    }
+    const seconds = Math.max(0, Math.ceil((timestamp - clock) / 1000));
     const hours = Math.floor(seconds / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
     const remainingSeconds = seconds % 60;
@@ -711,15 +880,15 @@
     const countdown = hours > 0
       ? `${pad(hours)}:${pad(minutes)}:${pad(remainingSeconds)}`
       : `${pad(minutes)}:${pad(remainingSeconds)}`;
-    return { countdown, absolute, text: `${countdown} · ${absolute}` };
+    return { countdown, absolute, text: `${countdown} · ${absolute}`, expired: false };
   }
 
   function redPacketEventExpiry(event: RedPacketEvent) {
     return redPacketEventExpiryParts(event).text;
   }
 
-  async function openRedPacketLiveRoom(event: RedPacketEvent) {
-    const webRID = (event.web_rid || event.room_id || "").trim();
+  async function openLiveRoomByWebRID(value: string) {
+    const webRID = value.trim();
     if (!/^\d{6,24}$/.test(webRID)) {
       showToast("暂未读取到可打开的直播间地址");
       return;
@@ -735,6 +904,44 @@
     }
   }
 
+  async function openRedPacketLiveRoom(event: RedPacketEvent) {
+    await openLiveRoomByWebRID(event.web_rid || event.room_id || "");
+  }
+
+  function roomOpenWebRID(room: RoomItem, monitor?: RedPacketMonitor) {
+    return (monitor?.web_rid || room.web_rid || room.id || "").trim();
+  }
+
+  function roomFollowSources(room: RoomItem) {
+    const unique = new Map<string, RoomFollowSource>();
+    for (const source of room.follow_sources ?? []) {
+      const accountId = source.account_id?.trim();
+      const accountName = source.account_name?.trim();
+      if (!accountId || !accountName) continue;
+      unique.set(accountId, { ...source, account_id: accountId, account_name: accountName });
+    }
+    return [...unique.values()];
+  }
+
+  function roomSourceLabel(room: RoomItem) {
+    const sources = roomFollowSources(room);
+    if (sources.length === 1) return `${sources[0].account_name}的关注`;
+    if (sources.length > 1) return `${sources[0].account_name}等 ${sources.length} 个账号的关注`;
+    if (room.source === "dy-kiro") return "旧福宝导入";
+    if (room.source === "manual") return "手动导入";
+    return "本机创建";
+  }
+
+  function roomSourceTooltip(room: RoomItem) {
+    const sources = roomFollowSources(room);
+    if (sources.length === 0) return roomSourceLabel(room);
+    return `关注来源：${sources.map((source) => source.account_name).join("、")}`;
+  }
+
+  async function openRoomLiveRoom(room: RoomItem, monitor?: RedPacketMonitor) {
+    await openLiveRoomByWebRID(roomOpenWebRID(room, monitor));
+  }
+
   function showExpiredAccounts(role: AccountRole) {
     switchView("accounts");
     managementTab = role;
@@ -747,6 +954,265 @@
     return userId || "尚未读取";
   }
 
+  function followingLiveSnapshot(instance: BrowserInstance) {
+    return browserFollowingLive[instance.id];
+  }
+
+  function followingLiveTooltip(instance: BrowserInstance) {
+    const snapshot = followingLiveSnapshot(instance);
+    if (!snapshot) return browserFollowingLiveErrors[instance.id] ? "直播未知" : "读取直播";
+    return `${snapshot.total} 个正在直播`;
+  }
+
+  async function loadBrowserFollowingLive(instance: BrowserInstance, force = false) {
+    if (browserFollowingLiveLoadingIds.includes(instance.id)) return;
+    browserFollowingLiveLoadingIds = [...browserFollowingLiveLoadingIds, instance.id];
+    const nextErrors = { ...browserFollowingLiveErrors };
+    delete nextErrors[instance.id];
+    browserFollowingLiveErrors = nextErrors;
+    try {
+      const result = await engineRequest<FollowingLiveResult>("browser.following_live", {
+        instance_id: instance.id,
+        force,
+      });
+      browserFollowingLive = { ...browserFollowingLive, [instance.id]: result };
+      if (force && !result.stale) {
+        await loadRooms(false);
+        void loadRedPacketMonitors(true);
+      }
+    } catch (error) {
+      browserFollowingLiveErrors = {
+        ...browserFollowingLiveErrors,
+        [instance.id]: error instanceof Error ? error.message : String(error),
+      };
+    } finally {
+      browserFollowingLiveLoadingIds = browserFollowingLiveLoadingIds.filter((id) => id !== instance.id);
+    }
+  }
+
+  async function loadBrowserFollowingLives(instances: BrowserInstance[]) {
+    const seenAccounts = new Set<string>();
+    const queue = instances.filter((instance) => {
+      if (!instance.account_id || seenAccounts.has(instance.account_id)) return false;
+      seenAccounts.add(instance.account_id);
+      return true;
+    });
+    await Promise.all(
+      Array.from({ length: Math.min(2, queue.length) }, async () => {
+        while (queue.length > 0) {
+          const instance = queue.shift();
+          if (instance) await loadBrowserFollowingLive(instance);
+        }
+      }),
+    );
+    if (queue.length === 0 && instances.length > 0) {
+      await loadRooms(false);
+      void loadRedPacketMonitors(true);
+    }
+  }
+
+  async function openFollowingLive(instance: BrowserInstance) {
+    followingLiveModalInstance = instance;
+    // Native child WebViews always sit above HTML, regardless of CSS z-index.
+    // Invalidate any pending bounds/show work, then serialize one final hide
+    // before the live-room dialog is allowed to own the visual top layer.
+    browserLayoutRevision += 1;
+    await queueBrowserNativeLayout(hideEmbeddedBrowsers);
+    void loadBrowserFollowingLive(instance);
+  }
+
+  async function closeFollowingLive() {
+    followingLiveModalInstance = null;
+    browserLayoutRevision += 1;
+    const revision = browserLayoutRevision;
+    await tick();
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+    await queueBrowserNativeLayout(() => syncEmbeddedBrowsers(revision));
+  }
+
+  async function openFollowingLiveRoom(item: FollowingLiveItem) {
+    const webRID = (item.web_rid || item.room_id || "").trim();
+    if (!/^\d{6,24}$/.test(webRID)) {
+      showToast("这个直播间暂时没有可打开的房间号");
+      return;
+    }
+    if (!isTauriDesktop()) {
+      window.open(`https://live.douyin.com/${webRID}`, "_blank", "noopener,noreferrer");
+      return;
+    }
+    try {
+      await invoke("open_live_room", { webRid: webRID });
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  function truncatedTooltip(node: HTMLElement, initialText: string) {
+    let text = initialText;
+    let tooltip: HTMLDivElement | null = null;
+    let frame = 0;
+    const originalTabIndex = node.getAttribute("tabindex");
+
+    function hideTooltip() {
+      tooltip?.remove();
+      tooltip = null;
+    }
+
+    function refresh() {
+      const normalized = text.trim();
+      const truncated = Boolean(normalized) && node.scrollWidth > node.clientWidth + 1;
+      if (truncated) {
+        node.dataset.tooltip = normalized;
+        node.dataset.tooltipPlacement = "edge-safe";
+        node.tabIndex = 0;
+      } else {
+        delete node.dataset.tooltip;
+        delete node.dataset.tooltipPlacement;
+        if (originalTabIndex === null) node.removeAttribute("tabindex");
+        else node.setAttribute("tabindex", originalTabIndex);
+        hideTooltip();
+      }
+    }
+
+    function positionTooltip() {
+      if (!tooltip) return;
+      const rect = node.getBoundingClientRect();
+      const tooltipRect = tooltip.getBoundingClientRect();
+      const viewportInset = 8;
+      let left = rect.left + (rect.width - tooltipRect.width) / 2;
+      left = Math.min(Math.max(left, viewportInset), window.innerWidth - tooltipRect.width - viewportInset);
+      let top = rect.bottom + 6;
+      if (top + tooltipRect.height > window.innerHeight - viewportInset) {
+        top = rect.top - tooltipRect.height - 6;
+      }
+      tooltip.style.left = `${Math.round(left)}px`;
+      tooltip.style.top = `${Math.round(Math.max(viewportInset, top))}px`;
+    }
+
+    function showTooltip() {
+      refresh();
+      if (!node.dataset.tooltip || tooltip) return;
+      tooltip = document.createElement("div");
+      tooltip.className = "shared-overflow-tooltip";
+      tooltip.textContent = node.dataset.tooltip;
+      tooltip.setAttribute("role", "tooltip");
+      document.body.appendChild(tooltip);
+      positionTooltip();
+    }
+
+    function scheduleRefresh() {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(refresh);
+    }
+
+    node.classList.add("portal-tooltip-trigger");
+    node.addEventListener("pointerenter", showTooltip);
+    node.addEventListener("pointerleave", hideTooltip);
+    node.addEventListener("focus", showTooltip);
+    node.addEventListener("blur", hideTooltip);
+    window.addEventListener("resize", positionTooltip);
+    window.addEventListener("scroll", positionTooltip, true);
+    const resizeObserver = new ResizeObserver(scheduleRefresh);
+    resizeObserver.observe(node);
+    scheduleRefresh();
+
+    return {
+      update(nextText: string) {
+        text = nextText;
+        scheduleRefresh();
+      },
+      destroy() {
+        cancelAnimationFrame(frame);
+        resizeObserver.disconnect();
+        hideTooltip();
+        node.classList.remove("portal-tooltip-trigger");
+        window.removeEventListener("resize", positionTooltip);
+        window.removeEventListener("scroll", positionTooltip, true);
+        delete node.dataset.tooltip;
+        delete node.dataset.tooltipPlacement;
+        if (originalTabIndex === null) node.removeAttribute("tabindex");
+        else node.setAttribute("tabindex", originalTabIndex);
+      },
+    };
+  }
+
+  function portalTooltip(node: HTMLElement, initialText: string) {
+    let text = initialText;
+    let tooltip: HTMLDivElement | null = null;
+
+    function hideTooltip() {
+      tooltip?.remove();
+      tooltip = null;
+    }
+
+    function positionTooltip() {
+      if (!tooltip) return;
+      const rect = node.getBoundingClientRect();
+      const tooltipRect = tooltip.getBoundingClientRect();
+      const inset = 8;
+      const gap = 6;
+      const placement = node.dataset.tooltipPlacement || "top";
+      let left = rect.left + (rect.width - tooltipRect.width) / 2;
+      let top = rect.top - tooltipRect.height - gap;
+
+      if (placement === "bottom") top = rect.bottom + gap;
+      if (placement === "left") {
+        left = rect.left - tooltipRect.width - gap;
+        top = rect.top + (rect.height - tooltipRect.height) / 2;
+      }
+      if (placement === "right") {
+        left = rect.right + gap;
+        top = rect.top + (rect.height - tooltipRect.height) / 2;
+      }
+      if (top < inset) top = rect.bottom + gap;
+      if (top + tooltipRect.height > window.innerHeight - inset) {
+        top = rect.top - tooltipRect.height - gap;
+      }
+      left = Math.min(Math.max(left, inset), window.innerWidth - tooltipRect.width - inset);
+      tooltip.style.left = `${Math.round(left)}px`;
+      tooltip.style.top = `${Math.round(Math.max(inset, top))}px`;
+    }
+
+    function showTooltip() {
+      const normalized = text.trim();
+      if (!normalized || tooltip) return;
+      tooltip = document.createElement("div");
+      tooltip.className = "shared-overflow-tooltip";
+      tooltip.textContent = normalized;
+      tooltip.setAttribute("role", "tooltip");
+      document.body.appendChild(tooltip);
+      positionTooltip();
+    }
+
+    node.classList.add("portal-tooltip-trigger");
+    node.addEventListener("pointerenter", showTooltip);
+    node.addEventListener("pointerleave", hideTooltip);
+    node.addEventListener("focus", showTooltip);
+    node.addEventListener("blur", hideTooltip);
+    window.addEventListener("resize", positionTooltip);
+    window.addEventListener("scroll", positionTooltip, true);
+
+    return {
+      update(nextText: string) {
+        text = nextText;
+        if (tooltip) {
+          tooltip.textContent = text.trim();
+          positionTooltip();
+        }
+      },
+      destroy() {
+        hideTooltip();
+        node.classList.remove("portal-tooltip-trigger");
+        node.removeEventListener("pointerenter", showTooltip);
+        node.removeEventListener("pointerleave", hideTooltip);
+        node.removeEventListener("focus", showTooltip);
+        node.removeEventListener("blur", hideTooltip);
+        window.removeEventListener("resize", positionTooltip);
+        window.removeEventListener("scroll", positionTooltip, true);
+      },
+    };
+  }
+
   function switchView(key: NavKey) {
     if (activeView === "browsers" && key !== "browsers") {
       void releaseEmbeddedBrowsers();
@@ -757,6 +1223,7 @@
     searchOpen = false;
     statusMenuOpen = false;
     importMenuOpen = false;
+    roomSortMenuOpen = false;
     if (engineListenerReady && (key === "accounts" || key === "browsers")) {
       void loadAccounts();
     }
@@ -860,6 +1327,17 @@
     await Promise.all(browserInstances.map((instance) => hideEmbeddedBrowser(instance.id)));
   }
 
+  function queueBrowserNativeLayout(operation: () => Promise<void>) {
+    const queued = browserNativeLayoutChain
+      .catch(() => undefined)
+      .then(operation);
+    // Keep later layout work serialized even if one native command fails.
+    // The returned promise still preserves the original failure for callers
+    // that need to report it.
+    browserNativeLayoutChain = queued.catch(() => undefined);
+    return queued;
+  }
+
   function updateBrowserRuntimeState(
     instanceId: string,
     state: "stopped" | "waiting" | "running",
@@ -884,6 +1362,7 @@
       }
       browserWebviewMountedIds = browserWebviewMountedIds.filter((id) => id !== instance.id);
       browserWebviewMountingIds = browserWebviewMountingIds.filter((id) => id !== instance.id);
+      browserWebviewLoadingIds = browserWebviewLoadingIds.filter((id) => id !== instance.id);
       if (engineListenerReady) {
         browserCapacity = await engineRequest<BrowserCapacity>("browser.runtime.release", {
           instance_id: instance.id,
@@ -910,6 +1389,9 @@
       return;
     }
     browserWebviewMountingIds = [...browserWebviewMountingIds, instance.id];
+    if (!browserWebviewLoadingIds.includes(instance.id)) {
+      browserWebviewLoadingIds = [...browserWebviewLoadingIds, instance.id];
+    }
     const nextErrors = { ...browserWebviewErrors };
     delete nextErrors[instance.id];
     browserWebviewErrors = nextErrors;
@@ -919,7 +1401,10 @@
       });
       browserCapacity = admission.capacity;
       updateBrowserRuntimeState(instance.id, admission.state, admission.queue_position ?? 0);
-      if (!admission.granted) return;
+      if (!admission.granted) {
+        browserWebviewLoadingIds = browserWebviewLoadingIds.filter((id) => id !== instance.id);
+        return;
+      }
       await invoke("mount_browser_webview", {
         instanceId: instance.id,
         bounds: embeddedBrowserBounds(element),
@@ -940,6 +1425,7 @@
           instance_id: instance.id,
         }).catch(() => browserCapacity);
         updateBrowserRuntimeState(instance.id, "stopped");
+        browserWebviewLoadingIds = browserWebviewLoadingIds.filter((id) => id !== instance.id);
         return;
       }
       if (!browserWebviewMountedIds.includes(instance.id)) {
@@ -955,6 +1441,7 @@
         accounts = await engineRequest<AccountItem[]>("account.list");
       }
     } catch (error) {
+      browserWebviewLoadingIds = browserWebviewLoadingIds.filter((id) => id !== instance.id);
       browserWebviewErrors = {
         ...browserWebviewErrors,
         [instance.id]: error instanceof Error ? error.message : String(error),
@@ -971,12 +1458,25 @@
     }
   }
 
-  async function syncEmbeddedBrowsers() {
-    if (!isTauriDesktop() || browserLayoutChanging) return;
+  async function syncEmbeddedBrowsers(expectedRevision = browserLayoutRevision) {
+    if (
+      !isTauriDesktop() ||
+      browserLayoutChanging ||
+      followingLiveModalInstance ||
+      browserPendingClose ||
+      expectedRevision !== browserLayoutRevision
+    ) return;
     await tick();
+    if (
+      browserLayoutChanging ||
+      followingLiveModalInstance ||
+      browserPendingClose ||
+      expectedRevision !== browserLayoutRevision
+    ) return;
     const visibleIds = new Set(visibleBrowserInstances.map((instance) => instance.id));
     await Promise.all(
       browserInstances.map(async (instance) => {
+        if (browserLayoutChanging || expectedRevision !== browserLayoutRevision) return;
         const element = document.querySelector<HTMLElement>(
           `[data-browser-instance="${instance.id}"]`,
         );
@@ -1001,17 +1501,32 @@
           const admission = await engineRequest<BrowserAdmission>("browser.runtime.acquire", {
             instance_id: instance.id,
           });
+          if (browserLayoutChanging || expectedRevision !== browserLayoutRevision) return;
           browserCapacity = admission.capacity;
           updateBrowserRuntimeState(instance.id, admission.state, admission.queue_position ?? 0);
           if (!admission.granted) {
             await releaseEmbeddedBrowser({ ...instance, runtime_state: "running" });
             return;
           }
+          if (
+            browserLayoutChanging ||
+            expectedRevision !== browserLayoutRevision ||
+            !element.isConnected ||
+            !browserMountIsVisible(element)
+          ) return;
           await invoke("sync_browser_webview", {
             instanceId: instance.id,
             bounds: embeddedBrowserBounds(element),
+            // Column dragging hides every native surface first. A WebView
+            // whose first page-load event already arrived must be shown
+            // again after its final geometry is applied; WebViews that are
+            // still loading remain hidden until Rust emits `ready`.
+            reveal:
+              !browserWebviewLoadingIds.includes(instance.id) &&
+              !browserWebviewErrors[instance.id],
           });
         } catch {
+          if (browserLayoutChanging || expectedRevision !== browserLayoutRevision) return;
           browserWebviewMountedIds = browserWebviewMountedIds.filter((id) => id !== instance.id);
           await mountEmbeddedBrowser(instance, element);
         }
@@ -1021,9 +1536,10 @@
 
   function scheduleEmbeddedBrowserSync() {
     if (!isTauriDesktop() || browserLayoutChanging) return;
+    const revision = browserLayoutRevision;
     window.cancelAnimationFrame(browserWebviewSyncFrame);
     browserWebviewSyncFrame = window.requestAnimationFrame(() => {
-      void syncEmbeddedBrowsers();
+      void queueBrowserNativeLayout(() => syncEmbeddedBrowsers(revision));
     });
   }
 
@@ -1068,19 +1584,28 @@
     query = "";
     roomRenderLimit = 300;
     redPacketRenderLimit = 300;
+	participationRecordRenderLimit = 300;
+    if (tab === "redpackets") redPacketHistoryVisible = false;
     accountStatusFilter = "all";
     if (tab === "participation" || tab === "monitoring") accountRole = tab;
     if (tab === "redpackets" && engineListenerReady) void loadRedPacketEvents();
+	if (tab === "participation-records" && engineListenerReady) void loadParticipationRecords();
     if (tab === "rooms" && engineListenerReady) {
       void loadRooms();
       void loadRedPacketMonitors();
     }
   }
 
+  function toggleRedPacketHistory() {
+    redPacketHistoryVisible = !redPacketHistoryVisible;
+    redPacketRenderLimit = 300;
+  }
+
   function searchPlaceholder() {
     if (activeView === "accounts") {
       if (managementTab === "redpackets") return "搜索红包、直播间或房间号";
       if (managementTab === "rooms") return "搜索直播间、主播或房间号";
+	  if (managementTab === "participation-records") return "搜索参与账号、直播间或结果";
       return "搜索账号昵称或抖音号";
     }
     if (activeView === "browsers") return "搜索实例或参与账号";
@@ -1110,9 +1635,13 @@
     return role === "monitoring" ? "监测账号" : "参与账号";
   }
 
-  function accountStatus(account: AccountItem) {
+  function accountStatus(account: AccountItem, clock = Date.now()) {
     const profile = accountRole === "monitoring" ? account.monitoring : account.participation;
     if (accountCookieStatus(account, accountRole) === "expired") return "CK 失效";
+	if (accountRole === "participation" && profile?.red_packet_cooldown_until) {
+		const cooldownUntil = new Date(profile.red_packet_cooldown_until).getTime();
+		if (!Number.isNaN(cooldownUntil) && cooldownUntil > clock) return "冷却中";
+	}
     if (!profile?.enabled || profile.last_error || /冷却|等待|cooldown/i.test(profile.last_use_status || "")) return "冷却中";
     return "可用";
   }
@@ -1161,7 +1690,27 @@
     if (!target.closest(".menu-anchor")) {
       statusMenuOpen = false;
       importMenuOpen = false;
+      roomSortMenuOpen = false;
     }
+  }
+
+  function roomSortModeLabel(mode: RoomSortMode) {
+    if (mode === "instance-first") return "实例优先";
+    if (mode === "live-first") return "开播优先";
+    if (mode === "recent-live") return "最近开播";
+    if (mode === "recent-redpacket") return "红包优先";
+    return "默认顺序";
+  }
+
+  function selectRoomSortMode(mode: RoomSortMode) {
+    roomSortMode = mode;
+    roomSortMenuOpen = false;
+  }
+
+  function toggleRoomSortMenu() {
+    roomSortMenuOpen = !roomSortMenuOpen;
+    statusMenuOpen = false;
+    importMenuOpen = false;
   }
 
   async function pasteAccountCookie() {
@@ -1320,6 +1869,82 @@
     return monitors.find((item) => item.room_id === room.id || item.web_rid === room.web_rid);
   }
 
+  // Followed-live feeds refresh once per minute. Keep a small grace window for
+  // engine scheduling and IPC delivery, but never let a snapshot from a
+  // previous desktop session make a broadcaster look permanently live.
+  const FOLLOWING_LIVE_FRESH_MS = 150_000;
+
+  function roomWasDiscoveredByInstance(room: RoomItem) {
+    return room.source === "following-live" || roomFollowSources(room).length > 0;
+  }
+
+  function roomFollowingLiveTimestamp(room: RoomItem) {
+    let latest = eventTimestamp(room.last_seen_live_at);
+    for (const source of roomFollowSources(room)) {
+      if (source.is_live === false) continue;
+      latest = Math.max(latest, eventTimestamp(source.last_seen_live_at));
+    }
+    return latest;
+  }
+
+  function roomIsFollowingLive(room: RoomItem, clock = Date.now()) {
+    if (!room.following_live) return false;
+    const lastSeen = roomFollowingLiveTimestamp(room);
+    return lastSeen > 0 && clock >= lastSeen - 60_000 && clock - lastSeen <= FOLLOWING_LIVE_FRESH_MS;
+  }
+
+  function roomIsCurrentlyLive(
+    room: RoomItem,
+    monitors: RedPacketMonitor[],
+    overrides: Record<string, { status: string; connectionStatus: string }>,
+    clock = Date.now(),
+  ) {
+    if (roomIsFollowingLive(room, clock)) return true;
+    const monitor = roomMonitorFor(room, monitors);
+    if (!monitor) return false;
+    return roomLiveStatus(monitor, redPacketMonitorUiStatus(monitor, overrides)) === "已开播";
+  }
+
+  function roomLastLiveStartedAt(room: RoomItem, monitors: RedPacketMonitor[]) {
+    const value = roomMonitorFor(room, monitors)?.live_started_at;
+    const monitorTimestamp = value ? new Date(value).getTime() : 0;
+    return Math.max(Number.isFinite(monitorTimestamp) ? monitorTimestamp : 0, roomFollowingLiveTimestamp(room));
+  }
+
+  function roomLastRedPacketAt(room: RoomItem, monitors: RedPacketMonitor[], events: RedPacketEvent[]) {
+    const monitor = roomMonitorFor(room, monitors);
+    let latest = eventTimestamp(monitor?.last_event_at);
+    for (const event of events) {
+      const belongsToRoom = (monitor && event.monitor_id === monitor.id)
+        || event.room_id === room.id
+        || Boolean(room.web_rid && event.web_rid === room.web_rid);
+      if (belongsToRoom) latest = Math.max(latest, eventTimestamp(event.detected_at));
+    }
+    return latest;
+  }
+
+  function roomActiveRedPacketSummary(room: RoomItem, clock: number) {
+    const monitor = roomMonitorFor(room, redPacketMonitors);
+    const events = redPacketEvents.filter((event) => {
+      const belongsToRoom = (monitor && event.monitor_id === monitor.id)
+        || event.room_id === room.id
+        || Boolean(room.web_rid && event.web_rid === room.web_rid)
+        || Boolean(room.actual_room_id && event.room_id === room.actual_room_id);
+      return belongsToRoom && redPacketEventIsActive(event, clock);
+    });
+    if (events.length === 0) return { count: 0, tip: "" };
+
+    const nearest = events
+      .map((event) => ({ event, expiresAt: eventTimestamp(event.expires_at || event.draw_at) }))
+      .filter((item) => item.expiresAt > clock)
+      .sort((left, right) => left.expiresAt - right.expiresAt)[0];
+    const remaining = nearest ? redPacketEventExpiryParts(nearest.event, clock).countdown : "";
+    return {
+      count: events.length,
+      tip: `检测到 ${events.length} 个未过期红包${remaining ? ` · 最近结束 ${remaining}` : ""}`,
+    };
+  }
+
   function redPacketMonitorName(monitor: RedPacketMonitor) {
     return monitor.name || monitor.streamer_name || `直播间 ${monitor.web_rid || monitor.room_id}`;
   }
@@ -1373,6 +1998,35 @@
     if (monitor.live_status === "offline") return "未开播";
     if (monitor.live_status === "error" || monitor.connection_status === "error") return "探测异常";
     return "检测中";
+  }
+
+  function roomCombinedLiveStatus(
+    room: RoomItem,
+    monitor?: RedPacketMonitor,
+    status = monitor ? redPacketMonitorUiStatus(monitor) : "",
+    clock = Date.now(),
+  ) {
+    if (!room.enabled) return "已停用";
+    if (roomIsFollowingLive(room, clock)) return "已开播";
+    if (monitor) return roomLiveStatus(monitor, status);
+    return "未监测";
+  }
+
+  function roomCombinedMonitorPhase(
+    room: RoomItem,
+    monitor?: RedPacketMonitor,
+    status = monitor ? redPacketMonitorUiStatus(monitor) : "",
+    clock = Date.now(),
+  ) {
+    if (roomIsFollowingLive(room, clock)) {
+      const discovered = `实例关注发现 · ${formatMonitorTime(room.last_seen_live_at)}`;
+      if (!monitor || status !== "running") return discovered;
+      if (monitor.live_status === "error" || monitor.connection_status === "error") {
+        return "实例已确认开播 · 红包探测异常";
+      }
+      if (monitor.live_status !== "live") return "实例已确认开播 · 等待红包检测";
+    }
+    return monitor ? roomMonitorPhase(monitor, status) : "红包监测未准备";
   }
 
   function roomMonitorPhase(monitor: RedPacketMonitor, status = redPacketMonitorUiStatus(monitor)) {
@@ -1522,6 +2176,36 @@
     }
   }
 
+	async function loadParticipationRecords() {
+		if (participationRecordsLoading) return;
+		participationRecordsLoading = true;
+		participationRecordError = "";
+		try {
+			participationRecords = await engineRequest<ParticipationRecord[]>("red_packet_participation.list");
+		} catch (error) {
+			participationRecordError = error instanceof Error ? error.message : String(error);
+		} finally {
+			participationRecordsLoading = false;
+		}
+	}
+
+	function participationRecordStatus(record: ParticipationRecord) {
+		if (record.status === "pending") return { label: "等待中", tone: "pending" };
+		if (record.status === "joined") return { label: "参与成功", tone: "success" };
+		if (record.status === "already_joined") return { label: "已参与", tone: "success" };
+		if (record.status === "risk_control") return { label: "风控冷却", tone: "warning" };
+		if (record.status === "login_expired") return { label: "CK 失效", tone: "error" };
+		if (record.status === "network_error") return { label: "网络异常", tone: "warning" };
+		if (record.status === "expired") return { label: "已过期", tone: "muted" };
+		return { label: "参与失败", tone: "error" };
+	}
+
+	function participationRecordEndpoint(record: ParticipationRecord) {
+		if (record.endpoint === "rush") return "rush 回退";
+		if (record.endpoint === "join") return "join 接口";
+		return "等待请求";
+	}
+
   async function toggleRoomRedPacketMonitor(monitor: RedPacketMonitor) {
     if (redPacketMonitorActionId || redPacketBatchAction) return;
     redPacketMonitorActionId = monitor.id;
@@ -1568,13 +2252,13 @@
     redPacketBatchAction = action;
     try {
       appendMonitorLog(action === "start" ? "正在批量启动直播间监测" : "正在批量停止直播间监测");
-	  const result = await engineRequest<{ started?: number; stopped?: number; account_id?: string; account_name?: string }>(
+	  const result = await engineRequest<{ started?: number; stopped?: number; account_count?: number }>(
         action === "start" ? "red_packet_monitor.start_all" : "red_packet_monitor.stop_all",
       );
       showToast(action === "start" ? `已启动 ${result.started ?? 0} 个直播间红包监测` : `已停止 ${result.stopped ?? 0} 个直播间红包监测`);
       appendMonitorLog(
 		action === "start"
-		  ? `监测账号「${result.account_name || result.account_id || "默认监测账号"}」已开始监测 ${result.started ?? 0} 个直播间`
+		  ? `${result.account_count ?? 0} 个监测账号已分摊监测 ${result.started ?? 0} 个直播间`
 		  : `批量停止完成：${result.stopped ?? 0} 个直播间`,
         action === "start" ? "success" : "warning",
       );
@@ -1831,6 +2515,7 @@
       ]);
       browserInstances = instances;
       browserCapacity = capacity;
+      void loadBrowserFollowingLives(instances);
       await tick();
       if (activeView === "browsers" && isTauriDesktop()) {
         try {
@@ -1857,18 +2542,21 @@
     const revision = browserLayoutRevision;
     window.cancelAnimationFrame(browserWebviewSyncFrame);
     window.clearTimeout(browserColumnSyncTimer);
-    void hideEmbeddedBrowsers();
+    // Every native visibility mutation shares one queue. Without this, a
+    // slow hide request from an earlier slider value can complete after the
+    // final reveal and randomly strand a card on its HTML placeholder.
+    void queueBrowserNativeLayout(hideEmbeddedBrowsers);
     browserColumnSyncTimer = window.setTimeout(async () => {
       if (revision !== browserLayoutRevision) return;
       // Flush any native bounds request that may have completed after the
       // first hide, then measure only the final settled grid.
-      await hideEmbeddedBrowsers();
+      await queueBrowserNativeLayout(hideEmbeddedBrowsers);
       await tick();
       await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
       await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
       if (revision !== browserLayoutRevision) return;
       browserLayoutChanging = false;
-      await syncEmbeddedBrowsers();
+      await queueBrowserNativeLayout(() => syncEmbeddedBrowsers(revision));
     }, 180);
   }
 
@@ -1994,6 +2682,9 @@
       browserInstances = browserInstances.filter((item) => item.id !== instance.id);
       browserWebviewMountedIds = browserWebviewMountedIds.filter((id) => id !== instance.id);
       browserWebviewMountingIds = browserWebviewMountingIds.filter((id) => id !== instance.id);
+      browserWebviewLoadingIds = browserWebviewLoadingIds.filter((id) => id !== instance.id);
+      browserWebviewReadyIds = browserWebviewReadyIds.filter((id) => id !== instance.id);
+      browserPendingClose = null;
       showToast(`已关闭「${instance.account_name}」的实例，账号环境已保留`);
     } catch (error) {
       browserError = error instanceof Error ? error.message : String(error);
@@ -2005,11 +2696,39 @@
     }
   }
 
+  async function openBrowserCloseConfirm(instance: BrowserInstance) {
+    if (browserClosingId || browserPendingClose) return;
+    browserLayoutRevision += 1;
+    await queueBrowserNativeLayout(hideEmbeddedBrowsers);
+    browserPendingClose = instance;
+  }
+
+  async function cancelBrowserCloseConfirm() {
+    if (browserClosingId) return;
+    browserPendingClose = null;
+    browserLayoutRevision += 1;
+    const revision = browserLayoutRevision;
+    await tick();
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+    await queueBrowserNativeLayout(() => syncEmbeddedBrowsers(revision));
+  }
+
   async function openBrowserInstance(instance: BrowserInstance) {
     if (browserOpeningId) return;
     browserOpeningId = instance.id;
     browserError = "";
     try {
+      // The embedded WKWebView can contain a newer login than the persisted
+      // account credential. Flush it through the native channel before the
+      // card WebView is destroyed so the independent Chrome window receives
+      // the exact same canonical account session.
+      if (isTauriDesktop()) {
+        const loginStateUpdated = await invoke<boolean>("sync_browser_account_cookie", {
+          instanceId: instance.id,
+          requireLoggedIn: true,
+        });
+        if (loginStateUpdated) accounts = await engineRequest<AccountItem[]>("account.list");
+      }
       await releaseEmbeddedBrowser(instance);
       const opened = await engineRequest<BrowserInstance>("browser.open", {
         instance_id: instance.id,
@@ -2043,6 +2762,31 @@
       accountDeleting = false;
     }
   }
+
+	async function toggleAccountRedPacketAPI(account: AccountItem) {
+		if (redPacketAPITogglingAccountIds.includes(account.id)) return;
+		const previous = Boolean(account.participation?.red_packet_api_enabled);
+		const enabled = !previous;
+		redPacketAPITogglingAccountIds = [...redPacketAPITogglingAccountIds, account.id];
+		accounts = accounts.map((item) => item.id === account.id
+			? { ...item, participation: { ...item.participation, enabled: item.participation?.enabled ?? true, red_packet_api_enabled: enabled } }
+			: item);
+		try {
+			const updated = await engineRequest<AccountItem>("account.set_red_packet_api_enabled", {
+				account_id: account.id,
+				enabled,
+			});
+			accounts = accounts.map((item) => item.id === account.id ? updated : item);
+			showToast(enabled ? `已将「${account.nickname || account.name}」加入红包接口参与池` : `已将「${account.nickname || account.name}」移出红包接口参与池`);
+		} catch (error) {
+			accounts = accounts.map((item) => item.id === account.id
+				? { ...item, participation: { ...item.participation, enabled: item.participation?.enabled ?? true, red_packet_api_enabled: previous } }
+				: item);
+			showToast(error instanceof Error ? error.message : String(error));
+		} finally {
+			redPacketAPITogglingAccountIds = redPacketAPITogglingAccountIds.filter((id) => id !== account.id);
+		}
+	}
 
   function toggleMonitor(id: number) {
     monitors = monitors.map((item) =>
@@ -2169,6 +2913,8 @@
     let unlistenEngine: (() => void) | undefined;
     let unlistenMonitorLogReady: (() => void) | undefined;
     let unlistenMonitorLogClear: (() => void) | undefined;
+    let unlistenBrowserWebviewReady: (() => void) | undefined;
+    let unlistenBrowserWebviewLoadError: (() => void) | undefined;
     let unlistenUpdateProgress: (() => void) | undefined;
     if ("__TAURI_INTERNALS__" in window) {
       void listen<string>("engine://message", (event) => handleEngineMessage(event.payload))
@@ -2200,6 +2946,31 @@
       }).then((unlisten) => {
         unlistenMonitorLogClear = unlisten;
       });
+      void listen<BrowserWebviewEvent>("browser-webview://ready", (event) => {
+        const instanceId = event.payload.instance_id?.trim();
+        if (!instanceId) return;
+        browserWebviewLoadingIds = browserWebviewLoadingIds.filter((id) => id !== instanceId);
+        if (!browserWebviewReadyIds.includes(instanceId)) {
+          browserWebviewReadyIds = [...browserWebviewReadyIds, instanceId];
+        }
+        // The page can finish while a grid reflow is in progress. Reconcile
+        // against the latest card bounds instead of trusting the geometry
+        // captured when the child WebView was first created.
+        scheduleEmbeddedBrowserSync();
+      }).then((unlisten) => {
+        unlistenBrowserWebviewReady = unlisten;
+      });
+      void listen<BrowserWebviewEvent>("browser-webview://load-error", (event) => {
+        const instanceId = event.payload.instance_id?.trim();
+        if (!instanceId) return;
+        browserWebviewLoadingIds = browserWebviewLoadingIds.filter((id) => id !== instanceId);
+        browserWebviewErrors = {
+          ...browserWebviewErrors,
+          [instanceId]: event.payload.message || "真实浏览器加载失败",
+        };
+      }).then((unlisten) => {
+        unlistenBrowserWebviewLoadError = unlisten;
+      });
       void listen<UpdateProgress>("update://progress", (event) => {
         updateProgress = event.payload;
       }).then((unlisten) => {
@@ -2230,6 +3001,17 @@
     const browserStatusTimer = window.setInterval(() => {
       void pollBrowserInstanceStatuses();
     }, 2000);
+    const followingRoomSyncTimer = window.setInterval(() => {
+      if (!engineListenerReady) return;
+      if (browserInstances.length > 0) {
+        // A room-list reload only reads the last persisted snapshot. Refresh
+        // the followed-live feeds themselves so instance attribution and the
+        // current live/offline flags keep advancing while the app stays open.
+        void loadBrowserFollowingLives(browserInstances);
+        return;
+      }
+      if (activeView === "accounts") void loadRooms(false);
+    }, 60000);
     const browserCookieSyncTimer = window.setInterval(() => {
       void syncEmbeddedBrowserCookies();
     }, 5000);
@@ -2247,6 +3029,7 @@
       window.clearInterval(redPacketRefreshTimer);
       window.clearInterval(redPacketClockTimer);
       window.clearInterval(browserStatusTimer);
+      window.clearInterval(followingRoomSyncTimer);
       window.clearInterval(browserCookieSyncTimer);
       window.clearTimeout(browserColumnSyncTimer);
       window.cancelAnimationFrame(browserWebviewSyncFrame);
@@ -2255,6 +3038,8 @@
       unlistenEngine?.();
       unlistenMonitorLogReady?.();
       unlistenMonitorLogClear?.();
+      unlistenBrowserWebviewReady?.();
+      unlistenBrowserWebviewLoadError?.();
       unlistenUpdateProgress?.();
       for (const pending of pendingRequests.values()) {
         window.clearTimeout(pending.timer);
@@ -2273,6 +3058,7 @@
 <div
   class:sidebar-collapsed={sidebarCollapsed}
   class:sidebar-resizing={resizingSidebar}
+  class:windows-platform={isWindowsPlatform}
   class="app-shell"
   style={`--sidebar-width:${sidebarCollapsed ? 0 : sidebarWidth}px`}
 >
@@ -2355,6 +3141,13 @@
             data-tooltip-placement="top"
             onclick={openLicenseModal}
           >{licenseStatus.edition}</button>
+          {#if licenseStatus.state === "active" && licenseDaysRemaining !== null}
+            <span
+              class="license-expiry-brief"
+              data-tooltip={`到期时间 ${formatLicenseDate(licenseStatus.expires_at, "")}`}
+              data-tooltip-placement="top"
+            >剩余{licenseDaysRemaining}天</span>
+          {/if}
         </span>
       </span>
       <button
@@ -2621,11 +3414,15 @@
                         <strong>等待运行资源</strong>
                         <small>队列第 {item.queue_position || 1} 位，资源释放后自动启动</small>
                       </span>
-                    {:else if browserWebviewMountingIds.includes(item.id)}
-                      <span class="browser-preview-loading">
-                        <ArrowClockwise class="spinning" size={18} />
-                        <strong>正在嵌入真实浏览器</strong>
-                        <small>正在同步该账号的独立登录态</small>
+                    {:else if browserWebviewMountingIds.includes(item.id) || browserWebviewLoadingIds.includes(item.id)}
+                      <span class="browser-preview-loading loading">
+                        <span class="browser-loading-icon"><ArrowClockwise class="spinning" size={15} /></span>
+                        <strong>{browserWebviewReadyIds.includes(item.id) ? "正在恢复实例" : "正在加载实例"}</strong>
+                        <small>
+                          {browserWebviewReadyIds.includes(item.id)
+                            ? "正在恢复上次页面与账号登录状态"
+                            : `正在准备「${item.account_name}」的独立浏览器`}
+                        </small>
                       </span>
                     {:else if browserWebviewErrors[item.id]}
                       <span class="browser-preview-loading error">
@@ -2644,24 +3441,47 @@
                 </div>
 
                 <div class="browser-account-row">
-                  <span class={`simple-icon browser-tone-${index % 3}`}><Browser size={14} /></span>
+                  <span class={`simple-icon browser-tone-${index % 3}`}><Browser size={12} /></span>
                   <div class="simple-title browser-account-title">
                     <h2>
-                      <span>{item.account_name}</span>
-                      <small>{browserAccountDouyinId(item)}</small>
+                      <span use:truncatedTooltip={item.account_name}>{item.account_name}</span>
+                      <small use:truncatedTooltip={browserAccountDouyinId(item)}>{browserAccountDouyinId(item)}</small>
                       {#if browserCookieExpired(item)}
-                        <em class="browser-cookie-expired" data-tooltip={browserCookieMessage(item)} data-tooltip-placement="top">CK 已失效</em>
+                        <em
+                          class="browser-cookie-expired"
+                          use:portalTooltip={"CK 已失效"}
+                          data-tooltip="CK 已失效"
+                          data-tooltip-placement="bottom"
+                        >CK</em>
                       {/if}
                     </h2>
                   </div>
                   <div class="browser-card-actions">
+                    <button
+                      class="browser-following-live-button"
+                      class:has-live={Boolean(followingLiveSnapshot(item)?.total)}
+                      use:portalTooltip={followingLiveTooltip(item)}
+                      aria-label={followingLiveSnapshot(item)
+                        ? `查看 ${followingLiveSnapshot(item).total} 个正在直播的关注账号`
+                        : "读取正在直播的关注账号"}
+                      data-tooltip={followingLiveTooltip(item)}
+                      data-tooltip-placement="bottom"
+                      onclick={() => openFollowingLive(item)}
+                    >
+                      {#if browserFollowingLiveLoadingIds.includes(item.id)}
+                        <ArrowClockwise class="spinning" size={10} />
+                      {:else}
+                        <Radio size={10} weight="fill" />
+                      {/if}
+                      <span>{followingLiveSnapshot(item) ? followingLiveSnapshot(item).total : browserFollowingLiveErrors[item.id] ? "未知" : "读取"}</span>
+                    </button>
                     <button
                       class="secondary-button browser-close-button"
                       aria-label="关闭实例"
                       data-tooltip="关闭实例"
                       data-tooltip-placement="left"
                       disabled={browserClosingId === item.id}
-                      onclick={() => closeBrowserInstance(item)}
+                      onclick={() => openBrowserCloseConfirm(item)}
                     >
                       {#if browserClosingId === item.id}<ArrowClockwise class="spinning" size={13} />
                       {:else}<X size={13} weight="bold" />{/if}
@@ -2725,7 +3545,7 @@
             aria-selected={managementTab === "redpackets"}
             onclick={() => selectManagementTab("redpackets")}
           >
-            红包 <span>{redPacketEvents.length}</span>
+            红包 <span>{activeRedPacketCount}</span>
           </button>
           <button
             class:active={managementTab === "rooms"}
@@ -2752,7 +3572,19 @@
             监测账号 <span>{monitoringAccounts.length}</span>
           </button>
           {#if managementTab === "redpackets"}
-            <p>仅展示直播间实时发现的红包</p>
+            <div class="red-packet-history-entry">
+              <button
+                type="button"
+                aria-pressed={redPacketHistoryVisible}
+                data-tooltip={redPacketHistoryVisible ? "返回未过期红包" : "查看已过期红包"}
+                data-tooltip-placement="top"
+                onclick={toggleRedPacketHistory}
+              >
+                {#if redPacketHistoryVisible}<Gift size={13} />{:else}<ClockCountdown size={13} />{/if}
+                <span>{redPacketHistoryVisible ? "当前红包" : "历史红包"}</span>
+                <small>{redPacketHistoryVisible ? activeRedPacketCount : historicalRedPacketCount}</small>
+              </button>
+            </div>
           {:else if managementTab === "rooms"}
             <div class="room-monitor-bulk-actions" aria-label="直播间红包监测批量操作">
               <button class="monitor-log-button" aria-label="查看红包监测运行日志" data-tooltip="查看红包监测运行日志" data-tooltip-placement="top" onclick={openMonitorRuntimeLog}>
@@ -2827,9 +3659,9 @@
               <div class="account-empty"><ArrowClockwise class="spinning" size={22} /><span>正在读取实时红包…</span></div>
             {:else if visibleRedPacketEvents.length === 0}
               <div class="account-empty">
-                <Gift size={28} />
-                <strong>{query ? "没有匹配的红包" : "暂未发现实时红包"}</strong>
-                <span>{query ? "换个关键词试试" : "请先在“直播间”点击“全部启动”，发现红包后会显示在这里"}</span>
+                {#if redPacketHistoryVisible}<ClockCountdown size={28} />{:else}<Gift size={28} />{/if}
+                <strong>{query ? "没有匹配的红包" : redPacketHistoryVisible ? "暂无历史红包" : "暂无未过期红包"}</strong>
+                <span>{query ? "换个关键词试试" : redPacketHistoryVisible ? "过期红包会保留在这里" : "新发现且尚未过期的红包会显示在这里"}</span>
               </div>
             {:else}
               <div class="red-packet-event-list">
@@ -2837,10 +3669,16 @@
 				  <span>红包</span><span>直播间 / 监测账号</span><span>奖品与时效</span><span>发现时间</span><span>参与人数</span>
                 </div>
                 {#each visibleRedPacketEvents as event}
-                  {@const expiry = redPacketEventExpiryParts(event)}
+                  {@const expiry = redPacketEventExpiryParts(event, redPacketClock)}
                   <article class="red-packet-event-row">
                     <div class="red-packet-event-identity">
-                      <span class="room-avatar red-packet-avatar"><Gift size={17} weight="fill" /></span>
+                      <span class="room-avatar red-packet-avatar">
+                        {#if redPacketEventIsDiamond(event)}
+                          <Diamond size={18} weight="fill" />
+                        {:else}
+                          <Gift size={17} weight="fill" />
+                        {/if}
+                      </span>
                       <div>
                         <strong>{event.title || "直播间红包"}</strong>
                         <small>{event.packet_id || "红包事件"} · {event.source === "luckybox_api" ? "红包接口" : "实时检测"}</small>
@@ -2862,7 +3700,7 @@
 					  <strong>{event.prize || "奖品待解析"}</strong>
 					  <small class="red-packet-event-expiry">
 						{#if expiry.countdown}
-						  <span class="red-packet-event-countdown">{expiry.countdown}</span>
+						  <span class:expired={expiry.expired} class="red-packet-event-countdown">{expiry.countdown}</span>
 						  <span class="red-packet-event-expiry-absolute">· {expiry.absolute}</span>
 						{:else}
 						  <span>{expiry.text}</span>
@@ -2899,23 +3737,94 @@
             {:else}
               <div class="room-list">
                 <div class="room-list-head">
-                  <span>直播间</span><span>主播 / 房间标识</span><span>直播与红包状态</span><span>操作</span>
+                  <span>直播间</span>
+                  <span>主播 / 房间标识</span>
+                  <span class="room-list-status-head menu-anchor">
+                    <span>直播与红包状态</span>
+                    <button
+                      type="button"
+                      class:active={roomSortMode !== "default"}
+                      class="room-live-sort-button"
+                      aria-label={`直播间排序：${roomSortModeLabel(roomSortMode)}`}
+                      aria-haspopup="menu"
+                      aria-expanded={roomSortMenuOpen}
+                      data-tooltip={roomSortMenuOpen ? undefined : roomSortModeLabel(roomSortMode)}
+                      data-tooltip-placement="bottom"
+                      onclick={toggleRoomSortMenu}
+                    ><ArrowsDownUp size={11} weight="bold" /></button>
+                    {#if roomSortMenuOpen}
+                      <div class="floating-menu room-sort-menu" role="menu" aria-label="直播间排序">
+                        {#each [
+                          ["default", "默认顺序"],
+                          ["instance-first", "实例优先"],
+                          ["live-first", "开播优先"],
+                          ["recent-live", "最近开播"],
+                          ["recent-redpacket", "红包优先"],
+                        ] as option}
+                          <button
+                            type="button"
+                            class:active={roomSortMode === option[0]}
+                            role="menuitemradio"
+                            aria-checked={roomSortMode === option[0]}
+                            onclick={() => selectRoomSortMode(option[0] as RoomSortMode)}
+                          >
+                            <span>{option[1]}</span>
+                            {#if roomSortMode === option[0]}<CheckCircle size={13} weight="fill" />{/if}
+                          </button>
+                        {/each}
+                      </div>
+                    {/if}
+                  </span>
+                  <span>操作</span>
                 </div>
                 {#each visibleRooms as room}
                     {@const roomMonitor = roomMonitorFor(room, redPacketMonitors)}
                     {@const roomMonitorStatus = roomMonitor ? redPacketMonitorUiStatus(roomMonitor, redPacketMonitorOverrides) : ""}
-                    {@const roomStatusValue = roomMonitor ? roomLiveStatus(roomMonitor, roomMonitorStatus) : room.enabled ? "未监测" : "已停用"}
+                    {@const roomStatusValue = roomCombinedLiveStatus(room, roomMonitor, roomMonitorStatus, redPacketClock)}
+                    {@const activeRoomRedPackets = roomActiveRedPacketSummary(room, redPacketClock)}
+                    {@const roomLiveWebRID = roomOpenWebRID(room, roomMonitor)}
                     <article class="room-row">
                     <div class="room-identity">
                       <span class="room-avatar"><Radio size={18} weight="fill" /></span>
                       <div>
-                        <strong>{roomDisplayName(room)}</strong>
+                        <div class="room-identity-title">
+                          <strong>{roomDisplayName(room)}</strong>
+                          {#if /^\d{6,24}$/.test(roomLiveWebRID)}
+                            <button
+                              type="button"
+                              class="icon-button room-open-live-action"
+                              aria-label="在浏览器中打开直播间"
+                              data-tooltip="在浏览器中打开直播间"
+                              data-tooltip-placement="top"
+                              onclick={() => openRoomLiveRoom(room, roomMonitor)}
+                            ><ArrowSquareOut size={11} /></button>
+                          {/if}
+                        </div>
                         <small>{room.web_rid ? `房间号 ${room.web_rid}` : `记录号 ${room.id}`}</small>
                       </div>
                     </div>
                     <div class="room-streamer-info">
-                      <strong>{roomMonitor?.streamer_name || room.streamer_name || "尚未读取主播"}</strong>
-                      <small>房间标识 {roomMonitor?.actual_room_id || room.actual_room_id || room.id} · {room.source === "dy-kiro" ? "旧福宝导入" : "本机创建"}</small>
+                      <div class="room-streamer-title">
+                        <strong>{roomMonitor?.streamer_name || room.streamer_name || "尚未读取主播"}</strong>
+                        {#if activeRoomRedPackets.count > 0}
+                          <span
+                            class="room-red-packet-indicator"
+                            aria-label={activeRoomRedPackets.tip}
+                            data-tooltip={activeRoomRedPackets.tip}
+                            data-tooltip-placement="top"
+                          ><Gift size={10} weight="fill" /></span>
+                        {/if}
+                      </div>
+                      <div
+                        class="room-streamer-meta"
+                        data-tooltip={roomSourceTooltip(room)}
+                        data-tooltip-placement="top"
+                      >
+                        <small>
+                          房间标识 {roomMonitor?.actual_room_id || room.actual_room_id || room.id} ·
+                          <span class="room-follow-source">{roomSourceLabel(room)}</span>
+                        </small>
+                      </div>
                     </div>
                     <div class="room-live-state">
                       <span
@@ -2924,7 +3833,7 @@
                         class:muted={roomStatusValue === "已停用" || roomStatusValue === "未监测" || roomStatusValue === "未开播"}
                         class="status-pill"
                       ><span></span>{roomStatusValue}</span>
-                      <small>{roomMonitor ? roomMonitorPhase(roomMonitor, roomMonitorStatus) : "红包监测未准备"}</small>
+                      <small>{roomCombinedMonitorPhase(room, roomMonitor, roomMonitorStatus, redPacketClock)}</small>
                     </div>
                     {#if roomMonitor}
                       <button
@@ -3032,10 +3941,10 @@
                   </div>
                   <div class="account-health">
                     <div class="account-health-status">
-					  <span class:warning={accountStatus(account) === "冷却中"} class:expired={accountStatus(account) === "CK 失效"} class="status-pill" data-tooltip={accountCookieMessage(account, accountRole) || undefined} data-tooltip-placement="top">
-                        <span></span>{accountStatus(account)}
-                      </span>
-                      {#if accountStatus(account) === "CK 失效"}
+					  <span class:warning={accountStatus(account, redPacketClock) === "冷却中"} class:expired={accountStatus(account, redPacketClock) === "CK 失效"} class="status-pill" data-tooltip={accountCookieMessage(account, accountRole) || undefined} data-tooltip-placement="top">
+						<span></span>{accountStatus(account, redPacketClock)}
+					  </span>
+					  {#if accountStatus(account, redPacketClock) === "CK 失效"}
                         <button
                           class="account-rebind-button"
                           class:spinning={accountRebindOpeningId === account.id}
@@ -3060,6 +3969,18 @@
                       data-tooltip-placement="left"
                       onclick={() => (accountPendingDelete = account)}
                     ><Trash size={15} /></button>
+					{#if accountRole === "participation"}
+						<button
+							class:enabled={Boolean(account.participation?.red_packet_api_enabled)}
+							class="account-red-packet-api-button"
+							aria-label={account.participation?.red_packet_api_enabled ? "关闭红包接口参与" : "加入红包接口参与池"}
+							aria-pressed={Boolean(account.participation?.red_packet_api_enabled)}
+							data-tooltip={account.participation?.red_packet_api_enabled ? "关闭红包接口参与" : "加入红包接口参与池"}
+							data-tooltip-placement="left"
+							disabled={redPacketAPITogglingAccountIds.includes(account.id)}
+							onclick={() => toggleAccountRedPacketAPI(account)}
+						><Gift size={14} weight={account.participation?.red_packet_api_enabled ? "fill" : "regular"} /></button>
+					{/if}
                   </div>
                 </article>
               {/each}
@@ -3155,24 +4076,40 @@
         {#if licenseStatus.machine_code}<small>设备码 {licenseStatus.machine_code}</small>{/if}
       </div>
 
-      {#if licenseStatus.state === "active"}
+      {#if licenseStatus.state === "active" && !licenseReplacing}
         <div class="license-details">
-          <span><small>激活码</small><strong>{licenseStatus.license_key_masked || "已保存"}</strong></span>
-          <span><small>最近验证</small><strong>{licenseStatus.last_validated_at ? new Date(licenseStatus.last_validated_at).toLocaleString("zh-CN", { hour12: false }) : "刚刚"}</strong></span>
+          <span class="license-key-detail">
+            <small>激活码</small>
+            <strong>{licenseStatus.license_key_masked || "已保存"}</strong>
+            <button
+              aria-label="更换授权码"
+              data-tooltip="更换授权码"
+              data-tooltip-placement="top"
+              onclick={beginLicenseReplacement}
+            ><PencilSimple size={12} weight="bold" /></button>
+          </span>
+          <span><small>最近验证</small><strong>{formatLicenseDate(licenseStatus.last_validated_at, "刚刚")}</strong></span>
+          <span><small>到期时间</small><strong>{formatLicenseDate(licenseStatus.expires_at)}</strong></span>
         </div>
       {:else}
         <label class="field license-key-field">
-          <span>激活码</span>
-          <input bind:value={licenseKey} placeholder="输入福宝激活码" autocomplete="off" spellcheck="false" onkeydown={(event) => event.key === "Enter" && activateLicense()} />
+          <span>{licenseReplacing ? "新激活码" : "激活码"}</span>
+          <input bind:value={licenseKey} placeholder={licenseReplacing ? "输入新的福宝激活码" : "输入福宝激活码"} autocomplete="off" spellcheck="false" onkeydown={(event) => event.key === "Enter" && activateLicense()} />
         </label>
+        {#if licenseReplacing}<p class="license-replace-hint">新授权验证成功后才会替换当前授权。</p>{/if}
       {/if}
 
       {#if licenseError}<div class="license-error"><WarningCircle size={14} />{licenseError}</div>{/if}
       <div class="modal-actions">
-        <button class="secondary-button" disabled={licenseBusy} onclick={closeLicenseModal}>关闭</button>
-        {#if licenseStatus.state === "active"}
+        <button class="secondary-button" disabled={licenseBusy} onclick={licenseReplacing ? cancelLicenseReplacement : closeLicenseModal}>{licenseReplacing ? "取消更换" : "关闭"}</button>
+        {#if licenseStatus.state === "active" && !licenseReplacing}
           <button class="primary-action" disabled={licenseBusy} onclick={refreshLicense}>
             <ArrowClockwise class={licenseBusy ? "spinning" : undefined} size={14} />{licenseBusy ? "刷新中…" : "刷新授权"}
+          </button>
+        {:else if licenseReplacing}
+          <button class="primary-action" disabled={licenseBusy || !licenseKey.trim()} onclick={activateLicense}>
+            {#if licenseBusy}<ArrowClockwise class="spinning" size={14} />{:else}<ShieldCheck size={14} />{/if}
+            {licenseBusy ? "验证中…" : "确认更换"}
           </button>
         {:else}
           <button class="primary-action" disabled={licenseBusy || !licenseKey.trim()} onclick={activateLicense}>
@@ -3374,6 +4311,83 @@
   </div>
 {/if}
 
+{#if followingLiveModalInstance}
+  {@const followingLiveResult = followingLiveSnapshot(followingLiveModalInstance)}
+  <div
+    class="modal-backdrop"
+    role="presentation"
+    onclick={(event) => event.currentTarget === event.target && void closeFollowingLive()}
+  >
+    <dialog class="modal following-live-modal" open aria-labelledby="following-live-modal-title">
+      <div class="modal-head following-live-modal-head">
+        <div>
+          <span class="modal-icon following-live-modal-icon"><Radio size={16} weight="fill" /></span>
+          <div>
+            <h2 id="following-live-modal-title">正在直播</h2>
+            <p>{followingLiveModalInstance.account_name} · {followingLiveResult ? `${followingLiveResult.total} 个关注账号正在直播` : "正在读取关注直播"}</p>
+          </div>
+        </div>
+        <div class="following-live-head-actions">
+          <button
+            class="icon-button"
+            aria-label="刷新正在直播列表"
+            data-tooltip="刷新正在直播列表"
+            data-tooltip-placement="left"
+            disabled={browserFollowingLiveLoadingIds.includes(followingLiveModalInstance.id)}
+            onclick={() => loadBrowserFollowingLive(followingLiveModalInstance!, true)}
+          ><ArrowClockwise
+            class={browserFollowingLiveLoadingIds.includes(followingLiveModalInstance.id) ? "spinning" : undefined}
+            size={14}
+          /></button>
+          <button class="icon-button" aria-label="关闭" onclick={() => void closeFollowingLive()}><X size={16} /></button>
+        </div>
+      </div>
+
+      {#if browserFollowingLiveLoadingIds.includes(followingLiveModalInstance.id) && !followingLiveResult}
+        <div class="following-live-state"><ArrowClockwise class="spinning" size={18} /><span>正在读取这个账号的关注直播…</span></div>
+      {:else if browserFollowingLiveErrors[followingLiveModalInstance.id] && !followingLiveResult}
+        <div class="following-live-state error">
+          <WarningCircle size={19} />
+          <strong>暂时无法读取关注直播</strong>
+          <span>{browserFollowingLiveErrors[followingLiveModalInstance.id]}</span>
+          <button class="secondary-button" onclick={() => loadBrowserFollowingLive(followingLiveModalInstance!, true)}>重新读取</button>
+        </div>
+      {:else if !followingLiveResult || followingLiveResult.items.length === 0}
+        <div class="following-live-state"><Radio size={20} /><strong>当前没有关注账号正在直播</strong><span>点击右上角刷新可重新读取。</span></div>
+      {:else}
+        <div class="following-live-list">
+          {#each followingLiveResult.items as live}
+            <article class="following-live-row">
+              {#if live.avatar_url}
+                <img src={live.avatar_url} alt="" loading="lazy" referrerpolicy="no-referrer" />
+              {:else}
+                <span class="following-live-avatar"><UserCircle size={19} weight="fill" /></span>
+              {/if}
+              <div class="following-live-identity">
+                <strong use:truncatedTooltip={live.nickname || "未命名主播"}>{live.nickname || "未命名主播"}</strong>
+                <small use:truncatedTooltip={live.title || "直播标题尚未读取"}>{live.title || "直播标题尚未读取"}</small>
+              </div>
+              <div class="following-live-room-meta">
+                <span>房间号 <strong>{live.web_rid || "—"}</strong></span>
+                <span>房间标识 <strong>{live.room_id || "—"}</strong></span>
+              </div>
+              <span class="following-live-viewers">{live.viewer_count ? `${live.viewer_count} 在线` : "正在直播"}</span>
+              <button
+                class="icon-button"
+                aria-label={`打开 ${live.nickname || "主播"} 的直播间`}
+                data-tooltip="打开直播间"
+                data-tooltip-placement="left"
+                onclick={() => openFollowingLiveRoom(live)}
+              ><ArrowSquareOut size={14} /></button>
+            </article>
+          {/each}
+        </div>
+      {/if}
+      {#if followingLiveResult?.stale}<p class="following-live-stale">网络暂时不可用，当前展示最近一次成功读取的结果。</p>{/if}
+    </dialog>
+  </div>
+{/if}
+
 {#if accountPendingDelete}
   <ConfirmDialog
     title="删除账号"
@@ -3382,6 +4396,19 @@
     busy={accountDeleting}
     onCancel={() => !accountDeleting && (accountPendingDelete = null)}
     onConfirm={deleteAccount}
+  />
+{/if}
+
+{#if browserPendingClose}
+  <ConfirmDialog
+    title="关闭浏览器实例"
+    message={`确定关闭「${browserPendingClose.account_name}」的浏览器实例吗？\n当前嵌入页面会关闭并从列表移除；账号登录环境与本地配置会保留，下次创建时可继续使用。`}
+    confirmText="确认关闭"
+    busyText="正在关闭…"
+    icon="close"
+    busy={browserClosingId === browserPendingClose.id}
+    onCancel={cancelBrowserCloseConfirm}
+    onConfirm={() => closeBrowserInstance(browserPendingClose!)}
   />
 {/if}
 

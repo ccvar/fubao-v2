@@ -4,7 +4,9 @@
   export let title = "请确认操作";
   export let message: string;
   export let confirmText = "确认";
+  export let busyText = "正在删除…";
   export let cancelText = "取消";
+  export let icon: "trash" | "close" = "trash";
   export let onConfirm: () => void;
   export let onCancel: () => void;
   export let busy = false;
@@ -45,7 +47,9 @@
       <X size={14} />
     </button>
     <div class="confirm-head">
-      <div class="confirm-icon" aria-hidden="true"><Trash size={18} weight="fill" /></div>
+      <div class="confirm-icon" aria-hidden="true">
+        {#if icon === "close"}<X size={17} weight="bold" />{:else}<Trash size={18} weight="fill" />{/if}
+      </div>
       <div class="confirm-copy">
         <h2 id="confirm-title">{title}</h2>
         <p id="confirm-message">{message}</p>
@@ -60,7 +64,7 @@
         disabled={busy}
         onclick={onConfirm}
       >
-        {busy ? "正在删除…" : confirmText}
+        {busy ? busyText : confirmText}
       </button>
     </div>
   </dialog>

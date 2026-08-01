@@ -7,6 +7,7 @@ package httpclient
 import (
 	"context"
 	"crypto/tls"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -228,6 +229,12 @@ func orderedEncode(params map[string]string) string {
 // appends a_bogus last (matching how the Python signer returns params with
 // a_bogus added at the end). The returned map includes a_bogus.
 func (c *Client) BuildSignedURL(baseURL string, params map[string]string) (string, map[string]string) {
+	return c.BuildSignedURLForMethod(http.MethodGet, baseURL, params)
+}
+
+// BuildSignedURLForMethod is identical to BuildSignedURL but binds a_bogus to
+// the actual HTTP method. Douyin's luckybox join/rush actions are POST calls.
+func (c *Client) BuildSignedURLForMethod(method, baseURL string, params map[string]string) (string, map[string]string) {
 	full := make(map[string]string, len(params)+24)
 	for k, v := range params {
 		if k != "a_bogus" {
@@ -241,7 +248,7 @@ func (c *Client) BuildSignedURL(baseURL string, params map[string]string) (strin
 		full[k] = v
 	}
 	orderedQuery := orderedEncode(full)
-	aBogus := abogus.NewSigner("").SignParams(orderedQuery, "GET")
+	aBogus := abogus.NewSigner("").SignParams(orderedQuery, strings.ToUpper(method))
 	full["a_bogus"] = aBogus
 
 	sep := "?"
@@ -266,13 +273,30 @@ func splitURL(u string) (base string, query string, hasQuery bool) {
 // URL. Params are signed (a_bogus + fingerprint) and encoded into the query
 // string, and the signed API headers are attached.
 func (c *Client) NewSignedRequest(ctx context.Context, method, baseURL string, params map[string]string) (*http.Request, error) {
-	finalURL, _ := c.BuildSignedURL(baseURL, params)
-	req, err := http.NewRequestWithContext(ctx, method, finalURL, nil)
+	finalURL, _ := c.BuildSignedURLForMethod(method, baseURL, params)
+	var body io.Reader
+	if strings.EqualFold(method, http.MethodPost) {
+		body = strings.NewReader("")
+	}
+	req, err := http.NewRequestWithContext(ctx, method, finalURL, body)
 	if err != nil {
 		return nil, err
 	}
 	req.Header = c.SignedAPIHeaders()
+	if strings.EqualFold(method, http.MethodPost) {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	}
 	return req, nil
+}
+
+// PostSigned executes a signed same-origin POST action with an empty form body,
+// matching the verified 福宝 luckybox join/rush request.
+func (c *Client) PostSigned(ctx context.Context, baseURL string, params map[string]string) (*http.Response, error) {
+	req, err := c.NewSignedRequest(ctx, http.MethodPost, baseURL, params)
+	if err != nil {
+		return nil, err
+	}
+	return c.http.Do(req)
 }
 
 // GetSigned builds a signed GET request for the base URL + params and executes
@@ -282,5 +306,12 @@ func (c *Client) GetSigned(ctx context.Context, baseURL string, params map[strin
 	if err != nil {
 		return nil, err
 	}
+	return c.http.Do(req)
+}
+
+// Do executes a prepared request through the client's pinned HTTP/1.1
+// transport. Callers use this when an endpoint needs signed headers that are
+// added after NewSignedRequest (for example x-common-params-v2).
+func (c *Client) Do(req *http.Request) (*http.Response, error) {
 	return c.http.Do(req)
 }

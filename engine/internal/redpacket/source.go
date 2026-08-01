@@ -139,7 +139,11 @@ func firstString(values ...any) string {
 }
 
 func (s *source) Fetch(ctx context.Context) ([]poller.Snapshot, error) {
-	if packets, err := s.fetchLuckybox(ctx); err == nil && len(packets) > 0 {
+	packets, err := s.fetchLuckybox(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(packets) > 0 {
 		return packets, nil
 	}
 	return poller.NewHTTPSource(s.client, s.webRID, s.actualRoomID).Fetch(ctx)
@@ -169,7 +173,7 @@ func (s *source) fetchLuckybox(ctx context.Context) ([]poller.Snapshot, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= http.StatusBadRequest {
-		return nil, nil
+		return nil, fmt.Errorf("红包接口返回 HTTP %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(resp.Body)
 	if err != nil || len(strings.TrimSpace(string(body))) == 0 {

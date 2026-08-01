@@ -11,8 +11,8 @@ use std::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::{
-    webview::{Cookie, WebviewBuilder},
-    Emitter, LogicalPosition, LogicalSize, Manager, WebviewUrl, WebviewWindowBuilder,
+    webview::{Cookie, PageLoadEvent, WebviewBuilder},
+    Emitter, LogicalPosition, LogicalSize, Manager, Url, WebviewUrl, WebviewWindowBuilder,
 };
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
@@ -29,6 +29,11 @@ struct EngineRuntime {
     online: AtomicBool,
     native_secret: String,
     pending: Mutex<HashMap<String, oneshot::Sender<String>>>,
+    // Child WebViews are intentionally destroyed when the browser screen is
+    // not visible so they release their runtime leases. Remember only their
+    // last safe Douyin location here so remounting the same stable instance
+    // restores its page instead of always jumping back to the home page.
+    browser_locations: Mutex<HashMap<String, String>>,
 }
 
 impl Default for EngineRuntime {
@@ -38,6 +43,7 @@ impl Default for EngineRuntime {
             online: AtomicBool::new(false),
             native_secret: Uuid::new_v4().to_string(),
             pending: Mutex::new(HashMap::new()),
+            browser_locations: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -304,6 +310,35 @@ fn read_douyin_cookie(webview: &tauri::Webview) -> Result<String, String> {
         .join("; "))
 }
 
+fn canonical_cookie_values(raw_cookie: &str) -> HashMap<String, String> {
+    raw_cookie
+        .split(';')
+        .filter_map(|item| item.trim().split_once('='))
+        .filter_map(|(name, value)| {
+            let name = name.trim();
+            if name.is_empty() || name == "fubao_login_probe" {
+                return None;
+            }
+            Some((name.to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod cookie_tests {
+    use super::canonical_cookie_values;
+
+    #[test]
+    fn complete_cookie_comparison_ignores_order_but_detects_auxiliary_changes() {
+        let stored = canonical_cookie_values("sessionid_ss=session; ttwid=old; sid_guard=guard");
+        let reordered = canonical_cookie_values("sid_guard=guard; sessionid_ss=session; ttwid=old");
+        let rotated = canonical_cookie_values("sid_guard=guard; sessionid_ss=session; ttwid=new");
+
+        assert_eq!(stored, reordered);
+        assert_ne!(stored, rotated);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BrowserLoginState {
     LoggedIn,
@@ -359,28 +394,6 @@ async fn inspect_douyin_login(webview: &tauri::Webview) -> Result<BrowserLoginSn
         _ => BrowserLoginState::Unknown,
     };
     Ok(BrowserLoginSnapshot { raw_cookie, state })
-}
-
-fn login_cookie_signature(raw_cookie: &str) -> Vec<(String, String)> {
-    let login_names = [
-        "sessionid_ss",
-        "sessionid",
-        "sid_guard",
-        "sid_tt",
-        "sid_ucp_v1",
-        "ssid_ucp_v1",
-        "uid_tt",
-        "uid_tt_ss",
-        "passport_assist_user",
-    ];
-    let mut values = raw_cookie
-        .split(';')
-        .filter_map(|item| item.trim().split_once('='))
-        .filter(|(name, _)| login_names.contains(&name.trim()))
-        .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
-        .collect::<Vec<_>>();
-    values.sort_by(|left, right| left.0.cmp(&right.0));
-    values
 }
 
 fn build_login_webview(label: String) -> WebviewBuilder<tauri::Wry> {
@@ -674,7 +687,7 @@ fn cancel_account_create(app: tauri::AppHandle, session_id: String) -> Result<()
     Ok(())
 }
 
-fn apply_browser_bounds(webview: &tauri::Webview, bounds: &BrowserBounds) -> Result<(), String> {
+fn apply_browser_geometry(webview: &tauri::Webview, bounds: &BrowserBounds) -> Result<(), String> {
     let width = bounds.width.max(120.0);
     let height = bounds.height.max(90.0);
     // Base the desktop-page scale only on available width. Height changes as
@@ -689,10 +702,80 @@ fn apply_browser_bounds(webview: &tauri::Webview, bounds: &BrowserBounds) -> Res
         .map_err(|error| format!("调整嵌入浏览器大小失败：{error}"))?;
     webview
         .set_zoom(zoom)
-        .map_err(|error| format!("设置嵌入浏览器缩放失败：{error}"))?;
+        .map_err(|error| format!("设置嵌入浏览器缩放失败：{error}"))
+}
+
+fn apply_browser_bounds(webview: &tauri::Webview, bounds: &BrowserBounds) -> Result<(), String> {
+    apply_browser_geometry(webview, bounds)?;
     webview
         .show()
         .map_err(|error| format!("显示嵌入浏览器失败：{error}"))
+}
+
+fn schedule_browser_webview_reveal(
+    webview: tauri::Webview,
+    app: tauri::AppHandle,
+    instance_id: String,
+    revealed: Arc<AtomicBool>,
+    delay: std::time::Duration,
+) {
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        if revealed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        match webview.show() {
+            Ok(()) => {
+                let _ = app.emit(
+                    "browser-webview://ready",
+                    json!({ "instance_id": instance_id }),
+                );
+            }
+            Err(error) => {
+                let _ = app.emit(
+                    "browser-webview://load-error",
+                    json!({
+                        "instance_id": instance_id,
+                        "message": format!("显示嵌入浏览器失败：{error}"),
+                    }),
+                );
+            }
+        }
+    });
+}
+
+fn is_safe_douyin_location(url: &Url) -> bool {
+    url.scheme() == "https"
+        && url
+            .domain()
+            .is_some_and(|domain| domain == "douyin.com" || domain.ends_with(".douyin.com"))
+}
+
+fn remember_browser_location(runtime: &EngineRuntime, instance_id: &str, url: &Url) {
+    if !is_safe_douyin_location(url) {
+        return;
+    }
+    if let Ok(mut locations) = runtime.browser_locations.lock() {
+        locations.insert(instance_id.to_owned(), url.as_str().to_owned());
+    }
+}
+
+fn browser_restore_location(runtime: &EngineRuntime, instance_id: &str) -> Url {
+    runtime
+        .browser_locations
+        .lock()
+        .ok()
+        .and_then(|locations| locations.get(instance_id).cloned())
+        .and_then(|location| location.parse::<Url>().ok())
+        .filter(is_safe_douyin_location)
+        .unwrap_or_else(|| {
+            "https://www.douyin.com/"
+                .parse::<Url>()
+                .expect("static Douyin URL must be valid")
+        })
 }
 
 #[tauri::command]
@@ -728,6 +811,15 @@ async fn mount_browser_webview(
     let blank_url = "about:blank"
         .parse()
         .map_err(|error| format!("初始化浏览器地址失败：{error}"))?;
+    let ready_app = app.clone();
+    let ready_instance_id = instance_id.clone();
+    let ready_once = Arc::new(AtomicBool::new(false));
+    let ready_once_for_page = ready_once.clone();
+    let navigation_runtime = runtime.clone();
+    let navigation_instance_id = instance_id.clone();
+    let page_runtime = runtime.clone();
+    let page_instance_id = instance_id.clone();
+    let restore_url = browser_restore_location(&runtime, &instance_id);
     let mut builder = WebviewBuilder::new(label.clone(), WebviewUrl::External(blank_url))
         .focused(false)
         .accept_first_mouse(true)
@@ -736,11 +828,35 @@ async fn mount_browser_webview(
         // browser. Douyin's page-level login gate is UA-sensitive even when
         // its self-profile API accepts the same Cookie.
         .user_agent(DOUYIN_CHROME_USER_AGENT)
-        .on_navigation(|url| {
-            url.scheme() == "about"
-                || url
-                    .domain()
-                    .is_some_and(|domain| domain == "douyin.com" || domain.ends_with(".douyin.com"))
+        .on_navigation(move |url| {
+            if url.scheme() == "about" {
+                return true;
+            }
+            if is_safe_douyin_location(url) {
+                remember_browser_location(&navigation_runtime, &navigation_instance_id, url);
+                return true;
+            }
+            false
+        })
+        .on_page_load(move |webview, payload| {
+            let is_douyin = is_safe_douyin_location(payload.url());
+            if is_douyin {
+                remember_browser_location(&page_runtime, &page_instance_id, payload.url());
+            }
+            if payload.event() == PageLoadEvent::Finished && is_douyin {
+                // WKWebView can report navigation completion before the
+                // remote SPA has committed its first meaningful frame. Keep
+                // the native surface hidden for a short paint-stabilization
+                // window so the HTML loading state transitions directly into
+                // real Douyin content instead of flashing an empty white card.
+                schedule_browser_webview_reveal(
+                    webview.clone(),
+                    ready_app.clone(),
+                    ready_instance_id.clone(),
+                    ready_once_for_page.clone(),
+                    std::time::Duration::from_millis(1_200),
+                );
+            }
         });
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
@@ -763,19 +879,34 @@ async fn mount_browser_webview(
     let webview = main_window
         .add_child(
             builder,
-            LogicalPosition::new(bounds.x, bounds.y),
+            // Create the native surface outside the visible window first. A
+            // newly-created WKWebView paints white before its first page
+            // frame; keeping it off-card lets the HTML loading state remain
+            // visible until `on_page_load(Finished)` reveals the real page.
+            LogicalPosition::new(-10_000.0, -10_000.0),
             LogicalSize::new(bounds.width.max(120.0), bounds.height.max(90.0)),
         )
         .map_err(|error| format!("创建嵌入浏览器失败：{error}"))?;
 
-    inject_douyin_cookie(&webview, &credential.cookie)?;
-    let douyin_url = "https://www.douyin.com/"
-        .parse()
-        .map_err(|error| format!("解析抖音地址失败：{error}"))?;
     webview
-        .navigate(douyin_url)
+        .hide()
+        .map_err(|error| format!("隐藏待加载浏览器失败：{error}"))?;
+    apply_browser_geometry(&webview, &bounds)?;
+    inject_douyin_cookie(&webview, &credential.cookie)?;
+    webview
+        .navigate(restore_url)
         .map_err(|error| format!("加载抖音页面失败：{error}"))?;
-    apply_browser_bounds(&webview, &bounds)?;
+    // Some Douyin SPA navigations keep network work alive long enough that
+    // WKWebView postpones its Finished callback even though the first screen
+    // is already painted. Avoid an endless loading state while still giving
+    // the page enough time to replace its initial native white surface.
+    schedule_browser_webview_reveal(
+        webview.clone(),
+        app.clone(),
+        instance_id.clone(),
+        ready_once,
+        std::time::Duration::from_millis(5_000),
+    );
     if cfg!(debug_assertions) {
         let current_url = webview
             .url()
@@ -795,10 +926,20 @@ fn sync_browser_webview(
     app: tauri::AppHandle,
     instance_id: String,
     bounds: BrowserBounds,
+    reveal: bool,
 ) -> Result<(), String> {
     let label = browser_webview_label(&instance_id);
     let webview = app.get_webview(&label).ok_or("嵌入浏览器尚未创建")?;
-    apply_browser_bounds(&webview, &bounds)
+    // Geometry synchronization must not reveal an initial white native
+    // surface. Once the frontend has observed the first page-load event,
+    // however, a grid-column change needs to re-show the surface that was
+    // deliberately hidden during drag. Applying bounds and visibility in one
+    // command prevents the card from being stranded on its HTML placeholder.
+    if reveal {
+        apply_browser_bounds(&webview, &bounds)
+    } else {
+        apply_browser_geometry(&webview, &bounds)
+    }
 }
 
 #[tauri::command]
@@ -813,9 +954,21 @@ fn hide_browser_webview(app: tauri::AppHandle, instance_id: String) -> Result<()
 }
 
 #[tauri::command]
-fn close_browser_webview(app: tauri::AppHandle, instance_id: String) -> Result<(), String> {
+fn close_browser_webview(
+    app: tauri::AppHandle,
+    runtime: tauri::State<'_, Arc<EngineRuntime>>,
+    instance_id: String,
+) -> Result<(), String> {
     let label = browser_webview_label(&instance_id);
     if let Some(webview) = app.get_webview(&label) {
+        // Douyin is a SPA, so its current address can change without a full
+        // page-load callback. Snapshot the live native URL immediately before
+        // releasing the child WebView so returning to the browser screen can
+        // restore the same safe Douyin location instead of falling back to the
+        // home page.
+        if let Ok(url) = webview.url() {
+            remember_browser_location(runtime.inner().as_ref(), &instance_id, &url);
+        }
         webview
             .close()
             .map_err(|error| format!("关闭嵌入浏览器失败：{error}"))?;
@@ -861,9 +1014,13 @@ async fn sync_browser_account_cookie(
     app: tauri::AppHandle,
     runtime: tauri::State<'_, Arc<EngineRuntime>>,
     instance_id: String,
+    require_logged_in: Option<bool>,
 ) -> Result<bool, String> {
     let label = browser_webview_label(&instance_id);
     let Some(webview) = app.get_webview(&label) else {
+        if require_logged_in.unwrap_or(false) {
+            return Err("当前卡片登录页面尚未就绪，请等待卡片加载完成后重试".into());
+        }
         if cfg!(debug_assertions) {
             eprintln!(
                 "[embedded-browser] cookie-sync skipped instance={instance_id} reason=not-mounted"
@@ -887,7 +1044,13 @@ async fn sync_browser_account_cookie(
     let mut cookie_changed = false;
     if snapshot.state == BrowserLoginState::LoggedIn {
         if let Some(raw_cookie) = snapshot.raw_cookie.as_deref() {
-            if login_cookie_signature(raw_cookie) != login_cookie_signature(&credential.cookie) {
+            // Compare the complete Cookie map, not only the login markers.
+            // Auxiliary session cookies can rotate while sessionid stays the
+            // same, but an unchanged set must not cause a storage write or a
+            // repeated frontend "CK synced" notification every poll cycle.
+            cookie_changed =
+                canonical_cookie_values(raw_cookie) != canonical_cookie_values(&credential.cookie);
+            if cookie_changed {
                 native_engine_request(
                     runtime.clone(),
                     "account.native_replace_cookie",
@@ -898,7 +1061,6 @@ async fn sync_browser_account_cookie(
                     }),
                 )
                 .await?;
-                cookie_changed = true;
             }
         }
     }
@@ -907,6 +1069,19 @@ async fn sync_browser_account_cookie(
             eprintln!("[embedded-browser] login-state unknown instance={instance_id}");
         }
         return Ok(false);
+    }
+    if require_logged_in.unwrap_or(false) && snapshot.state != BrowserLoginState::LoggedIn {
+        native_engine_request(
+            runtime.clone(),
+            "account.native_set_browser_login_state",
+            json!({
+                "account_id": credential.account_id,
+                "logged_in": false,
+                "secret": runtime.native_secret,
+            }),
+        )
+        .await?;
+        return Err("当前卡片没有检测到有效登录状态，请先完成登录或重新绑定 CK".into());
     }
     let desired_status = if snapshot.state == BrowserLoginState::LoggedIn {
         "valid"

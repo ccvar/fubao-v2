@@ -63,6 +63,80 @@ func TestMigrateAndShareRoles(t *testing.T) {
 	}
 }
 
+func TestRedPacketAPIDefaultsOffAndPersists(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, _, err := store.UpsertAuthenticatedCookie("sessionid_ss=red-packet-opt-in", "参与账号", "20001", "sec-20001", RoleParticipation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Participation == nil || view.Participation.RedPacketAPIEnabled {
+		t.Fatalf("new participation accounts must default off: %+v", view.Participation)
+	}
+	view, err = store.SetRedPacketAPIEnabled(view.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Participation == nil || !view.Participation.RedPacketAPIEnabled {
+		t.Fatalf("expected opt-in to be enabled: %+v", view.Participation)
+	}
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := reloaded.List(RoleParticipation)
+	if len(persisted) != 1 || persisted[0].Participation == nil || !persisted[0].Participation.RedPacketAPIEnabled {
+		t.Fatalf("red-packet opt-in did not persist: %+v", persisted)
+	}
+}
+
+func TestRedPacketParticipationEligibility(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	eligible, _, err := store.UpsertAuthenticatedCookie("sessionid_ss=eligible", "可参与", "30001", "sec-30001", RoleParticipation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expired, _, err := store.UpsertAuthenticatedCookie("sessionid_ss=expired-rp", "失效账号", "30002", "sec-30002", RoleParticipation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cooling, _, err := store.UpsertAuthenticatedCookie("sessionid_ss=cooling", "冷却账号", "30003", "sec-30003", RoleParticipation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabled, _, err := store.UpsertAuthenticatedCookie("sessionid_ss=disabled", "关闭账号", "30004", "sec-30004", RoleParticipation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, accountID := range []string{eligible.ID, expired.ID, cooling.ID} {
+		if _, err := store.SetRedPacketAPIEnabled(accountID, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store.mu.Lock()
+	store.accounts[expired.ID].CookieStatus = cookieStatusExpired
+	store.accounts[cooling.ID].Participation.RedPacketCooldownUntil = time.Now().Add(time.Hour).Format(time.RFC3339Nano)
+	store.mu.Unlock()
+
+	credentials := store.RedPacketParticipationCredentials(time.Now())
+	if len(credentials) != 1 || credentials[0].AccountID != eligible.ID {
+		t.Fatalf("expected only valid, opted-in, non-cooling participation account; got %+v (disabled=%s)", credentials, disabled.ID)
+	}
+	encoded, err := json.Marshal(store.List(RoleParticipation))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "sessionid_ss=") {
+		t.Fatalf("safe account list leaked raw CK: %s", encoded)
+	}
+}
+
 func TestRecordMonitoringRequestTracksLocalCounters(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {

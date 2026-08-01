@@ -18,9 +18,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 const storeVersion = 1
+
+const legacyDouyinUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 
 type Status string
 
@@ -90,9 +94,29 @@ type Store struct {
 }
 
 type cookieSyncEndpoint struct {
-	URL    string
-	Token  string
-	server *http.Server
+	URL            string
+	Token          string
+	server         *http.Server
+	mu             sync.RWMutex
+	bootstrapReady bool
+}
+
+func (endpoint *cookieSyncEndpoint) resetBootstrap() {
+	endpoint.mu.Lock()
+	endpoint.bootstrapReady = false
+	endpoint.mu.Unlock()
+}
+
+func (endpoint *cookieSyncEndpoint) markBootstrapReady() {
+	endpoint.mu.Lock()
+	endpoint.bootstrapReady = true
+	endpoint.mu.Unlock()
+}
+
+func (endpoint *cookieSyncEndpoint) isBootstrapReady() bool {
+	endpoint.mu.RLock()
+	defer endpoint.mu.RUnlock()
+	return endpoint.bootstrapReady
 }
 
 func NewStore(dataDir string) (*Store, error) {
@@ -323,15 +347,16 @@ func (s *Store) Open(instanceID, cookie string) (Instance, error) {
 	if strings.TrimSpace(cookie) == "" {
 		return Instance{}, errors.New("参与账号没有可用 Cookie")
 	}
-	if browserSessionActive(instance) {
-		lease := s.runtimeLeases[instanceID]
-		if lease == nil {
-			lease = &runtimeLease{}
-			s.runtimeLeases[instanceID] = lease
+	// Opening an already-running account is a deliberate restart. This makes
+	// “重新打开实例” pick up the newest canonical Cookie instead of silently
+	// reusing a window that was launched with stale credentials.
+	if browserSessionActive(instance) && instance.PID > 0 {
+		if process, err := os.FindProcess(instance.PID); err == nil {
+			_ = process.Kill()
 		}
-		lease.external = true
-		lease.touched = s.now()
-		return s.decorateInstanceLocked(instance), nil
+		instance.Status = StatusStopped
+		instance.PID = 0
+		s.releaseExternalLocked(instanceID)
 	}
 	admission := s.acquireRuntimeLocked(instanceID, true)
 	if !admission.Granted {
@@ -343,12 +368,26 @@ func (s *Store) Open(instanceID, cookie string) (Instance, error) {
 		return Instance{}, err
 	}
 	profileDir := s.profileDir(instance.AccountID)
+	// Chrome forwards launches to the process that already owns a user-data
+	// directory. Older prototype builds could leave that owner alive after the
+	// tracked launcher PID exited; the next --app launch would then become an
+	// ordinary Chrome new tab. Stop only processes that explicitly reference
+	// this account's isolated profile before starting the canonical app window.
+	if err := stopProfileBrowserProcesses(profileDir); err != nil {
+		s.releaseExternalLocked(instanceID)
+		return Instance{}, err
+	}
 	extensionDir := filepath.Join(profileDir, "fubao-cookie-sync")
 	endpoint, err := s.ensureCookieSyncEndpointLocked(instance)
 	if err != nil {
 		s.releaseExternalLocked(instanceID)
 		return Instance{}, err
 	}
+	// The same authenticated loopback endpoint is reused for this stable
+	// account instance. Each launch still needs its own cookie-injection
+	// handshake, otherwise a prior successful launch can make the next
+	// bootstrap navigate before the extension has restored the account CK.
+	endpoint.resetBootstrap()
 	if err := writeCookieExtension(extensionDir, cookie, endpoint.URL, endpoint.Token); err != nil {
 		s.releaseExternalLocked(instanceID)
 		return Instance{}, err
@@ -359,16 +398,30 @@ func (s *Store) Open(instanceID, cookie string) (Instance, error) {
 		"--no-default-browser-check",
 		"--disable-background-mode",
 		"--disable-background-networking",
+		"--user-agent=" + legacyDouyinUserAgent,
 		"--remote-debugging-port=" + strconv.Itoa(PortHint(instance.ID)),
+		"--remote-allow-origins=http://127.0.0.1",
 		"--disable-extensions-except=" + extensionDir,
 		"--load-extension=" + extensionDir,
-		"--app=https://www.douyin.com/",
+		// Do not let Douyin render a logged-out page before the account Cookie is
+		// present. Go confirms the Cookie through this instance's CDP endpoint,
+		// then performs the first real navigation below.
+		"--app=about:blank",
 		"--window-size=960,760",
 	}
 	command := exec.Command(chrome, args...)
 	if err := command.Start(); err != nil {
 		s.releaseExternalLocked(instanceID)
 		return Instance{}, fmt.Errorf("启动浏览器失败: %w", err)
+	}
+	if err := restoreCookieThroughCDP(PortHint(instance.ID), cookie); err != nil {
+		_ = command.Process.Kill()
+		// Chrome may already have handed the app window to a child process.
+		// Ensure a rejected login never leaves that window alive or keeps the
+		// account profile locked while the UI correctly reports the open failure.
+		_ = stopProfileBrowserProcesses(profileDir)
+		s.releaseExternalLocked(instanceID)
+		return Instance{}, fmt.Errorf("恢复账号登录状态失败: %w", err)
 	}
 	now := time.Now().Format(time.RFC3339Nano)
 	instance.Status = StatusOnline
@@ -380,10 +433,11 @@ func (s *Store) Open(instanceID, cookie string) (Instance, error) {
 		s.releaseExternalLocked(instanceID)
 		return Instance{}, err
 	}
-	go func() {
+	startedPID := command.Process.Pid
+	go func(pid int) {
 		_ = command.Wait()
-		s.markStopped(instanceID)
-	}()
+		s.markStopped(instanceID, pid)
+	}(startedPID)
 	return s.decorateInstanceLocked(instance), nil
 }
 
@@ -452,7 +506,32 @@ func (s *Store) ensureCookieSyncEndpointLocked(instance *Instance) (*cookieSyncE
 		Token: token,
 	}
 	handler := http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		if request.Method != http.MethodPost || request.Header.Get("X-Fubao-Token") != token {
+		if request.Method == http.MethodGet && request.URL.Path == "/bootstrap" {
+			response.Header().Set("Content-Type", "text/html; charset=utf-8")
+			response.Header().Set("Cache-Control", "no-store")
+			response.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'")
+			_, _ = io.WriteString(response, `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>福宝</title><style>html,body{height:100%;margin:0}body{display:grid;place-items:center;background:#fff;color:#777;font:14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.state{display:flex;align-items:center;gap:10px}.spinner{width:16px;height:16px;border:2px solid #e8e6e1;border-top-color:#777;border-radius:50%;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}</style></head><body><div class="state"><span class="spinner"></span><span>正在恢复账号登录状态…</span></div><script>(()=>{const started=Date.now();async function resume(){try{const response=await fetch('/bootstrap-status',{cache:'no-store'});if(response.ok){location.replace('https://www.douyin.com/');return}}catch(_){}if(Date.now()-started>8000){location.replace('https://www.douyin.com/');return}setTimeout(resume,100)}resume()})()</script></body></html>`)
+			return
+		}
+		if request.Method == http.MethodGet && request.URL.Path == "/bootstrap-status" {
+			response.Header().Set("Cache-Control", "no-store")
+			if !endpoint.isBootstrapReady() {
+				response.WriteHeader(http.StatusTooEarly)
+				return
+			}
+			response.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if request.Method == http.MethodPost && request.URL.Path == "/bootstrap-ready" {
+			if request.Header.Get("X-Fubao-Token") != token {
+				http.Error(response, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			endpoint.markBootstrapReady()
+			response.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if request.Method != http.MethodPost || request.URL.Path != "/cookie" || request.Header.Get("X-Fubao-Token") != token {
 			http.Error(response, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -502,11 +581,17 @@ func (s *Store) AccountID(instanceID string) (string, error) {
 	return instance.AccountID, nil
 }
 
-func (s *Store) markStopped(instanceID string) {
+func (s *Store) markStopped(instanceID string, pid int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	instance := s.instances[instanceID]
 	if instance == nil {
+		return
+	}
+	// A deliberate restart can finish the old Chrome process after the new one
+	// has already been registered. Never let that stale waiter stop the new
+	// session or release its runtime lease.
+	if instance.PID != pid {
 		return
 	}
 	instance.Status = StatusStopped
@@ -692,9 +777,278 @@ func findChrome() (string, error) {
 	return "", errors.New("未找到 Chrome 或 Chromium，请先安装浏览器")
 }
 
+func processUsesProfile(command, profileDir string) bool {
+	profileDir = strings.TrimSpace(profileDir)
+	if profileDir == "" {
+		return false
+	}
+	plain := "--user-data-dir=" + profileDir
+	quoted := `--user-data-dir="` + profileDir + `"`
+	if strings.Contains(command, quoted) {
+		return true
+	}
+	for offset := 0; offset < len(command); {
+		index := strings.Index(command[offset:], plain)
+		if index < 0 {
+			return false
+		}
+		end := offset + index + len(plain)
+		if end == len(command) || command[end] == ' ' || command[end] == '\t' {
+			return true
+		}
+		offset = end
+	}
+	return false
+}
+
+func profileBrowserPIDs(profileDir string) ([]int, error) {
+	if runtime.GOOS == "windows" {
+		return nil, nil
+	}
+	absProfile, err := filepath.Abs(profileDir)
+	if err != nil || strings.TrimSpace(absProfile) == "" {
+		return nil, errors.New("浏览器实例配置目录无效")
+	}
+	output, err := exec.Command("ps", "-axo", "pid=,command=").Output()
+	if err != nil {
+		return nil, fmt.Errorf("检查旧浏览器进程失败: %w", err)
+	}
+	currentPID := os.Getpid()
+	pids := make([]int, 0)
+	for _, line := range strings.Split(string(output), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 2 {
+			continue
+		}
+		pid, parseErr := strconv.Atoi(fields[0])
+		if parseErr != nil || pid <= 1 || pid == currentPID {
+			continue
+		}
+		command := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), fields[0]))
+		if processUsesProfile(command, absProfile) {
+			pids = append(pids, pid)
+		}
+	}
+	return pids, nil
+}
+
+func stopProfileBrowserProcesses(profileDir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	pids, err := profileBrowserPIDs(profileDir)
+	if err != nil {
+		return err
+	}
+	for _, pid := range pids {
+		if process, findErr := os.FindProcess(pid); findErr == nil {
+			_ = process.Kill()
+		}
+	}
+	if len(pids) == 0 {
+		return nil
+	}
+	deadline := time.Now().Add(1500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		remaining, probeErr := profileBrowserPIDs(profileDir)
+		if probeErr != nil {
+			return probeErr
+		}
+		if len(remaining) == 0 {
+			return nil
+		}
+		time.Sleep(75 * time.Millisecond)
+	}
+	return errors.New("旧浏览器实例尚未完全退出，请稍后重试")
+}
+
 type browserCookie struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
+}
+
+type cdpTarget struct {
+	Type                 string `json:"type"`
+	WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+}
+
+type cdpResponse struct {
+	ID     int             `json:"id"`
+	Error  *cdpError       `json:"error,omitempty"`
+	Result json.RawMessage `json:"result,omitempty"`
+}
+
+type cdpError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// restoreCookieThroughCDP makes the independent Chrome window deterministic:
+// it does not navigate to Douyin until Chrome has acknowledged every canonical
+// account Cookie in the isolated account profile. The extension remains loaded
+// only for later login changes to be synchronized back to the Go account store.
+func restoreCookieThroughCDP(port int, rawCookie string) error {
+	cookies := parseCookies(rawCookie)
+	if len(cookies) == 0 {
+		return errors.New("账号 Cookie 格式无效")
+	}
+	deadline := time.Now().Add(8 * time.Second)
+	var debuggerURL string
+	for time.Now().Before(deadline) {
+		request, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/json/list", port), nil)
+		if err == nil {
+			client := &http.Client{Timeout: 350 * time.Millisecond}
+			if response, requestErr := client.Do(request); requestErr == nil {
+				var targets []cdpTarget
+				decodeErr := json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&targets)
+				_ = response.Body.Close()
+				if decodeErr == nil {
+					for _, target := range targets {
+						if target.Type == "page" && target.WebSocketDebuggerURL != "" {
+							debuggerURL = target.WebSocketDebuggerURL
+							break
+						}
+					}
+				}
+			}
+		}
+		if debuggerURL != "" {
+			break
+		}
+		time.Sleep(80 * time.Millisecond)
+	}
+	if debuggerURL == "" {
+		return errors.New("独立浏览器调试端口未就绪")
+	}
+
+	header := http.Header{}
+	header.Set("Origin", "http://127.0.0.1")
+	connection, _, err := websocket.DefaultDialer.Dial(debuggerURL, header)
+	if err != nil {
+		return fmt.Errorf("连接独立浏览器失败: %w", err)
+	}
+	defer connection.Close()
+	cdpCookies := make([]map[string]any, 0, len(cookies))
+	for _, cookie := range cookies {
+		cdpCookies = append(cdpCookies, map[string]any{
+			"name":     cookie.Name,
+			"value":    cookie.Value,
+			"domain":   ".douyin.com",
+			"path":     "/",
+			"secure":   true,
+			"sameSite": "None",
+		})
+	}
+	if _, err := sendCDPCommand(connection, 1, "Network.enable", map[string]any{}); err != nil {
+		return err
+	}
+	if _, err := sendCDPCommand(connection, 2, "Network.clearBrowserCookies", map[string]any{}); err != nil {
+		return err
+	}
+	if _, err := sendCDPCommand(connection, 3, "Network.setCookies", map[string]any{"cookies": cdpCookies}); err != nil {
+		return err
+	}
+	result, err := sendCDPCommand(connection, 4, "Network.getCookies", map[string]any{
+		"urls": []string{"https://www.douyin.com/", "https://live.douyin.com/"},
+	})
+	if err != nil {
+		return err
+	}
+	if err := verifyChromeLoginCookies(result, cookies); err != nil {
+		return err
+	}
+	if _, err := sendCDPCommand(connection, 5, "Page.enable", map[string]any{}); err != nil {
+		return err
+	}
+	if _, err := sendCDPCommand(connection, 6, "Page.navigate", map[string]any{"url": "https://www.douyin.com/"}); err != nil {
+		return err
+	}
+	return verifyDouyinPageLogin(connection, 7)
+}
+
+func sendCDPCommand(connection *websocket.Conn, id int, method string, params map[string]any) (json.RawMessage, error) {
+	_ = connection.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := connection.WriteJSON(map[string]any{
+		"id": id, "method": method, "params": params,
+	}); err != nil {
+		return nil, fmt.Errorf("发送浏览器命令 %s 失败: %w", method, err)
+	}
+	for {
+		var response cdpResponse
+		if err := connection.ReadJSON(&response); err != nil {
+			return nil, fmt.Errorf("等待浏览器命令 %s 失败: %w", method, err)
+		}
+		if response.ID != id {
+			continue
+		}
+		if response.Error != nil {
+			return nil, fmt.Errorf("浏览器命令 %s 被拒绝: %s", method, response.Error.Message)
+		}
+		return response.Result, nil
+	}
+}
+
+func verifyChromeLoginCookies(result json.RawMessage, expected []browserCookie) error {
+	var payload struct {
+		Cookies []browserCookie `json:"cookies"`
+	}
+	if err := json.Unmarshal(result, &payload); err != nil {
+		return fmt.Errorf("确认独立浏览器 Cookie 失败: %w", err)
+	}
+	stored := make(map[string]string, len(payload.Cookies))
+	for _, cookie := range payload.Cookies {
+		stored[cookie.Name] = cookie.Value
+	}
+	foundLoginCookie := false
+	for _, cookie := range expected {
+		if isBrowserLoginCookieName(cookie.Name) && strings.TrimSpace(cookie.Value) != "" {
+			if stored[cookie.Name] != cookie.Value {
+				return fmt.Errorf("独立浏览器未接受登录 Cookie %s", cookie.Name)
+			}
+			foundLoginCookie = true
+		}
+	}
+	if !foundLoginCookie {
+		return errors.New("账号 CK 中没有可识别的登录凭据，请重新绑定 CK")
+	}
+	return nil
+}
+
+func verifyDouyinPageLogin(connection *websocket.Conn, firstID int) error {
+	deadline := time.Now().Add(10 * time.Second)
+	id := firstID
+	readySince := time.Time{}
+	for time.Now().Before(deadline) {
+		result, err := sendCDPCommand(connection, id, "Runtime.evaluate", map[string]any{
+			"expression":    `(() => { const text = document.body?.innerText || ""; return { ready: document.readyState !== "loading" && !!document.body, loggedOut: text.includes("登录后免费畅享高清视频") && (text.includes("扫码登录") || text.includes("验证码登录")) }; })()`,
+			"returnByValue": true,
+		})
+		id++
+		if err == nil {
+			var payload struct {
+				Result struct {
+					Value struct {
+						Ready     bool `json:"ready"`
+						LoggedOut bool `json:"loggedOut"`
+					} `json:"value"`
+				} `json:"result"`
+			}
+			if json.Unmarshal(result, &payload) == nil {
+				if payload.Result.Value.LoggedOut {
+					return errors.New("抖音未接受当前 CK，请重新绑定 CK")
+				}
+				if payload.Result.Value.Ready {
+					if readySince.IsZero() {
+						readySince = time.Now()
+					} else if time.Since(readySince) >= 4*time.Second {
+						return nil
+					}
+				}
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	return errors.New("无法确认抖音登录状态，请检查网络后重试")
 }
 
 func writeCookieExtension(extensionDir, rawCookie, callbackURL, callbackToken string) error {
@@ -719,10 +1073,12 @@ func writeCookieExtension(extensionDir, rawCookie, callbackURL, callbackToken st
 }`
 	callbackURLJSON, _ := json.Marshal(callbackURL)
 	callbackTokenJSON, _ := json.Marshal(callbackToken)
+	bootstrapURLJSON, _ := json.Marshal(strings.TrimSuffix(callbackURL, "/cookie") + "/bootstrap")
 	background := fmt.Sprintf(`const cookies = %s;
 const callbackUrl = %s;
 const callbackToken = %s;
-const loginCookieNames = new Set(["sessionid", "sessionid_ss", "sid_guard"]);
+const bootstrapUrl = %s;
+const loginCookieNames = new Set(["sessionid", "sessionid_ss", "sid_guard", "sid_tt", "sid_ucp_v1", "ssid_ucp_v1", "uid_tt", "uid_tt_ss", "passport_assist_user"]);
 function loginFingerprint(items) {
   return items
     .filter((cookie) => loginCookieNames.has(cookie.name) && cookie.value)
@@ -745,14 +1101,32 @@ async function syncCookies() {
       });
     } catch (_) {}
   }
-  setTimeout(async () => {
-    const tabs = await chrome.tabs.query({ url: ["https://*.douyin.com/*", "https://douyin.com/*"] });
+	try {
+		await fetch(callbackUrl.replace(/\/cookie$/, "/bootstrap-ready"), {
+			method: "POST",
+			headers: { "X-Fubao-Token": callbackToken }
+		});
+	} catch (_) {}
+  // The app tab can appear just after the service worker starts. Retry briefly
+  // so the launch never remains on the local bootstrap page or a blank tab.
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const tabs = await chrome.tabs.query({});
+    let handled = false;
     for (const tab of tabs) {
-      if (tab.id) {
-        try { await chrome.tabs.reload(tab.id); } catch (_) {}
-      }
+      if (!tab.id || !tab.url) continue;
+      try {
+        if (tab.url.startsWith(bootstrapUrl)) {
+          await chrome.tabs.update(tab.id, { url: "https://www.douyin.com/" });
+          handled = true;
+        } else if (tab.url.includes("douyin.com")) {
+          await chrome.tabs.reload(tab.id);
+          handled = true;
+        }
+      } catch (_) {}
     }
-  }, 1200);
+    if (handled) return;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
 }
 let syncBackTimer = 0;
 function scheduleCookieSyncBack() {
@@ -786,7 +1160,7 @@ chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
   if (changeInfo.status === "complete" && tab.url && tab.url.includes("douyin.com")) scheduleCookieSyncBack();
 });
 syncCookies();
-`, string(cookieJSON), string(callbackURLJSON), string(callbackTokenJSON))
+`, string(cookieJSON), string(callbackURLJSON), string(callbackTokenJSON), string(bootstrapURLJSON))
 	if err := os.WriteFile(filepath.Join(extensionDir, "manifest.json"), []byte(manifest), 0o600); err != nil {
 		return fmt.Errorf("写入浏览器扩展配置失败: %w", err)
 	}
@@ -798,12 +1172,20 @@ syncCookies();
 
 func hasBrowserLoginCookie(cookies []browserCookie) bool {
 	for _, cookie := range cookies {
-		name := strings.ToLower(strings.TrimSpace(cookie.Name))
-		if (name == "sessionid" || name == "sessionid_ss" || name == "sid_guard") && strings.TrimSpace(cookie.Value) != "" {
+		if isBrowserLoginCookieName(cookie.Name) && strings.TrimSpace(cookie.Value) != "" {
 			return true
 		}
 	}
 	return false
+}
+
+func isBrowserLoginCookieName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "sessionid", "sessionid_ss", "sid_guard", "sid_tt", "sid_ucp_v1", "ssid_ucp_v1", "uid_tt", "uid_tt_ss", "passport_assist_user":
+		return true
+	default:
+		return false
+	}
 }
 
 func serializeBrowserCookies(cookies []browserCookie) string {

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -12,6 +13,7 @@ import (
 
 	"fubao.ccvar.com/engine/internal/accounts"
 	"fubao.ccvar.com/engine/internal/browsers"
+	"fubao.ccvar.com/engine/internal/followinglive"
 	"fubao.ccvar.com/engine/internal/license"
 	"fubao.ccvar.com/engine/internal/redpacket"
 	"fubao.ccvar.com/engine/internal/rooms"
@@ -78,6 +80,7 @@ func main() {
 			return err
 		})
 	}
+	followingLiveService := followinglive.NewService()
 	var roomStore *rooms.Store
 	roomStoreErr := dataDirErr
 	if roomStoreErr == nil {
@@ -90,6 +93,8 @@ func main() {
 	}
 	if redPacketStoreErr == nil && accountStoreErr == nil {
 		redPacketStore.SetRequestRecorder(accountStore.RecordMonitoringRequest)
+		redPacketParticipant := redpacket.NewParticipant(accountStore, redPacketStore)
+		redPacketStore.SetEventHandler(redPacketParticipant.HandleEvent)
 	}
 	var licenseManager *license.Manager
 	licenseManagerErr := dataDirErr
@@ -110,6 +115,11 @@ func main() {
 			Protocol:  protocolVersion,
 		},
 	})
+	backgroundCtx, stopBackground := context.WithCancel(context.Background())
+	defer stopBackground()
+	if accountStoreErr == nil && browserStoreErr == nil && roomStoreErr == nil {
+		go runFollowingLiveSync(backgroundCtx, accountStore, browserStore, followingLiveService, roomStore, redPacketStore)
+	}
 
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
@@ -295,6 +305,25 @@ func main() {
 				OK:      true,
 				Result:  result,
 			})
+		case "account.set_red_packet_api_enabled":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			var params struct {
+				AccountID string `json:"account_id"`
+				Enabled   bool   `json:"enabled"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.AccountID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "红包接口参与开关参数无效")
+				continue
+			}
+			result, err := accountStore.SetRedPacketAPIEnabled(params.AccountID, params.Enabled)
+			if err != nil {
+				writeError(encoder, req.ID, "account_red_packet_api_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
 		case "account.delete":
 			if accountStoreErr != nil {
 				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
@@ -461,6 +490,47 @@ func main() {
 				OK:      true,
 				Result:  browserStore.List(),
 			})
+		case "browser.following_live":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			if browserStoreErr != nil {
+				writeError(encoder, req.ID, "browser_store_unavailable", browserStoreErr.Error())
+				continue
+			}
+			var params struct {
+				InstanceID string `json:"instance_id"`
+				Force      bool   `json:"force"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.InstanceID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "关注直播参数无效")
+				continue
+			}
+			accountID, err := browserStore.AccountID(params.InstanceID)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_following_live_failed", err.Error())
+				continue
+			}
+			credential, err := accountStore.ParticipationCredential(accountID)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_account_invalid", err.Error())
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			result, err := followingLiveService.Fetch(ctx, credential.AccountID, credential.Cookie, params.Force)
+			cancel()
+			if err != nil {
+				writeError(encoder, req.ID, "browser_following_live_failed", err.Error())
+				continue
+			}
+			if !result.Stale {
+				if err := mergeFollowingLiveResult(roomStore, redPacketStore, credential, result); err != nil {
+					writeError(encoder, req.ID, "browser_following_live_sync_failed", err.Error())
+					continue
+				}
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
 		case "browser.capacity":
 			if browserStoreErr != nil {
 				writeError(encoder, req.ID, "browser_store_unavailable", browserStoreErr.Error())
@@ -722,6 +792,12 @@ func main() {
 				continue
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.EventsAll()})
+		case "red_packet_participation.list":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.ParticipationRecords()})
 		case "red_packet_monitor.start_all":
 			if accountStoreErr != nil {
 				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
@@ -735,26 +811,17 @@ func main() {
 				writeError(encoder, req.ID, "red_packet_store_unavailable", err.Error())
 				continue
 			}
-			monitoring := accountStore.List(accounts.RoleMonitoring)
-			if len(monitoring) == 0 {
+			credentials := monitoringPoolCredentials(accountStore)
+			if len(credentials) == 0 {
 				writeError(encoder, req.ID, "monitor_account_missing", "请先导入或添加监测账号")
 				continue
 			}
-			credential, err := accountStore.MonitoringCredential(monitoring[0].ID)
-			if err != nil {
-				writeError(encoder, req.ID, "monitor_account_invalid", err.Error())
-				continue
-			}
-			started, err := redPacketStore.StartAll(credential.AccountID, credential.AccountName, credential.Cookie)
+			result, err := redPacketStore.StartAllPool(credentials)
 			if err != nil {
 				writeError(encoder, req.ID, "red_packet_start_failed", err.Error())
 				continue
 			}
-			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{
-				"started":      started,
-				"account_id":   credential.AccountID,
-				"account_name": credential.AccountName,
-			}})
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
 		case "red_packet_monitor.stop_all":
 			if redPacketStoreErr != nil {
 				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
@@ -784,21 +851,25 @@ func main() {
 				continue
 			}
 			if strings.TrimSpace(params.AccountID) == "" {
-				monitoring := accountStore.List(accounts.RoleMonitoring)
-				if len(monitoring) == 0 {
+				credentials := monitoringPoolCredentials(accountStore)
+				if len(credentials) == 0 {
 					writeError(encoder, req.ID, "monitor_account_missing", "请先导入或添加监测账号")
 					continue
 				}
-				params.AccountID = monitoring[0].ID
-			}
-			credential, err := accountStore.MonitoringCredential(params.AccountID)
-			if err != nil {
-				writeError(encoder, req.ID, "monitor_account_invalid", err.Error())
-				continue
-			}
-			if err := redPacketStore.Start(params.MonitorID, credential.AccountID, credential.AccountName, credential.Cookie); err != nil {
-				writeError(encoder, req.ID, "red_packet_start_failed", err.Error())
-				continue
+				if err := redPacketStore.StartPooled(params.MonitorID, credentials); err != nil {
+					writeError(encoder, req.ID, "red_packet_start_failed", err.Error())
+					continue
+				}
+			} else {
+				credential, err := accountStore.MonitoringCredential(params.AccountID)
+				if err != nil {
+					writeError(encoder, req.ID, "monitor_account_invalid", err.Error())
+					continue
+				}
+				if err := redPacketStore.Start(params.MonitorID, credential.AccountID, credential.AccountName, credential.Cookie); err != nil {
+					writeError(encoder, req.ID, "red_packet_start_failed", err.Error())
+					continue
+				}
 			}
 			monitor, ok := redPacketStore.Get(params.MonitorID)
 			if !ok {
@@ -870,4 +941,92 @@ func writeError(encoder *json.Encoder, id, code, message string) {
 		OK:      false,
 		Error:   &rpcError{Code: code, Message: message},
 	})
+}
+
+func monitoringPoolCredentials(store *accounts.Store) []redpacket.AccountCredential {
+	views := store.List(accounts.RoleMonitoring)
+	credentials := make([]redpacket.AccountCredential, 0, len(views))
+	for _, view := range views {
+		credential, err := store.MonitoringCredential(view.ID)
+		if err != nil {
+			continue
+		}
+		credentials = append(credentials, redpacket.AccountCredential{
+			AccountID:   credential.AccountID,
+			AccountName: credential.AccountName,
+			Cookie:      credential.Cookie,
+		})
+	}
+	return credentials
+}
+
+func mergeFollowingLiveResult(roomStore *rooms.Store, redPacketStore *redpacket.Store, credential accounts.BrowserCredential, result followinglive.Result) error {
+	if roomStore == nil {
+		return errors.New("直播间存储不可用")
+	}
+	items := make([]rooms.FollowingLiveRoom, 0, len(result.Items))
+	for _, item := range result.Items {
+		items = append(items, rooms.FollowingLiveRoom{
+			RoomID:       item.RoomID,
+			WebRID:       item.WebRID,
+			Title:        item.Title,
+			StreamerName: item.Nickname,
+		})
+	}
+	if _, err := roomStore.SyncFollowingLive(credential.AccountID, credential.AccountName, items, result.RefreshedAt); err != nil {
+		return err
+	}
+	if redPacketStore != nil {
+		return redPacketStore.SyncRooms(roomStore.List())
+	}
+	return nil
+}
+
+// runFollowingLiveSync keeps discovery account-centric: one request per
+// canonical participation account, regardless of how often instance cards
+// rerender. The first pass runs shortly after startup, then refreshes once per
+// minute. Temporary network failures keep the previous canonical room data.
+func runFollowingLiveSync(ctx context.Context, accountStore *accounts.Store, browserStore *browsers.Store, service *followinglive.Service, roomStore *rooms.Store, redPacketStore *redpacket.Store) {
+	timer := time.NewTimer(2 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-timer.C:
+	}
+	for {
+		seenAccounts := map[string]struct{}{}
+		for _, instance := range browserStore.List() {
+			accountID := strings.TrimSpace(instance.AccountID)
+			if accountID == "" {
+				continue
+			}
+			if _, exists := seenAccounts[accountID]; exists {
+				continue
+			}
+			seenAccounts[accountID] = struct{}{}
+			credential, err := accountStore.ParticipationCredential(accountID)
+			if err != nil {
+				continue
+			}
+			requestCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			result, err := service.Fetch(requestCtx, credential.AccountID, credential.Cookie, false)
+			cancel()
+			if err == nil && !result.Stale {
+				_ = mergeFollowingLiveResult(roomStore, redPacketStore, credential, result)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(500 * time.Millisecond):
+			}
+		}
+
+		timer.Reset(60 * time.Second)
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+	}
 }

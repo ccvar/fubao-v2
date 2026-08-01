@@ -140,3 +140,81 @@ func TestImportIDsNormalizesDeduplicatesAndMerges(t *testing.T) {
 		t.Fatalf("unexpected imported rooms: %+v", items)
 	}
 }
+
+func TestSyncFollowingLiveMergesCanonicalRoomAndTracksEveryAccount(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ImportIDs("688220427462"); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := store.SyncFollowingLive("account-a", "川、", []FollowingLiveRoom{{
+		RoomID: "7000000000000000001", WebRID: "688220427462", Title: "关注直播标题", StreamerName: "韩可乐",
+	}}, "2026-08-01T16:00:00+08:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Imported != 0 || first.Merged != 1 || first.Total != 1 {
+		t.Fatalf("expected existing room merge, got %+v", first)
+	}
+
+	second, err := store.SyncFollowingLive("account-b", "jojo", []FollowingLiveRoom{{
+		RoomID: "7000000000000000001", WebRID: "688220427462", Title: "更新后的直播标题", StreamerName: "韩可乐",
+	}, {
+		RoomID: "7000000000000000002", WebRID: "699330528573", Title: "另一场直播", StreamerName: "新主播",
+	}}, "2026-08-01T16:01:00+08:00")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Imported != 1 || second.Merged != 1 || second.Total != 2 {
+		t.Fatalf("unexpected second sync: %+v", second)
+	}
+
+	items := store.List()
+	if len(items) != 2 {
+		t.Fatalf("expected two canonical rooms, got %+v", items)
+	}
+	var merged Room
+	for _, item := range items {
+		if item.WebRID == "688220427462" {
+			merged = item
+		}
+	}
+	if merged.Name != "更新后的直播标题" || merged.ActualRoomID != "7000000000000000001" {
+		t.Fatalf("live metadata was not refreshed: %+v", merged)
+	}
+	if !merged.FollowingLive || !merged.FollowSources[0].IsLive || !merged.FollowSources[1].IsLive {
+		t.Fatalf("expected the merged room and both sources to be live: %+v", merged)
+	}
+	if len(merged.FollowSources) != 2 || merged.FollowSources[0].AccountName != "jojo" || merged.FollowSources[1].AccountName != "川、" {
+		t.Fatalf("expected both account attributions, got %+v", merged.FollowSources)
+	}
+	if merged.Source != "manual" {
+		t.Fatalf("sync must preserve the original room source, got %q", merged.Source)
+	}
+
+	if _, err := store.SyncFollowingLive("account-a", "川、", nil, "2026-08-01T16:02:00+08:00"); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.List()) != 2 {
+		t.Fatal("an empty follow snapshot must never delete canonical rooms")
+	}
+	items = store.List()
+	for _, item := range items {
+		if item.WebRID == "688220427462" {
+			if !item.FollowingLive || item.FollowSources[1].IsLive {
+				t.Fatalf("account-a must turn offline while account-b keeps the room live: %+v", item)
+			}
+		}
+	}
+	if _, err := store.SyncFollowingLive("account-b", "jojo", nil, "2026-08-01T16:03:00+08:00"); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range store.List() {
+		if item.WebRID == "688220427462" && item.FollowingLive {
+			t.Fatalf("room should become offline after every source goes offline: %+v", item)
+		}
+	}
+}

@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	storeVersion         = 1
+	storeVersion         = 2
 	unknownProbeInterval = 10 * time.Second
 	offlineProbeInterval = 60 * time.Second
 	livePacketInterval   = 15 * time.Second
@@ -49,6 +49,7 @@ type Monitor struct {
 	Enabled                bool   `json:"enabled"`
 	LastCheckedAt          string `json:"last_checked_at,omitempty"`
 	LastLiveCheckedAt      string `json:"last_live_checked_at,omitempty"`
+	LiveStartedAt          string `json:"live_started_at,omitempty"`
 	LastRedPacketCheckedAt string `json:"last_red_packet_checked_at,omitempty"`
 	LastEventAt            string `json:"last_event_at,omitempty"`
 	LastError              string `json:"last_error,omitempty"`
@@ -77,12 +78,43 @@ type Event struct {
 	DrawAt           string `json:"draw_at,omitempty"`
 	ExpiresAt        string `json:"expires_at,omitempty"`
 	ParticipantCount int    `json:"participant_count,omitempty"`
+	ActualRoomID     string `json:"-"`
+	JoinBoxID        string `json:"-"`
+	AnchorID         string `json:"-"`
+	BoxType          string `json:"-"`
+	SendTime         string `json:"-"`
+	DelayTime        string `json:"-"`
+}
+
+// ParticipationRecord is safe audit metadata for one account/event attempt.
+// It deliberately excludes Cookie values, signed URLs, headers and raw bodies.
+type ParticipationRecord struct {
+	ID            string `json:"id"`
+	EventID       string `json:"event_id"`
+	AccountID     string `json:"account_id"`
+	AccountName   string `json:"account_name"`
+	RoomID        string `json:"room_id,omitempty"`
+	WebRID        string `json:"web_rid,omitempty"`
+	RoomName      string `json:"room_name,omitempty"`
+	StreamerName  string `json:"streamer_name,omitempty"`
+	PacketID      string `json:"packet_id"`
+	Title         string `json:"title,omitempty"`
+	Prize         string `json:"prize,omitempty"`
+	Endpoint      string `json:"endpoint,omitempty"`
+	Status        string `json:"status"`
+	Message       string `json:"message,omitempty"`
+	AttemptCount  int    `json:"attempt_count"`
+	Joined        bool   `json:"joined"`
+	CooldownUntil string `json:"cooldown_until,omitempty"`
+	CreatedAt     string `json:"created_at"`
+	UpdatedAt     string `json:"updated_at"`
 }
 
 type file struct {
-	Version  int        `json:"version"`
-	Monitors []*Monitor `json:"monitors"`
-	Events   []*Event   `json:"events"`
+	Version              int                    `json:"version"`
+	Monitors             []*Monitor             `json:"monitors"`
+	Events               []*Event               `json:"events"`
+	ParticipationRecords []*ParticipationRecord `json:"participation_records,omitempty"`
 }
 
 type Store struct {
@@ -90,8 +122,11 @@ type Store struct {
 	path            string
 	monitors        map[string]*Monitor
 	events          map[string]*Event
+	participations  map[string]*ParticipationRecord
 	runtime         map[string]context.CancelFunc
+	pool            *accountPool
 	requestRecorder func(accountID string, requestErr error)
+	eventHandler    func(Event)
 }
 
 type monitorJob struct {
@@ -99,6 +134,7 @@ type monitorJob struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	source       monitorSource
+	pool         *accountPool
 	initialDelay time.Duration
 }
 
@@ -110,10 +146,11 @@ func NewStore(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("创建红包监测数据目录失败: %w", err)
 	}
 	s := &Store{
-		path:     filepath.Join(dataDir, "red_packet_monitors.json"),
-		monitors: map[string]*Monitor{},
-		events:   map[string]*Event{},
-		runtime:  map[string]context.CancelFunc{},
+		path:           filepath.Join(dataDir, "red_packet_monitors.json"),
+		monitors:       map[string]*Monitor{},
+		events:         map[string]*Event{},
+		participations: map[string]*ParticipationRecord{},
+		runtime:        map[string]context.CancelFunc{},
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -128,6 +165,15 @@ func (s *Store) SetRequestRecorder(recorder func(accountID string, requestErr er
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requestRecorder = recorder
+}
+
+// SetEventHandler attaches a private engine callback for newly detected red
+// packets. It receives safe event metadata only and is invoked outside the
+// store lock so API participation cannot delay room polling.
+func (s *Store) SetEventHandler(handler func(Event)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.eventHandler = handler
 }
 
 func (s *Store) load() error {
@@ -158,6 +204,11 @@ func (s *Store) load() error {
 			s.events[event.ID] = event
 		}
 	}
+	for _, record := range payload.ParticipationRecords {
+		if record != nil && record.ID != "" && record.EventID != "" && record.AccountID != "" {
+			s.participations[record.ID] = record
+		}
+	}
 	return nil
 }
 
@@ -172,9 +223,17 @@ func (s *Store) saveLocked() error {
 		copy := *item
 		events = append(events, &copy)
 	}
+	participations := make([]*ParticipationRecord, 0, len(s.participations))
+	for _, item := range s.participations {
+		copy := *item
+		participations = append(participations, &copy)
+	}
 	sort.Slice(monitors, func(i, j int) bool { return monitors[i].Name < monitors[j].Name })
 	sort.Slice(events, func(i, j int) bool { return events[i].DetectedAt > events[j].DetectedAt })
-	payload, err := json.MarshalIndent(file{Version: storeVersion, Monitors: monitors, Events: events}, "", "  ")
+	sort.Slice(participations, func(i, j int) bool { return participations[i].UpdatedAt > participations[j].UpdatedAt })
+	payload, err := json.MarshalIndent(file{
+		Version: storeVersion, Monitors: monitors, Events: events, ParticipationRecords: participations,
+	}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("序列化红包监测数据失败: %w", err)
 	}
@@ -191,6 +250,76 @@ func (s *Store) saveLocked() error {
 		return fmt.Errorf("保存红包监测数据失败: %w", err)
 	}
 	return nil
+}
+
+// ReserveParticipation durably claims one account/event pair before the native
+// request is sent. Existing records make the operation idempotent across engine
+// restarts as well as repeated event callbacks.
+func (s *Store) ReserveParticipation(event Event, accountID, accountName string) (bool, error) {
+	accountID = strings.TrimSpace(accountID)
+	if strings.TrimSpace(event.ID) == "" || accountID == "" || strings.TrimSpace(event.JoinBoxID) == "" {
+		return false, errors.New("红包参与记录参数不完整")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := participationRecordID(accountID, event.ID)
+	if s.participations[id] != nil {
+		return false, nil
+	}
+	now := time.Now().Format(time.RFC3339Nano)
+	s.participations[id] = &ParticipationRecord{
+		ID: id, EventID: event.ID,
+		AccountID: accountID, AccountName: strings.TrimSpace(accountName),
+		RoomID: event.RoomID, WebRID: event.WebRID,
+		RoomName: event.RoomName, StreamerName: event.StreamerName,
+		PacketID: event.JoinBoxID, Title: event.Title, Prize: event.Prize,
+		Status: "pending", Message: "等待发送红包参与请求",
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := s.saveLocked(); err != nil {
+		delete(s.participations, id)
+		return false, err
+	}
+	return true, nil
+}
+
+// CompleteParticipation updates a reserved record with safe result metadata.
+func (s *Store) CompleteParticipation(eventID, accountID, endpoint, status, message string, attempts int, joined bool, cooldown time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := s.participations[participationRecordID(accountID, eventID)]
+	if record == nil {
+		return errors.New("红包参与记录不存在")
+	}
+	now := time.Now()
+	record.Endpoint = strings.TrimSpace(endpoint)
+	record.Status = strings.TrimSpace(status)
+	record.Message = strings.TrimSpace(message)
+	record.AttemptCount = attempts
+	record.Joined = joined
+	record.CooldownUntil = ""
+	if cooldown > 0 {
+		record.CooldownUntil = now.Add(cooldown).Format(time.RFC3339Nano)
+	}
+	record.UpdatedAt = now.Format(time.RFC3339Nano)
+	return s.saveLocked()
+}
+
+// ParticipationRecords returns newest-first safe audit rows for frontend IPC.
+func (s *Store) ParticipationRecords() []ParticipationRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := make([]ParticipationRecord, 0, len(s.participations))
+	for _, record := range s.participations {
+		items = append(items, *record)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].UpdatedAt > items[j].UpdatedAt })
+	return items
+}
+
+func participationRecordID(accountID, eventID string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(accountID) + "\x00" + strings.TrimSpace(eventID)))
+	return hex.EncodeToString(sum[:16])
 }
 
 // SyncRooms creates a monitor card for every canonical room without starting
@@ -313,13 +442,29 @@ func (s *Store) EventsAll() []Event {
 	return items
 }
 
-// StartAll starts every enabled room monitor with one selected monitoring
-// account. The account credential is kept inside the Go engine.
+// StartAll is retained for callers that deliberately pin every room to one
+// account. Bulk desktop monitoring should use StartAllPool instead.
 func (s *Store) StartAll(accountID, accountName, cookie string) (int, error) {
-	if strings.TrimSpace(cookie) == "" {
-		return 0, errors.New("监测账号没有可用 Cookie")
+	result, err := s.StartAllPool([]AccountCredential{{AccountID: accountID, AccountName: accountName, Cookie: cookie}})
+	return result.Started, err
+}
+
+// StartAllPool distributes enabled rooms over all usable monitoring accounts.
+// Assignment is stable for a room until its account enters cooldown, at which
+// point the next poll automatically fails over to another available account.
+func (s *Store) StartAllPool(credentials []AccountCredential) (PoolStartResult, error) {
+	pool, err := newAccountPool(credentials)
+	if err != nil {
+		return PoolStartResult{}, err
 	}
 	s.mu.Lock()
+	if s.pool == nil {
+		s.pool = pool
+	} else {
+		// Preserve the pool referenced by already-running goroutines. A fresh
+		// engine start still builds it from every currently enabled account.
+		pool = s.pool
+	}
 	now := time.Now().Format(time.RFC3339Nano)
 	jobs := make([]monitorJob, 0, len(s.monitors))
 	for _, monitor := range s.monitors {
@@ -327,17 +472,24 @@ func (s *Store) StartAll(accountID, accountName, cookie string) (int, error) {
 			continue
 		}
 		if _, running := s.runtime[monitor.ID]; running {
+			if account, accountErr := pool.accountFor(monitor.ID); accountErr == nil {
+				monitor.AccountID, monitor.AccountName = account.credential.AccountID, account.credential.AccountName
+			}
 			jobs = append(jobs, monitorJob{id: monitor.ID})
 			continue
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		s.runtime[monitor.ID] = cancel
-		monitor.AccountID, monitor.AccountName = accountID, accountName
+		account, accountErr := pool.accountFor(monitor.ID)
+		if accountErr != nil {
+			delete(s.runtime, monitor.ID)
+			cancel()
+			continue
+		}
+		monitor.AccountID, monitor.AccountName = account.credential.AccountID, account.credential.AccountName
 		monitor.Status, monitor.ConnectionStatus, monitor.LastError = "running", "connecting", ""
 		monitor.UpdatedAt = now
-		roomID := firstNonEmpty(monitor.WebRID, monitor.RoomID)
-		actualRoomID := firstNonEmpty(monitor.ActualRoomID, monitor.RoomID)
-		jobs = append(jobs, monitorJob{id: monitor.ID, ctx: ctx, cancel: cancel, source: newSource(httpclient.New(httpclient.WithCookie(cookie), httpclient.WithRoomURL("https://live.douyin.com/"+roomID)), roomID, actualRoomID), initialDelay: monitorStaggerDelay(monitor.ID)})
+		jobs = append(jobs, monitorJob{id: monitor.ID, ctx: ctx, cancel: cancel, pool: pool, initialDelay: monitorStaggerDelay(monitor.ID)})
 	}
 	if err := s.saveLocked(); err != nil {
 		for _, job := range jobs {
@@ -347,20 +499,21 @@ func (s *Store) StartAll(accountID, accountName, cookie string) (int, error) {
 			}
 		}
 		s.mu.Unlock()
-		return 0, err
+		return PoolStartResult{}, err
 	}
 	s.mu.Unlock()
 	for _, job := range jobs {
-		if job.ctx != nil && job.source != nil {
-			go s.run(job.ctx, job.id, job.source, job.initialDelay)
+		if job.ctx != nil && job.pool != nil {
+			go s.runPooled(job.ctx, job.id, job.pool, job.initialDelay)
 		}
 	}
-	return len(jobs), nil
+	return PoolStartResult{Started: len(jobs), AccountCount: len(pool.ordered), Assignments: pool.summary()}, nil
 }
 
 // StopAll stops every room monitor. Persisted event history is retained.
 func (s *Store) StopAll() (int, error) {
 	s.mu.Lock()
+	s.pool = nil
 	stopped := 0
 	now := time.Now().Format(time.RFC3339Nano)
 	for id, cancel := range s.runtime {
@@ -379,6 +532,74 @@ func (s *Store) StopAll() (int, error) {
 	err := s.saveLocked()
 	s.mu.Unlock()
 	return stopped, err
+}
+
+// StartPooled starts one monitor through the shared account pool. This keeps
+// single-row starts consistent with bulk starts instead of silently reverting
+// to the first monitoring account.
+func (s *Store) StartPooled(id string, credentials []AccountCredential) error {
+	s.mu.Lock()
+	pool := s.pool
+	s.mu.Unlock()
+	if pool == nil {
+		var err error
+		pool, err = newAccountPool(credentials)
+		if err != nil {
+			return err
+		}
+		s.mu.Lock()
+		if s.pool == nil {
+			s.pool = pool
+		} else {
+			pool = s.pool
+		}
+		s.mu.Unlock()
+	}
+
+	s.mu.Lock()
+	monitor := s.monitors[id]
+	if monitor == nil {
+		s.mu.Unlock()
+		return errors.New("红包监测不存在")
+	}
+	if !monitor.Enabled {
+		s.mu.Unlock()
+		return errors.New("直播间已停用")
+	}
+	if s.runtime[id] != nil {
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+
+	account, err := pool.accountFor(id)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	monitor = s.monitors[id]
+	if monitor == nil {
+		s.mu.Unlock()
+		return errors.New("红包监测不存在")
+	}
+	if s.runtime[id] != nil {
+		s.mu.Unlock()
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.runtime[id] = cancel
+	monitor.AccountID, monitor.AccountName = account.credential.AccountID, account.credential.AccountName
+	monitor.Status, monitor.ConnectionStatus, monitor.LastError = "running", "connecting", ""
+	monitor.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+	if err := s.saveLocked(); err != nil {
+		delete(s.runtime, id)
+		cancel()
+		s.mu.Unlock()
+		return err
+	}
+	s.mu.Unlock()
+	go s.runPooled(ctx, id, pool, 0)
+	return nil
 }
 
 func (s *Store) Start(id, accountID, accountName, cookie string) error {
@@ -432,6 +653,9 @@ func (s *Store) Stop(id string) error {
 		cancel()
 		delete(s.runtime, id)
 	}
+	if s.pool != nil {
+		s.pool.dropAssignment(id, monitor.AccountID)
+	}
 	monitor.Status, monitor.ConnectionStatus = "stopped", "disconnected"
 	monitor.UpdatedAt = time.Now().Format(time.RFC3339Nano)
 	return s.saveLocked()
@@ -447,6 +671,9 @@ func (s *Store) Delete(id string) error {
 		cancel()
 		delete(s.runtime, id)
 	}
+	if s.pool != nil {
+		s.pool.dropAssignment(id, s.monitors[id].AccountID)
+	}
 	delete(s.monitors, id)
 	for eventID, event := range s.events {
 		if event.MonitorID == id {
@@ -454,6 +681,108 @@ func (s *Store) Delete(id string) error {
 		}
 	}
 	return s.saveLocked()
+}
+
+func (s *Store) runPooled(ctx context.Context, id string, pool *accountPool, initialDelay time.Duration) {
+	defer func() {
+		s.mu.Lock()
+		if _, ok := s.runtime[id]; ok {
+			delete(s.runtime, id)
+			if monitor := s.monitors[id]; monitor != nil && monitor.Status == "running" {
+				monitor.Status, monitor.ConnectionStatus = "stopped", "disconnected"
+				monitor.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+				_ = s.saveLocked()
+			}
+		}
+		s.mu.Unlock()
+	}()
+	if initialDelay > 0 {
+		timer := time.NewTimer(initialDelay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+	var currentAccountID string
+	var observed *observedMonitorSource
+	for {
+		s.mu.Lock()
+		monitor := s.monitors[id]
+		if monitor == nil {
+			s.mu.Unlock()
+			return
+		}
+		webRID := firstNonEmpty(monitor.WebRID, monitor.RoomID)
+		actualRoomID := firstNonEmpty(monitor.ActualRoomID, monitor.RoomID)
+		s.mu.Unlock()
+
+		account, err := pool.accountFor(id)
+		if err != nil {
+			next := time.Second
+			var unavailable *poolUnavailableError
+			if errors.As(err, &unavailable) && unavailable.retryAfter > next {
+				next = unavailable.retryAfter
+				if next > 30*time.Second {
+					next = 30 * time.Second
+				}
+			}
+			s.updatePoolWaitState(id, err)
+			if !waitContext(ctx, next) {
+				return
+			}
+			continue
+		}
+
+		s.mu.Lock()
+		if monitor := s.monitors[id]; monitor != nil {
+			monitor.AccountID, monitor.AccountName = account.credential.AccountID, account.credential.AccountName
+			monitor.Status = "running"
+			monitor.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+		}
+		s.mu.Unlock()
+
+		if observed == nil || currentAccountID != account.credential.AccountID {
+			currentAccountID = account.credential.AccountID
+			observed = &observedMonitorSource{inner: pool.sourceFor(account, webRID, actualRoomID)}
+		}
+		observed.lastErr = nil
+		next := s.pollOnce(ctx, id, observed)
+		if observed.lastErr == nil {
+			pool.markSuccess(account.credential.AccountID)
+		} else if pool.markFailure(account.credential.AccountID, observed.lastErr) {
+			pool.dropAssignment(id, account.credential.AccountID)
+			next = time.Second
+		}
+		if next <= 0 {
+			next = unknownProbeInterval
+		}
+		if !waitContext(ctx, next) {
+			return
+		}
+	}
+}
+
+func (s *Store) updatePoolWaitState(id string, waitErr error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if monitor := s.monitors[id]; monitor != nil {
+		monitor.Status, monitor.ConnectionStatus = "running", "connecting"
+		monitor.LastError = waitErr.Error()
+		monitor.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+	}
+}
+
+func waitContext(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (s *Store) run(ctx context.Context, id string, source monitorSource, initialDelay time.Duration) {
@@ -510,7 +839,7 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 	s.mu.Unlock()
 
 	probe, probeErr := source.ProbeLive(ctx)
-	if ctx.Err() == nil && recorder != nil && accountID != "" {
+	if ctx.Err() == nil && recorder != nil && accountID != "" && !errors.Is(probeErr, errMonitoringAccountCooling) {
 		recorder(accountID, probeErr)
 	}
 	if ctx.Err() != nil {
@@ -536,7 +865,14 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 		s.mu.Unlock()
 		return unknownProbeInterval
 	}
+	previousLiveStatus := monitor.LiveStatus
 	monitor.LiveStatus = firstNonEmpty(probe.Status, "unknown")
+	if monitor.LiveStatus == "live" && (previousLiveStatus != "live" || monitor.LiveStartedAt == "") {
+		// This is a state-transition timestamp, not the recurring live-probe time.
+		// Keeping it stable allows the UI to sort by when a room most recently
+		// started broadcasting without poll cadence changing the order.
+		monitor.LiveStartedAt = now
+	}
 	monitor.LiveStatusSource, monitor.LiveRawStatus = probe.Source, probe.RawStatus
 	monitor.ConnectionStatus, monitor.LastError = "connected", ""
 	if probe.ActualRoomID != "" {
@@ -560,19 +896,20 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 	s.mu.Unlock()
 
 	snapshots, err := source.Fetch(ctx)
-	if ctx.Err() == nil && recorder != nil && accountID != "" {
+	if ctx.Err() == nil && recorder != nil && accountID != "" && !errors.Is(err, errMonitoringAccountCooling) {
 		recorder(accountID, err)
 	}
 	if ctx.Err() != nil {
 		return 0
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if ctx.Err() != nil {
+		s.mu.Unlock()
 		return 0
 	}
 	monitor = s.monitors[id]
 	if monitor == nil {
+		s.mu.Unlock()
 		return 0
 	}
 	now = time.Now().Format(time.RFC3339Nano)
@@ -580,9 +917,11 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 	if err != nil {
 		monitor.ConnectionStatus, monitor.LastError = "error", err.Error()
 		_ = s.saveLocked()
+		s.mu.Unlock()
 		return livePacketInterval
 	}
 	monitor.ConnectionStatus, monitor.LastError = "connected", ""
+	newEvents := make([]Event, 0)
 	for _, snapshot := range snapshots {
 		packet, ok := extractRedPacket(snapshot.Data)
 		if !ok {
@@ -616,13 +955,26 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 			Source: snapshot.Source, DetectedAt: now,
 			DrawAt: packet.drawAt, ExpiresAt: packet.expiresAt,
 			ParticipantCount: packet.participants,
+			ActualRoomID:     firstNonEmpty(snapshot.ActualRoomID, monitor.ActualRoomID),
+			JoinBoxID:        packet.id,
+			AnchorID:         packet.anchorID, BoxType: packet.boxType,
+			SendTime: packet.sendTime, DelayTime: packet.delayTime,
 		}
 		s.events[eventID] = event
+		newEvents = append(newEvents, *event)
 		monitor.PacketCount++
 		monitor.LastEventAt, monitor.LastPacketID, monitor.LastPacketTitle = now, packetID, packet.title
 		monitor.LastParticipantCount = packet.participants
 	}
 	_ = s.saveLocked()
+	handler := s.eventHandler
+	s.mu.Unlock()
+	if handler != nil {
+		for _, event := range newEvents {
+			event := event
+			go handler(event)
+		}
+	}
 	if len(snapshots) > 0 {
 		return activePacketInterval
 	}
@@ -636,8 +988,9 @@ func monitorStaggerDelay(id string) time.Duration {
 }
 
 type packetMeta struct {
-	id, title, prize, drawAt, expiresAt string
-	participants                        int
+	id, title, prize, drawAt, expiresAt    string
+	anchorID, boxType, sendTime, delayTime string
+	participants                           int
 }
 
 var redMarkers = []string{"红包", "red_packet", "redpacket", "luckybox", "lucky_box", "抢红包", "领红包"}
@@ -667,7 +1020,11 @@ func extractRedPacket(data map[string]any) (packetMeta, bool) {
 		return packetMeta{}, false
 	}
 	meta := packetMeta{}
-	meta.id = firstPairValue(pairs, "red_packet_id", "redPacketId", "redpacket_id", "activity_id", "activityId", "lottery_id_str", "lotteryIdStr", "box_id_str", "boxIdStr", "id")
+	meta.id = firstPairValue(pairs, "red_packet_id", "redPacketId", "redpacket_id", "activity_id", "activityId", "lottery_id_str", "lotteryIdStr", "box_id_str", "boxIdStr", "box_id", "boxId")
+	meta.anchorID = firstPairValue(pairs, "anchor_id", "anchorId")
+	meta.boxType = firstPairValue(pairs, "box_type", "boxType")
+	meta.sendTime = firstPairValue(pairs, "send_time", "sendTime", "start_time", "startTime")
+	meta.delayTime = firstPairValue(pairs, "delay_time", "delayTime", "duration", "duration_s")
 	meta.title = firstPairValue(pairs, "title", "display_name", "displayName", "name", "activity_name", "activityName")
 	meta.prize = formatPacketPrize(pairs)
 	meta.drawAt = normalizePacketTime(firstPairValue(pairs,

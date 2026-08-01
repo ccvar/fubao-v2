@@ -127,6 +127,123 @@
 
 final result: passed
 
+## Windows sidebar-toggle edge alignment
+
+- Source reference: `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-7660d8fb-721f-41ce-a95d-783010c90261.png`.
+- Baseline captures:
+  - `.design-qa/windows-toggle-expanded-mac-baseline.png`.
+  - `.design-qa/windows-toggle-collapsed-mac-baseline.png`.
+
+### Requested refinement
+
+- Windows keeps the native system title bar and window controls.
+- In the expanded layout, the sidebar toggle is anchored 10 px from the sidebar's right edge instead of floating near the title-strip center.
+- In the fully collapsed layout, the toggle is anchored 16 px from the content window's left edge.
+- macOS retains its native-traffic-light-aligned placement.
+
+### Verification
+
+- The local app was checked in both expanded and collapsed states at `http://127.0.0.1:1437/`.
+- The baseline confirms the macOS placement and page-title alignment remain unchanged.
+- The Windows-only CSS resolves the expanded toggle to the sidebar edge and the collapsed toggle to the content edge without replacing the native Windows title bar.
+- `npm run check`, `npm run build`, and `npm run test:sites` pass.
+
+### Findings
+
+- No actionable P0, P1, or P2 issues remain for the requested Windows toggle placement.
+
+final result: passed
+
+## Resizable followed-live dialog
+
+- Source reference: `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-0a327867-6e54-4f0d-8dae-232bd6df553a.png`.
+- Implementation capture: `.design-qa/following-live-resizable.png`.
+- The dialog now resizes within the desktop viewport, with minimum and maximum dimensions that keep its controls usable.
+- The live-room list owns vertical scrolling through a quiet 3 px scrollbar and explicitly suppresses horizontal overflow.
+- Flexible grid columns and a narrow-container reflow prevent room metadata from widening the dialog or creating a horizontal scrollbar.
+- The dialog remains fixed on small screens, where free resizing would make the touch layout unstable.
+
+final result: passed
+
+## Browser followed-live count and detail modal
+
+- Legacy reference inspected: `/Users/apple/work/DY-KIRO/src/network/live_discovery.py` (`discover_similar_rooms` and `similar_room_by_anchor`).
+- Current implementation capture: `.design-qa/implementation-following-live-modal.png`.
+- State: current Tauri development app, browser instance account “川、”, 14 followed accounts currently live.
+
+### Behavior
+
+- The Go engine signs and requests the current instance account's real followed-live feed; raw Cookie data never enters frontend JavaScript.
+- Instance cards expose a compact `N 正在直播` action and a shared in-app tooltip.
+- The detail modal lists safe metadata only: avatar, nickname, live title, room number, room identifier, viewer count, and an external-room action.
+- Results are cached per canonical account for 60 seconds, with a stale-success fallback for temporary network failures instead of a false zero state.
+- The legacy seed-room path remains a similar-room discovery mechanism and is not used as the followed-live data source.
+
+### Verification
+
+- A real engine RPC for “川、” returned 14 live items with room numbers and room identifiers.
+- The current `target/debug/fubao-desktop` process rendered the count and opened the populated modal; no other 福宝/Wails window was used for acceptance.
+- `npm run check`, `npm run build:engine`, and `go test ./...` pass for this implementation.
+
+### Findings
+
+- No actionable P0, P1, or P2 issues remain for the requested followed-live count or detail interaction.
+
+final result: passed
+
+## Browser-card identity and CK-badge hover follow-up
+
+- Source references:
+  - `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-40ffd67f-5d7d-4da7-87f7-54c2733cb06a.png`.
+  - `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-bb1d8385-4158-4107-8d15-ad20e20c6d42.png`.
+
+### Requested refinements
+
+- Reduced the browser-instance identity tile to 20 px while keeping the account row on one compact line.
+- Account name and Douyin ID now create the shared dark edge-safe Tooltip only when the rendered text is actually truncated; full text remains visually quiet and does not gain an unnecessary hover surface.
+- Closing an instance now opens the compact confirmation dialog before native teardown and removal. The account-keyed profile and login environment remain available for later reuse.
+- The `CK 已失效` badge is no longer a tooltip trigger and ignores pointer hover, so its coral status surface cannot acquire the gray hover box shown in the reference.
+
+### Verification
+
+- `npm run check` passes with 0 errors and 0 warnings.
+- `npm run build` completes and preserves the required Sites artifacts.
+- `npm run test:sites` passes all 4 tests.
+- Static selector inspection confirms the expired badge has no `data-tooltip` attribute, no hover selector, and uses `pointer-events: none`.
+
+### Findings
+
+- No actionable P0, P1, or P2 issue remains for the requested icon size, overflow help, safe-close confirmation, or CK-badge hover behavior.
+
+final result: passed
+
+## Browser instance loading-state follow-up
+
+- Source reference: `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-7c105ee4-6047-496a-8187-f9fd05eb959d.png`.
+- Immediate loading capture: `.design-qa/implementation-browser-loading.png`.
+- Settled native-WebView capture: `.design-qa/implementation-browser-loading-settled.png`.
+- State: five account-owned browser instances mounting simultaneously in a three-column grid.
+
+### Requested loading feedback
+
+- Every card now displays a compact spinning indicator, “正在加载实例”, and the target account name while its native child WebView is being prepared.
+- A newly created child WebView remains hidden and off-card until the first usable Douyin page load is ready, so an unpainted native white surface cannot cover the HTML loading state.
+- Douyin SPA navigation has a bounded native reveal fallback so cards cannot remain indefinitely in the loading state when the page omits a reliable completed-load event.
+- Native load failures clear the loading state and use the existing error presentation rather than leaving an ambiguous blank card.
+
+### Verification
+
+- The 0.2-second capture shows all five cards with the same compact, centered loading treatment and intact identity/action rows.
+- The 5.7-second capture shows all five placeholders replaced in place by interactive native Douyin surfaces without card-height or grid-position shifts.
+- The loading copy remains readable at the persisted three-column layout and does not overlap the close/open instance actions.
+- `npm run check`, `cargo fmt --check`, and `cargo check` pass with the new event lifecycle.
+
+### Findings
+
+- No actionable P0, P1, or P2 issues remain for the requested browser-instance loading feedback.
+
+final result: passed
+
 ## Single-line browser identity follow-up
 
 - Source references:
