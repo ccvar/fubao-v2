@@ -127,6 +127,44 @@
 
 final result: passed
 
+## Windows topbar without sidebar collapsing
+
+### Evidence
+
+- Source visual truth: `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-021384c4-16ff-4b55-84ef-5e406d2f2c00.png` (1162 × 402 px).
+- Browser-rendered implementation: `artifacts/design-qa/windows-topbar-final.png` (1111 × 700 px at 1× density).
+- Requested browser viewport: 1162 × 700 CSS px; the in-app Browser exposed an 1111 × 700 CSS-pixel content viewport after application chrome.
+- State: simulated Windows desktop shell on the empty “浏览器实例” page.
+- Same-input comparison evidence: the source and implementation were opened together in one comparison view. The native Windows caption is not part of the standalone browser rendering, so judgment is scoped to the web-owned sidebar and content topbar directly below it.
+
+### Full-view and focused comparison
+
+- The Windows-only sidebar collapse control is absent; a DOM check found zero controls whose accessible name contains “侧栏”.
+- The original browser page icon is restored before “浏览器实例”; its rendered box is 18 × 18 px and uses the existing Phosphor icon component.
+- The Windows topbar is now 64 px high with 9 px top and 6 px bottom padding, adding restrained vertical breathing room without changing the sidebar, content grid, toolbar, or macOS chrome.
+- The title icon, heading, subtitle, and right toolbar retain the existing compact horizontal rhythm. No unrelated surface was restyled.
+
+### Required fidelity surfaces
+
+- Typography: the existing system font, 16 px page title, subtitle hierarchy, weights, and truncation remain unchanged.
+- Spacing and layout: only the Windows topbar vertical inset and minimum height changed; sidebar width and content alignment remain intact.
+- Colors and tokens: no color token or background treatment changed.
+- Image and icon quality: the existing Phosphor `Browser` / `UserFocus` components are restored; no placeholder or custom vector artwork was introduced.
+- Copy and content: all existing labels, counts, and empty-state copy remain unchanged.
+
+### Interaction and runtime verification
+
+- Switching from “浏览器实例” to “账号与直播间” and back updates the heading normally while retaining the restored page icon position.
+- `npm run build` and `git diff --check` pass.
+- Browser console inspection found only the expected standalone-preview missing-Tauri-bridge error; it is unrelated to this visual change and does not occur in the packaged Tauri client.
+
+### Comparison history and findings
+
+- Initial comparison found no actionable P0, P1, or P2 issue in the requested Windows-owned regions, so no visual-fix iteration was required.
+- No P3 follow-up remains for this scoped adjustment.
+
+final result: passed
+
 ## Browser title CPU and memory usage
 
 ### Evidence

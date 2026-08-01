@@ -57,6 +57,25 @@ func NewService() *Service {
 	return &Service{cache: make(map[string]cacheEntry), ttl: 60 * time.Second}
 }
 
+// StoreNative records a safe snapshot produced inside the account's real
+// browser page. The page owns the exact Cookie jar and dynamic request context;
+// only the already-reduced public room fields cross the authenticated native
+// channel into the Go engine.
+func (s *Service) StoreNative(accountID string, items []Item) Result {
+	accountID = strings.TrimSpace(accountID)
+	items = normalizeItems(items)
+	result := Result{
+		AccountID:   accountID,
+		Total:       len(items),
+		Items:       items,
+		RefreshedAt: time.Now().Format(time.RFC3339),
+	}
+	s.mu.Lock()
+	s.cache[accountID] = cacheEntry{result: result, expiresAt: time.Now().Add(s.ttl)}
+	s.mu.Unlock()
+	return result
+}
+
 // Fetch returns the current followed accounts that are live. A stale cached
 // result is preferred over turning a temporary network failure into a false
 // empty state.
@@ -223,5 +242,48 @@ func parseItems(body []byte) ([]Item, error) {
 			ViewerCount: viewerCount,
 		})
 	}
-	return items, nil
+	return normalizeItems(items), nil
+}
+
+func normalizeItems(items []Item) []Item {
+	normalized := make([]Item, 0, len(items))
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		item.RoomID = trimField(item.RoomID, 32)
+		item.WebRID = trimField(item.WebRID, 32)
+		key := item.RoomID
+		if key == "" {
+			key = item.WebRID
+		}
+		if key == "" {
+			continue
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		item.UserID = trimField(item.UserID, 64)
+		item.SecUID = trimField(item.SecUID, 160)
+		item.Nickname = trimField(item.Nickname, 120)
+		item.AvatarURL = trimField(item.AvatarURL, 800)
+		if item.AvatarURL != "" && !strings.HasPrefix(item.AvatarURL, "https://") && !strings.HasPrefix(item.AvatarURL, "http://") {
+			item.AvatarURL = ""
+		}
+		item.Title = trimField(item.Title, 240)
+		item.ViewerCount = trimField(item.ViewerCount, 48)
+		normalized = append(normalized, item)
+		if len(normalized) == 200 {
+			break
+		}
+	}
+	return normalized
+}
+
+func trimField(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	runes := []rune(value)
+	if len(runes) > limit {
+		return string(runes[:limit])
+	}
+	return value
 }

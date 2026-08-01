@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	storeVersion         = 7
+	storeVersion         = 8
 	unknownProbeInterval = 10 * time.Second
 	offlineProbeInterval = 60 * time.Second
 	livePacketInterval   = 15 * time.Second
@@ -184,31 +184,57 @@ type Activity struct {
 	CreatedAt string `json:"created_at"`
 }
 
+// ParticipationSchedule is a credential-free persisted trigger definition.
+// The frontend claims due runs, then prepares each native browser context.
+type ParticipationSchedule struct {
+	ID              string `json:"id"`
+	Mode            string `json:"mode"`
+	Enabled         bool   `json:"enabled"`
+	RunAt           string `json:"run_at,omitempty"`
+	DailyTime       string `json:"daily_time,omitempty"`
+	IntervalSeconds int    `json:"interval_seconds,omitempty"`
+	NextRunAt       string `json:"next_run_at"`
+	LastRunAt       string `json:"last_run_at,omitempty"`
+	CreatedAt       string `json:"created_at"`
+	UpdatedAt       string `json:"updated_at"`
+}
+
+// ParticipationScheduleExecution is the safe claim returned when a persisted
+// plan becomes due. It contains no browser credentials or request metadata.
+type ParticipationScheduleExecution struct {
+	ScheduleID string `json:"schedule_id"`
+	Mode       string `json:"mode"`
+	Label      string `json:"label"`
+	DueAt      string `json:"due_at"`
+}
+
 type file struct {
-	Version               int                    `json:"version"`
-	Monitors              []*Monitor             `json:"monitors"`
-	Events                []*Event               `json:"events"`
-	ParticipationRecords  []*ParticipationRecord `json:"participation_records,omitempty"`
-	ParticipationSettings ParticipationSettings  `json:"participation_settings"`
-	ParticipationTasks    []*ParticipationTask   `json:"participation_tasks,omitempty"`
-	ParticipationTraces   []*ParticipationTrace  `json:"participation_traces,omitempty"`
-	Activities            []*Activity            `json:"activities,omitempty"`
+	Version                int                      `json:"version"`
+	Monitors               []*Monitor               `json:"monitors"`
+	Events                 []*Event                 `json:"events"`
+	ParticipationRecords   []*ParticipationRecord   `json:"participation_records,omitempty"`
+	ParticipationSettings  ParticipationSettings    `json:"participation_settings"`
+	ParticipationTasks     []*ParticipationTask     `json:"participation_tasks,omitempty"`
+	ParticipationTraces    []*ParticipationTrace    `json:"participation_traces,omitempty"`
+	ParticipationSchedules []*ParticipationSchedule `json:"participation_schedules,omitempty"`
+	Activities             []*Activity              `json:"activities,omitempty"`
 }
 
 type Store struct {
-	mu                  sync.Mutex
-	path                string
-	monitors            map[string]*Monitor
-	events              map[string]*Event
-	participations      map[string]*ParticipationRecord
-	participationTasks  map[string]*ParticipationTask
-	participationTraces map[string]*ParticipationTrace
-	settings            ParticipationSettings
-	activities          map[string]*Activity
-	runtime             map[string]context.CancelFunc
-	pool                *accountPool
-	requestRecorder     func(accountID string, requestErr error)
-	eventHandler        func(Event)
+	mu                     sync.Mutex
+	path                   string
+	monitors               map[string]*Monitor
+	events                 map[string]*Event
+	participations         map[string]*ParticipationRecord
+	participationTasks     map[string]*ParticipationTask
+	participationTraces    map[string]*ParticipationTrace
+	participationSchedules map[string]*ParticipationSchedule
+	settings               ParticipationSettings
+	activities             map[string]*Activity
+	runtime                map[string]context.CancelFunc
+	pool                   *accountPool
+	requestRecorder        func(accountID string, requestErr error)
+	eventHandler           func(Event)
 }
 
 type monitorJob struct {
@@ -228,15 +254,16 @@ func NewStore(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("创建红包监测数据目录失败: %w", err)
 	}
 	s := &Store{
-		path:                filepath.Join(dataDir, "red_packet_monitors.json"),
-		monitors:            map[string]*Monitor{},
-		events:              map[string]*Event{},
-		participations:      map[string]*ParticipationRecord{},
-		participationTasks:  map[string]*ParticipationTask{},
-		participationTraces: map[string]*ParticipationTrace{},
-		activities:          map[string]*Activity{},
-		runtime:             map[string]context.CancelFunc{},
-		settings:            normalizeParticipationSettings(ParticipationSettings{}),
+		path:                   filepath.Join(dataDir, "red_packet_monitors.json"),
+		monitors:               map[string]*Monitor{},
+		events:                 map[string]*Event{},
+		participations:         map[string]*ParticipationRecord{},
+		participationTasks:     map[string]*ParticipationTask{},
+		participationTraces:    map[string]*ParticipationTrace{},
+		participationSchedules: map[string]*ParticipationSchedule{},
+		activities:             map[string]*Activity{},
+		runtime:                map[string]context.CancelFunc{},
+		settings:               normalizeParticipationSettings(ParticipationSettings{}),
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -305,6 +332,11 @@ func (s *Store) load() error {
 			s.participationTraces[trace.ID] = trace
 		}
 	}
+	for _, schedule := range payload.ParticipationSchedules {
+		if schedule != nil && schedule.ID != "" && schedule.Enabled && schedule.NextRunAt != "" {
+			s.participationSchedules[schedule.ID] = schedule
+		}
+	}
 	s.settings = normalizeParticipationSettings(payload.ParticipationSettings)
 	migrated := payload.Version < storeVersion
 	deadlineGrace := time.Duration(s.settings.DrawResultTimeoutSeconds) * time.Second
@@ -366,6 +398,11 @@ func (s *Store) saveLocked() error {
 		copy.RequestParams = cloneStringMap(item.RequestParams)
 		participationTraces = append(participationTraces, &copy)
 	}
+	participationSchedules := make([]*ParticipationSchedule, 0, len(s.participationSchedules))
+	for _, item := range s.participationSchedules {
+		copy := *item
+		participationSchedules = append(participationSchedules, &copy)
+	}
 	activities := make([]*Activity, 0, len(s.activities))
 	for _, item := range s.activities {
 		copy := *item
@@ -375,6 +412,7 @@ func (s *Store) saveLocked() error {
 	sort.Slice(events, func(i, j int) bool { return events[i].DetectedAt > events[j].DetectedAt })
 	sort.Slice(participations, func(i, j int) bool { return participations[i].UpdatedAt > participations[j].UpdatedAt })
 	sort.Slice(participationTraces, func(i, j int) bool { return participationTraces[i].CreatedAt > participationTraces[j].CreatedAt })
+	sort.Slice(participationSchedules, func(i, j int) bool { return participationSchedules[i].NextRunAt < participationSchedules[j].NextRunAt })
 	if len(participationTraces) > 500 {
 		participationTraces = participationTraces[:500]
 	}
@@ -384,7 +422,8 @@ func (s *Store) saveLocked() error {
 	}
 	payload, err := json.MarshalIndent(file{
 		Version: storeVersion, Monitors: monitors, Events: events, ParticipationRecords: participations,
-		ParticipationSettings: s.settings, ParticipationTasks: participationTasks, ParticipationTraces: participationTraces, Activities: activities,
+		ParticipationSettings: s.settings, ParticipationTasks: participationTasks, ParticipationTraces: participationTraces,
+		ParticipationSchedules: participationSchedules, Activities: activities,
 	}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("序列化红包监测数据失败: %w", err)

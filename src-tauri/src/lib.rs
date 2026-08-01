@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{
     menu::{Menu, MenuItem},
@@ -304,6 +304,25 @@ struct NativePageParticipationResult {
     login_expired: bool,
 }
 
+#[derive(Deserialize, Serialize)]
+struct NativeFollowingLiveItem {
+    room_id: String,
+    web_rid: String,
+    user_id: String,
+    sec_uid: String,
+    nickname: String,
+    avatar_url: String,
+    title: String,
+    viewer_count: String,
+}
+
+#[derive(Deserialize)]
+struct NativeFollowingLivePageResult {
+    status_code: i64,
+    status_msg: String,
+    items: Vec<NativeFollowingLiveItem>,
+}
+
 impl NativePageParticipationResult {
     fn context_missing(message: impl Into<String>) -> Self {
         Self {
@@ -422,29 +441,38 @@ fn inject_douyin_cookie(webview: &tauri::Webview, raw_cookie: &str) -> Result<()
 }
 
 fn read_douyin_cookie(webview: &tauri::Webview) -> Result<String, String> {
-    let mut values = HashMap::<String, String>::new();
+    let mut values = HashMap::<String, (u8, String)>::new();
     // Wry's macOS `cookies_for_url` currently compares cookie domains using
-    // exact equality. Douyin's authenticated HttpOnly cookies live on the
-    // parent domain `.douyin.com`, so querying `www.douyin.com` silently
-    // excludes the real session. Read the native store and apply proper
-    // parent-domain matching ourselves.
+    // exact equality. Read the native store and reproduce the cookies that
+    // apply to https://www.douyin.com/ ourselves. Cookies scoped only to a
+    // sibling such as live.douyin.com must not overwrite a same-named parent
+    // login cookie in the flat canonical account header.
     for cookie in webview
         .cookies()
         .map_err(|error| format!("读取登录 Cookie 失败：{error}"))?
         .into_iter()
-        .filter(|cookie| {
-            cookie.domain().is_some_and(|domain| {
-                let domain = domain.trim_start_matches('.').to_ascii_lowercase();
-                domain == "douyin.com" || domain.ends_with(".douyin.com")
-            })
-        })
     {
+        let Some(domain) = cookie.domain() else {
+            continue;
+        };
+        let domain = domain.trim_start_matches('.').to_ascii_lowercase();
+        let priority = match domain.as_str() {
+            "douyin.com" => 2,
+            "www.douyin.com" => 1,
+            _ => continue,
+        };
         if cookie.name() == "fubao_login_probe"
             || cookie.name().starts_with("fubao_participation_probe_")
+            || cookie.name().starts_with("fubao_following_live_")
         {
             continue;
         }
-        values.insert(cookie.name().to_string(), cookie.value().to_string());
+        let entry = values
+            .entry(cookie.name().to_string())
+            .or_insert_with(|| (priority, cookie.value().to_string()));
+        if priority > entry.0 {
+            *entry = (priority, cookie.value().to_string());
+        }
     }
     // Douyin does not use one stable login-cookie name across all desktop
     // rollouts. The current web client commonly persists the authenticated
@@ -463,7 +491,7 @@ fn read_douyin_cookie(webview: &tauri::Webview) -> Result<String, String> {
     let logged_in = login_names.iter().any(|name| {
         values
             .get(*name)
-            .is_some_and(|value| !value.trim().is_empty())
+            .is_some_and(|(_, value)| !value.trim().is_empty())
     });
     if !logged_in {
         if cfg!(debug_assertions) {
@@ -482,7 +510,7 @@ fn read_douyin_cookie(webview: &tauri::Webview) -> Result<String, String> {
     pairs.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(pairs
         .into_iter()
-        .map(|(name, value)| format!("{name}={value}"))
+        .map(|(name, (_, value))| format!("{name}={value}"))
         .collect::<Vec<_>>()
         .join("; "))
 }
@@ -496,6 +524,7 @@ fn canonical_cookie_values(raw_cookie: &str) -> HashMap<String, String> {
             if name.is_empty()
                 || name == "fubao_login_probe"
                 || name.starts_with("fubao_participation_probe_")
+                || name.starts_with("fubao_following_live_")
             {
                 return None;
             }
@@ -513,8 +542,12 @@ mod cookie_tests {
         let stored = canonical_cookie_values("sessionid_ss=session; ttwid=old; sid_guard=guard");
         let reordered = canonical_cookie_values("sid_guard=guard; sessionid_ss=session; ttwid=old");
         let rotated = canonical_cookie_values("sid_guard=guard; sessionid_ss=session; ttwid=new");
+        let with_native_probe = canonical_cookie_values(
+            "sid_guard=guard; sessionid_ss=session; ttwid=old; fubao_following_live_test_0=7b7d",
+        );
 
         assert_eq!(stored, reordered);
+        assert_eq!(stored, with_native_probe);
         assert_ne!(stored, rotated);
     }
 }
@@ -632,6 +665,182 @@ fn decode_hex_utf8(value: &str) -> Result<String, String> {
         bytes.push(u8::from_str_radix(text, 16).map_err(|_| "原生页面结果编码无效")?);
     }
     String::from_utf8(bytes).map_err(|_| "原生页面结果不是有效文本".into())
+}
+
+fn clear_page_probe_chunks(webview: &tauri::Webview, prefix: &str, chunk_count: usize) {
+    let names = (0..chunk_count)
+        .map(|index| format!("{prefix}_{index}"))
+        .chain(std::iter::once(format!("{prefix}_meta")))
+        .collect::<Vec<_>>();
+    let script = format!(
+        "for (const name of {}) document.cookie = `${{name}}=; Path=/; Secure; SameSite=None; Max-Age=0`;",
+        serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())
+    );
+    let _ = webview.eval(&script);
+}
+
+async fn read_page_probe_chunks(webview: &tauri::Webview, prefix: &str) -> Result<String, String> {
+    let meta_name = format!("{prefix}_meta");
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let cookies = match webview.cookies() {
+            Ok(cookies) => cookies,
+            Err(_) => continue,
+        };
+        let Some(chunk_count) = cookies
+            .iter()
+            .find(|cookie| cookie.name() == meta_name)
+            .and_then(|cookie| cookie.value().parse::<usize>().ok())
+        else {
+            continue;
+        };
+        if chunk_count == 0 || chunk_count > 80 {
+            clear_page_probe_chunks(webview, prefix, chunk_count.min(80));
+            return Err("关注直播页面返回的数据量异常".into());
+        }
+        let mut encoded = String::new();
+        let mut complete = true;
+        for index in 0..chunk_count {
+            let name = format!("{prefix}_{index}");
+            let Some(value) = cookies
+                .iter()
+                .find(|cookie| cookie.name() == name)
+                .map(|cookie| cookie.value())
+            else {
+                complete = false;
+                break;
+            };
+            encoded.push_str(value);
+        }
+        if !complete {
+            continue;
+        }
+        clear_page_probe_chunks(webview, prefix, chunk_count);
+        return decode_hex_utf8(&encoded);
+    }
+    Err("等待登录页面返回关注直播数据超时".into())
+}
+
+async fn execute_following_live_in_page(
+    webview: &tauri::Webview,
+) -> Result<NativeFollowingLivePageResult, String> {
+    let prefix = format!("fubao_following_live_{}", Uuid::new_v4().simple());
+    let prefix_json = serde_json::to_string(&prefix)
+        .map_err(|error| format!("准备关注直播页面请求失败：{error}"))?;
+    let script = r#"(() => {
+      const prefix = __FUBAO_PROBE_PREFIX__;
+      const compact = (value, limit = 240) => String(value ?? '').trim().slice(0, limit);
+      const finish = (result) => {
+        try {
+          const text = JSON.stringify(result);
+          const bytes = new TextEncoder().encode(text);
+          const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+          const chunks = hex.match(/.{1,2200}/g) || ['7b7d'];
+          chunks.forEach((chunk, index) => {
+            document.cookie = `${prefix}_${index}=${chunk}; Path=/; Secure; SameSite=None; Max-Age=20`;
+          });
+          document.cookie = `${prefix}_meta=${chunks.length}; Path=/; Secure; SameSite=None; Max-Age=20`;
+        } catch (_) {}
+      };
+      const safeItems = (payload) => {
+        const rows = Array.isArray(payload?.data?.data) ? payload.data.data : [];
+        const seen = new Set();
+        const items = [];
+        for (const record of rows.slice(0, 200)) {
+          const room = record && typeof record.room === 'object' ? record.room : {};
+          const owner = room && typeof room.owner === 'object' ? room.owner : {};
+          const roomID = compact(room.id_str || room.id, 32);
+          const webRID = compact(record?.web_rid || room.web_rid || owner.web_rid, 32);
+          const key = roomID || webRID;
+          if (!key || seen.has(key)) continue;
+          seen.add(key);
+          const avatarList = owner?.avatar_thumb?.url_list;
+          items.push({
+            room_id: roomID,
+            web_rid: webRID,
+            user_id: compact(owner.id_str || owner.id, 64),
+            sec_uid: compact(owner.sec_uid, 160),
+            nickname: compact(owner.nickname, 120),
+            avatar_url: compact(Array.isArray(avatarList) ? avatarList[0] : '', 800),
+            title: compact(room.title, 240),
+            viewer_count: compact(room.user_count_str || room?.stats?.user_count_str, 48),
+          });
+        }
+        return items;
+      };
+      const unsignedURL = () => {
+        const url = new URL('https://www.douyin.com/webcast/web/feed/follow/');
+        const values = {
+          device_platform: 'webapp', aid: '6383', channel: 'channel_pc_web',
+          pc_client_type: '1', version_code: '290100', version_name: '29.1.0',
+          cookie_enabled: String(navigator.cookieEnabled),
+          screen_width: String(screen.width || 1920), screen_height: String(screen.height || 1080),
+          browser_language: navigator.language || 'zh-CN', from_user_page: '1',
+          locate_query: 'false', need_time_list: '1', pc_libra_divert: 'Mac',
+          publish_video_strategy_type: '2', round_trip_time: '0',
+          show_live_replay_strategy: '1', time_list_query: '0',
+          update_version_code: '170400', whale_cut_token: '', scene: 'aweme_pc_follow_top'
+        };
+        for (const [key, value] of Object.entries(values)) url.searchParams.set(key, value);
+        return url;
+      };
+      const requestURLs = () => {
+        const urls = [];
+        try {
+          const entries = performance.getEntriesByType('resource').slice().reverse();
+          const matched = entries.find((entry) => {
+            try {
+              const candidate = new URL(String(entry.name || ''), location.href);
+              return candidate.hostname === 'www.douyin.com' && candidate.pathname === '/webcast/web/feed/follow/';
+            } catch (_) {
+              return false;
+            }
+          });
+          if (matched) {
+            const captured = new URL(String(matched.name), location.href);
+            urls.push(captured.toString());
+            for (const key of ['a_bogus', 'X-Bogus', '__ac_signature', '__ac_nonce']) captured.searchParams.delete(key);
+            urls.push(captured.toString());
+          }
+        } catch (_) {}
+        urls.push(unsignedURL().toString());
+        return [...new Set(urls)];
+      };
+      (async () => {
+        let last = null;
+        try {
+          for (const url of requestURLs()) {
+            const response = await fetch(url, {
+              method: 'GET', credentials: 'include', cache: 'no-store',
+              headers: {'accept': 'application/json, text/plain, */*'},
+              referrer: 'https://www.douyin.com/follow',
+              referrerPolicy: 'strict-origin-when-cross-origin'
+            });
+            const payload = await response.json();
+            const statusCode = Number(payload?.status_code || 0);
+            last = {
+              status_code: statusCode,
+              status_msg: compact(payload?.status_msg || (response.ok ? '' : `HTTP ${response.status}`)),
+              items: statusCode === 0 ? safeItems(payload) : []
+            };
+            if (statusCode === 0) break;
+          }
+          finish(last || {status_code: -1, status_msg: '关注直播接口没有返回数据', items: []});
+        } catch (error) {
+          finish({
+            status_code: -1,
+            status_msg: compact(error && (error.message || error) || '关注直播页面请求失败'),
+            items: []
+          });
+        }
+      })();
+    })();"#
+        .replace("__FUBAO_PROBE_PREFIX__", &prefix_json);
+    webview
+        .eval(&script)
+        .map_err(|error| format!("启动登录页面关注直播请求失败：{error}"))?;
+    let encoded = read_page_probe_chunks(webview, &prefix).await?;
+    serde_json::from_str(&encoded).map_err(|error| format!("解析关注直播页面结果失败：{error}"))
 }
 
 async fn execute_page_participation(
@@ -1786,6 +1995,75 @@ async fn sync_browser_account_cookie(
 }
 
 #[tauri::command]
+async fn sync_browser_following_live(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    runtime: tauri::State<'_, Arc<EngineRuntime>>,
+    instance_id: String,
+) -> Result<Value, String> {
+    let instance_id = instance_id.trim().to_string();
+    if instance_id.is_empty() {
+        return Err("浏览器实例参数无效".into());
+    }
+    let label = browser_webview_label(&instance_id, window.label());
+    let webview = app
+        .get_webview(&label)
+        .or_else(|| browser_webview_for_instance(&app, &instance_id))
+        .ok_or("浏览器实例页面尚未就绪，请等待卡片加载完成后重试")?;
+    let mut login_state = BrowserLoginState::Unknown;
+    for _ in 0..25 {
+        login_state = inspect_douyin_login(&webview).await?.state;
+        if login_state != BrowserLoginState::Unknown {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    match login_state {
+        BrowserLoginState::LoggedIn => {}
+        BrowserLoginState::LoggedOut => return Err("当前实例尚未登录，请先重新绑定 CK".into()),
+        BrowserLoginState::Unknown => return Err("抖音页面尚未完成加载，请稍后重试".into()),
+    }
+
+    let page_result = execute_following_live_in_page(&webview).await?;
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "[following-live-page] instance={} status={} items={} error={}",
+            instance_id,
+            page_result.status_code,
+            page_result.items.len(),
+            if page_result.status_msg.trim().is_empty() {
+                "none"
+            } else {
+                "present"
+            },
+        );
+    }
+    if page_result.status_code != 0 {
+        let detail = page_result.status_msg.trim();
+        let message = if page_result.status_code == 20003 {
+            "抖音关注直播接口未识别当前登录状态，请在实例中重新登录后重试".to_string()
+        } else if detail.is_empty() {
+            format!("关注直播页面请求失败：状态码 {}", page_result.status_code)
+        } else {
+            format!("关注直播页面请求失败：{detail}")
+        };
+        return Err(message);
+    }
+
+    let runtime = runtime.inner().clone();
+    native_engine_request(
+        runtime.clone(),
+        "browser.native_following_live",
+        json!({
+            "instance_id": instance_id,
+            "items": page_result.items,
+            "secret": runtime.native_secret,
+        }),
+    )
+    .await
+}
+
+#[tauri::command]
 fn engine_status(runtime: tauri::State<'_, Arc<EngineRuntime>>) -> bool {
     runtime.online.load(Ordering::SeqCst)
 }
@@ -2067,6 +2345,7 @@ pub fn run() {
             stop_browser_red_packet_context,
             refresh_browser_account_cookie,
             sync_browser_account_cookie,
+            sync_browser_following_live,
             open_account_rebind,
             sync_account_rebind,
             complete_account_rebind,

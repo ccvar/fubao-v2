@@ -188,6 +188,76 @@ func TestParticipationSettingsDefaultDrawTimeoutAndSafeTrace(t *testing.T) {
 	}
 }
 
+func TestParticipationSchedulesPersistClaimAndAdvance(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 2, 9, 30, 0, 0, time.Local)
+	once, err := store.CreateParticipationSchedule(ParticipationSchedule{
+		Mode: ParticipationScheduleOnce, RunAt: now.Add(time.Hour).Format(time.RFC3339Nano),
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interval, err := store.CreateParticipationSchedule(ParticipationSchedule{
+		Mode: ParticipationScheduleInterval, IntervalSeconds: 5 * 60,
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if schedules := reloaded.ParticipationSchedules(); len(schedules) != 2 {
+		t.Fatalf("participation schedules did not persist: %+v", schedules)
+	}
+	due, err := reloaded.ClaimDueParticipationSchedules(now)
+	if err != nil || len(due) != 1 || due[0].ScheduleID != interval.ID {
+		t.Fatalf("interval schedule should execute immediately once: due=%+v err=%v", due, err)
+	}
+	if repeated, err := reloaded.ClaimDueParticipationSchedules(now.Add(time.Second)); err != nil || len(repeated) != 0 {
+		t.Fatalf("same occurrence must be claimed once: due=%+v err=%v", repeated, err)
+	}
+	due, err = reloaded.ClaimDueParticipationSchedules(now.Add(time.Hour))
+	if err != nil || len(due) != 2 {
+		t.Fatalf("once and next interval occurrence should be due: %+v err=%v", due, err)
+	}
+	remaining := reloaded.ParticipationSchedules()
+	if len(remaining) != 1 || remaining[0].ID != interval.ID || !remaining[0].Enabled {
+		t.Fatalf("one-shot schedule must be removed after claim: once=%s remaining=%+v", once.ID, remaining)
+	}
+}
+
+func TestParticipationDailyScheduleAndBatchActivity(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 2, 20, 1, 0, 0, time.Local)
+	schedule, err := store.CreateParticipationSchedule(ParticipationSchedule{Mode: ParticipationScheduleDaily, DailyTime: "20:00"}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	next, err := time.Parse(time.RFC3339Nano, schedule.NextRunAt)
+	if err != nil || next.Day() != 3 || next.Hour() != 20 || next.Minute() != 0 {
+		t.Fatalf("daily schedule must roll to tomorrow: %+v parsed=%v err=%v", schedule, next, err)
+	}
+	if err := store.RecordParticipationBatchResult(schedule.ID, schedule.Mode, 3, 1); err != nil {
+		t.Fatal(err)
+	}
+	activities := store.Activities()
+	foundBatch := false
+	for _, activity := range activities {
+		foundBatch = foundBatch || strings.Contains(activity.Label, "成功启动 3 个实例，跳过 1 个")
+	}
+	if len(activities) < 2 || !foundBatch {
+		t.Fatalf("batch activity was not recorded safely: %+v", activities)
+	}
+}
+
 func TestReloadMigratesOverduePendingDrawToError(t *testing.T) {
 	dataDir := t.TempDir()
 	store, err := NewStore(dataDir)

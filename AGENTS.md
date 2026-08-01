@@ -146,13 +146,19 @@ Every successful followed-live account snapshot is authoritative only for that a
 
 Windows in-app upgrades follow Pilot/Tauri Updater behavior: launch the NSIS package in passive update mode with `/P /R /UPDATE`, never as a normal installer that shows the “Already Installed” uninstall-choice wizard. Keep the PowerShell update helper hidden, wait for the current client to exit, preserve local application data, and let the installer relaunch the upgraded client.
 
-Keep the native Windows title bar instead of replacing the system minimize/maximize/close controls merely to host the sidebar toggle. On Windows, remove the macOS-only web title strip entirely so primary navigation starts directly below the native title bar. Keep the sidebar toggle at the far left of the main top bar in both expanded and collapsed states, remove the otherwise adjacent page-title icon so the compact anatomy is unambiguously `sidebar toggle + page title`, and left-align the subtitle with that title. Its shared dark Tooltip opens below. Preserve the existing macOS title strip, traffic-light alignment, page-title icon, and right-opening toggle Tooltip.
+Keep the native Windows title bar and system minimize/maximize/close controls. On Windows, remove the macOS-only web title strip entirely so primary navigation starts directly below the native title bar, and disable sidebar collapsing rather than placing a toggle in the content topbar. Preserve the normal page icon before the content title and keep the Windows topbar slightly more vertically relaxed than the macOS chrome. Preserve the existing macOS title strip, collapsible behavior, traffic-light alignment, page-title icon, and right-opening toggle Tooltip.
 
 On Windows, retain the native caption and system window controls but use DWM caption, text, and border colors that match the warm `--sidebar`/topbar palette. The Windows sidebar and main topbar share that same opaque surface so the native title bar and both web chrome regions read as one continuous Pilot-like frame; do not switch to a custom-drawn Windows title bar merely for this blend.
 
 参与账号拥有持久化的红包接口参与开关，默认关闭；灰色表示关闭、红色表示开启。只有开关开启、CK 有效且不在冷却期的参与账号才能被 Go 引擎分配红包参与任务。参与请求按账号和红包事件幂等去重；关闭开关仅阻止未来分配，不中断已发出的请求。原始 CK 和签名请求始终留在 Go/Rust 原生层。
 
 红包参与设置包含持久化的“最低钻石”门槛，默认 1 钻。只有在红包数据能够可靠给出总钻石数与份数或明确的每份钻石数时，Go 引擎才在原生请求前按每份金额执行门槛；金额未知或信息不完整时不得猜测，也不得因此拦截参与。
+
+浏览器实例页提供全局“启动任务”入口，支持立即执行、指定日期、每天固定时间和间隔执行。计划定义、下次执行时间和原子到期领取必须持久化在 Go redpacket store；间隔计划保存后立即执行第一轮。每次触发只批量准备真实已登录浏览器实例的红包页面上下文并开启对应参与账号的红包接口参与池，已激活任务不得重复并发启动；失败实例回滚本次自动开启的参与池开关。计划创建、触发、批量成功数和跳过数必须写入安全的最近活动，原始 CK、签名和接口响应仍不得进入前端。
+
+“启动任务”入口放在浏览器实例标题第一行并利用标题右侧空白横向展开；第二行只保留实例、容量和资源信息。菜单必须留在紧凑标题栏自身的几何范围内，不得撑高标题栏、下推实例卡片或隐藏真实浏览器子 WebView；菜单与下方原生 WebView 不得发生几何相交，CSS 层级不能作为覆盖原生 WebView 的解决方案。
+
+执行计划中的间隔单位使用与应用一致的自定义紧凑下拉菜单，不使用浏览器或系统原生 `select` 外观。
 
 红包接口参与必须使用参与账号专属浏览器实例的真实直播页面上下文。实例卡片提供紧凑的红包图标；点击后先将该账号的原生子 WebView 切换到已确认开播的直播间并验证登录，再允许 Go 调度红包参与。`join/rush` 必须由直播页面中的 `bdms.js`/`window.fetch` 生成动态签名，禁止回退到脱离页面上下文的 Go HTTP 直连。页面上下文未准备好时不要创建误导性的参与失败记录；原始 Cookie、签名 URL 和原始接口响应不得进入前端 JavaScript。
 

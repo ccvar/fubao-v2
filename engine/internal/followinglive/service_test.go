@@ -1,6 +1,9 @@
 package followinglive
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestParseItemsNormalizesAndDeduplicates(t *testing.T) {
 	body := []byte(`{
@@ -29,5 +32,29 @@ func TestParseItemsNormalizesAndDeduplicates(t *testing.T) {
 func TestParseItemsRejectsNonzeroStatus(t *testing.T) {
 	if _, err := parseItems([]byte(`{"status_code":20003,"status_msg":"not login"}`)); err == nil {
 		t.Fatal("expected status error")
+	}
+}
+
+func TestStoreNativeNormalizesAndCachesSafeSnapshot(t *testing.T) {
+	service := NewService()
+	result := service.StoreNative(" account-1 ", []Item{
+		{RoomID: " 123 ", WebRID: "778899", Nickname: " 主播甲 ", AvatarURL: "javascript:alert(1)"},
+		{RoomID: "123", WebRID: "778899", Nickname: "重复"},
+		{WebRID: "990011", Nickname: "主播乙", AvatarURL: "https://example.com/avatar.jpg"},
+		{},
+	})
+	if result.AccountID != "account-1" || result.Total != 2 {
+		t.Fatalf("unexpected native result: %#v", result)
+	}
+	if result.Items[0].Nickname != "主播甲" || result.Items[0].AvatarURL != "" {
+		t.Fatalf("expected trimmed safe first item, got %#v", result.Items[0])
+	}
+
+	cached, err := service.Fetch(context.Background(), "account-1", "sessionid_ss=unused", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached.Total != 2 || cached.RefreshedAt != result.RefreshedAt {
+		t.Fatalf("expected native snapshot from cache, got %#v", cached)
 	}
 }

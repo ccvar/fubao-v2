@@ -573,21 +573,10 @@ button {
 }
 
 .windows-platform:not(.detached-page-window) .topbar {
+  min-height: 64px;
+  padding-top: 9px;
+  padding-bottom: 6px;
   padding-left: 34px;
-}
-
-.windows-platform.sidebar-collapsed .topbar .icon-button.windows-sidebar-toggle,
-.windows-platform .topbar .icon-button.windows-sidebar-toggle {
-  position: absolute !important;
-  top: 11px;
-  left: 8px;
-  width: 22px;
-  height: 22px;
-  border-radius: 6px;
-}
-
-.windows-platform:not(.detached-page-window) .title-group p {
-  margin-left: 0;
 }
 
 .collapsed-sidebar-toggle svg {
@@ -3447,6 +3436,279 @@ label.browser-column-control[data-tooltip]:focus-within {
 .participation-settings-modal {
   width: min(520px, 100%);
   padding: 18px;
+}
+
+.participation-task-menu {
+  top: calc(50% - 2px);
+  left: calc(100% + 6px);
+  grid-auto-flow: column;
+  grid-auto-columns: max-content;
+  min-width: 0;
+  width: max-content;
+  padding: 3px;
+  transform: translateY(-50%);
+  white-space: nowrap;
+}
+
+.participation-task-menu button {
+  min-height: 24px;
+  padding-inline: 7px;
+}
+
+.participation-task-menu .menu-divider {
+  width: 1px;
+  height: 18px;
+  margin: auto 2px;
+}
+
+.title-group .participation-task-anchor {
+  position: relative;
+  display: inline-flex;
+  margin-left: 7px;
+  vertical-align: middle;
+}
+
+.title-group .participation-task-trigger {
+  display: inline-flex;
+  height: 18px;
+  align-items: center;
+  gap: 3px;
+  padding: 0 5px;
+  border: 0;
+  border-radius: 5px;
+  background: #edf4f1;
+  color: #31896e;
+  font-size: 9.5px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.title-group .participation-task-trigger span {
+  color: inherit;
+}
+
+.title-group .participation-task-trigger:hover,
+.title-group .participation-task-trigger:focus-visible,
+.title-group .participation-task-trigger[aria-expanded="true"] {
+  outline: 0;
+  background: #dfeee8;
+  color: #19785c;
+}
+
+.title-group .participation-task-trigger:disabled {
+  cursor: wait;
+  opacity: .7;
+}
+
+.title-group .participation-task-menu {
+  color: #514d46;
+  font-weight: 520;
+}
+
+.title-group .participation-task-menu span {
+  color: inherit;
+}
+
+.participation-task-menu small {
+  min-width: 18px;
+  margin-left: auto;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: #eeece7;
+  color: #777269;
+  font-size: 9px;
+  text-align: center;
+}
+
+.participation-schedule-modal {
+  width: min(540px, 100%);
+  max-height: min(680px, calc(100vh - 28px));
+  overflow: auto;
+  padding: 18px;
+}
+
+.participation-schedule-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: #edf4f1;
+  color: #288b6e;
+}
+
+.participation-schedule-modes {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 4px;
+  margin-bottom: 10px;
+  padding: 3px;
+  border-radius: 9px;
+  background: #f1efeb;
+}
+
+.participation-schedule-modes button {
+  height: 29px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #7d7870;
+  font-size: 10.5px;
+  cursor: pointer;
+}
+
+.participation-schedule-modes button.active {
+  background: #fff;
+  color: #36332f;
+  font-weight: 650;
+  box-shadow: 0 1px 3px rgb(47 42 35 / 9%);
+}
+
+.participation-schedule-fields {
+  overflow: visible;
+  border: 1px solid #e7e3dd;
+  border-radius: 11px;
+  background: #fbfaf8;
+}
+
+.participation-schedule-fields > label {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 196px;
+  min-height: 64px;
+  align-items: center;
+  gap: 16px;
+  padding: 10px 12px;
+}
+
+.participation-schedule-fields label > span:first-child,
+.participation-schedule-row > span {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.participation-schedule-fields strong,
+.participation-schedule-row strong {
+  color: #413d37;
+  font-size: 11px;
+}
+
+.participation-schedule-fields small,
+.participation-schedule-row small {
+  overflow: hidden;
+  color: #918c84;
+  font-size: 9.5px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.participation-schedule-fields input,
+.schedule-unit-trigger {
+  width: 100%;
+  height: 30px;
+  border: 1px solid #dedad3;
+  border-radius: 8px;
+  outline: 0;
+  background: #fff;
+  color: #49453f;
+  font: inherit;
+  font-size: 11px;
+}
+
+.participation-schedule-fields input {
+  padding: 0 9px;
+}
+
+.participation-schedule-fields input:focus,
+.schedule-unit-trigger:focus-visible,
+.schedule-unit-trigger[aria-expanded="true"] {
+  border-color: #9cbcac;
+  box-shadow: 0 0 0 2px rgb(62 151 116 / 10%);
+}
+
+.schedule-interval-field {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 72px;
+  gap: 6px;
+}
+
+.schedule-unit-select {
+  min-width: 0;
+}
+
+.schedule-unit-trigger {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 9px;
+  cursor: pointer;
+}
+
+.schedule-unit-trigger svg {
+  flex: 0 0 auto;
+  color: #8b867d;
+  transition: transform 140ms ease;
+}
+
+.schedule-unit-trigger[aria-expanded="true"] svg {
+  transform: rotate(180deg);
+}
+
+.schedule-unit-menu {
+  z-index: 140;
+  top: calc(100% + 5px);
+  right: 0;
+  left: 0;
+  min-width: 100%;
+  padding: 3px;
+}
+
+.schedule-unit-menu button {
+  min-height: 27px;
+  padding-inline: 8px;
+  font-size: 10.5px;
+}
+
+.schedule-unit-menu button svg {
+  margin-left: auto;
+  color: #31896e;
+}
+
+.participation-schedule-existing {
+  display: grid;
+  max-height: 176px;
+  margin-top: 12px;
+  overflow: auto;
+  border: 1px solid #e7e3dd;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.schedule-section-title {
+  padding: 8px 11px 5px;
+  color: #979188;
+  font-size: 9.5px;
+  font-weight: 650;
+}
+
+.participation-schedule-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 24px;
+  min-height: 46px;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 8px 7px 11px;
+  border-top: 1px solid #efebe5;
+}
+
+.participation-schedule-row .icon-button {
+  color: #aaa49b;
+}
+
+.participation-schedule-row .icon-button:hover,
+.participation-schedule-row .icon-button:focus-visible {
+  background: #f8ece9;
+  color: #cc5d4b;
 }
 
 .participation-settings-icon {

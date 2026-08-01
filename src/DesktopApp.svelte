@@ -328,6 +328,28 @@
 	minimum_diamonds: number;
   };
 
+  type ParticipationScheduleMode = "once" | "daily" | "interval";
+
+  type ParticipationSchedule = {
+	id: string;
+	mode: ParticipationScheduleMode;
+	enabled: boolean;
+	run_at?: string;
+	daily_time?: string;
+	interval_seconds?: number;
+	next_run_at: string;
+	last_run_at?: string;
+	created_at: string;
+	updated_at: string;
+  };
+
+  type ParticipationScheduleExecution = {
+	schedule_id: string;
+	mode: ParticipationScheduleMode;
+	label: string;
+	due_at: string;
+  };
+
   type SidebarActivity = {
 	id: string;
 	kind: "participation_started" | string;
@@ -423,6 +445,19 @@
 	draw_result_timeout_seconds: 10,
 	minimum_diamonds: 1,
   };
+  let participationTaskMenuOpen = false;
+  let participationScheduleModalOpen = false;
+  let participationScheduleBusy = false;
+  let participationScheduleError = "";
+  let participationScheduleMode: ParticipationScheduleMode = "once";
+  let participationScheduleRunAt = "";
+  let participationScheduleDailyTime = "20:00";
+  let participationScheduleInterval = 10;
+  let participationScheduleIntervalUnit: "minutes" | "hours" = "minutes";
+  let participationScheduleUnitMenuOpen = false;
+  let participationSchedules: ParticipationSchedule[] = [];
+  let participationBatchRunning = false;
+  let participationScheduleClaiming = false;
   let sidebarActivities: SidebarActivity[] = [];
   $: licenseDaysRemaining = getLicenseDaysRemaining(licenseStatus.expires_at);
   let query = "";
@@ -446,6 +481,7 @@
   let browserPendingClose: BrowserInstance | null = null;
   let browserFollowingLive: Record<string, FollowingLiveResult> = {};
   let browserFollowingLiveLoadingIds: string[] = [];
+  let browserFollowingLivePendingNativeIds: string[] = [];
   let browserFollowingLiveErrors: Record<string, string> = {};
   let followingLiveModalInstance: BrowserInstance | null = null;
   let browserWebviewMountingIds: string[] = [];
@@ -584,13 +620,14 @@
   });
   $: monitoringAccounts = accounts.filter((account) => account.roles.includes("monitoring"));
   $: participationAccounts = accounts.filter((account) => account.roles.includes("participation"));
+
   $: recentActivityItems = sidebarActivities.slice(0, 4).map((activity) => ({
 		id: activity.id,
 		label: activity.label,
 		time: formatMonitorTime(activity.created_at, redPacketClock),
-		icon: activity.kind === "participation_started" ? Gift : Radio,
-		tone: activity.kind === "participation_started" ? "live" : "neutral",
-		view: activity.kind === "participation_started" ? ("browsers" as NavKey) : ("accounts" as NavKey),
+		icon: activity.kind.startsWith("participation_") ? (activity.kind.includes("schedule") ? ClockCountdown : Gift) : Radio,
+		tone: activity.kind.startsWith("participation_") ? "live" : "neutral",
+		view: activity.kind.startsWith("participation_") ? ("browsers" as NavKey) : ("accounts" as NavKey),
 	}));
   $: filteredRooms = rooms.filter((room) => {
     const followAccounts = (room.follow_sources ?? []).map((source) => source.account_name).join(" ");
@@ -665,7 +702,7 @@
     const haystack = `${item.name} ${item.account_name} ${item.browser}`.toLowerCase();
     return haystack.includes(query.trim().toLowerCase());
   });
-  $: browserWebviewLayoutKey = `${activeView}:${browserViewSettled}:${instanceModalOpen}:${licenseModalOpen}:${participationSettingsModalOpen}:${sidebarCollapsed}:${query}:${visibleBrowserInstances
+  $: browserWebviewLayoutKey = `${activeView}:${browserViewSettled}:${instanceModalOpen}:${licenseModalOpen}:${participationSettingsModalOpen}:${participationScheduleModalOpen}:${participationTaskMenuOpen}:${sidebarCollapsed}:${query}:${visibleBrowserInstances
     .map((instance) => instance.id)
     .join(",")}`;
   $: if (browserWebviewLayoutKey) scheduleEmbeddedBrowserSync();
@@ -830,6 +867,138 @@
 		participationSettingsError = error instanceof Error ? error.message : String(error);
 	} finally {
 		participationSettingsBusy = false;
+	}
+  }
+
+  function localDateTimeInput(value: Date) {
+	const offset = value.getTimezoneOffset() * 60_000;
+	return new Date(value.getTime() - offset).toISOString().slice(0, 16);
+  }
+
+  function closeParticipationTaskMenu() {
+	participationTaskMenuOpen = false;
+  }
+
+  async function toggleParticipationTaskMenu() {
+	if (participationTaskMenuOpen) {
+		closeParticipationTaskMenu();
+		return;
+	}
+	importMenuOpen = false;
+	statusMenuOpen = false;
+	participationTaskMenuOpen = true;
+	void loadParticipationSchedules();
+  }
+
+  async function loadParticipationSchedules() {
+	if (!engineListenerReady) return;
+	try {
+		participationSchedules = await engineRequest<ParticipationSchedule[]>("red_packet_participation.schedule.list");
+	} catch {
+		// The task menu remains usable for immediate execution during a transient refresh failure.
+	}
+  }
+
+  async function openParticipationSchedule(mode: ParticipationScheduleMode) {
+	closeParticipationTaskMenu();
+	participationScheduleMode = mode;
+	participationScheduleError = "";
+	participationScheduleRunAt = localDateTimeInput(new Date(Date.now() + 60 * 60_000));
+	participationScheduleDailyTime = "20:00";
+	participationScheduleInterval = 10;
+	participationScheduleIntervalUnit = "minutes";
+	participationScheduleUnitMenuOpen = false;
+	await hideEmbeddedBrowsers();
+	participationScheduleModalOpen = true;
+	void loadParticipationSchedules();
+  }
+
+  function closeParticipationSchedule() {
+	if (participationScheduleBusy) return;
+	participationScheduleUnitMenuOpen = false;
+	participationScheduleModalOpen = false;
+	participationScheduleError = "";
+	scheduleEmbeddedBrowserSync();
+  }
+
+  function participationScheduleModeLabel(mode: ParticipationScheduleMode) {
+	if (mode === "once") return "指定日期";
+	if (mode === "daily") return "每天固定时间";
+	return "间隔执行";
+  }
+
+  function participationScheduleDescription(schedule: ParticipationSchedule) {
+	const next = formatLicenseDate(schedule.next_run_at, "待计算");
+	if (schedule.mode === "daily") return `每天 ${schedule.daily_time} · 下次 ${next}`;
+	if (schedule.mode === "interval") {
+		const minutes = Math.round((schedule.interval_seconds || 0) / 60);
+		return `每 ${minutes >= 60 && minutes % 60 === 0 ? `${minutes / 60} 小时` : `${minutes} 分钟`} · 下次 ${next}`;
+	}
+	return `执行时间 ${next}`;
+  }
+
+  async function saveParticipationSchedule() {
+	if (participationScheduleBusy || !isTauriDesktop()) return;
+	participationScheduleBusy = true;
+	participationScheduleError = "";
+	const intervalBase = Math.max(1, Math.trunc(Number(participationScheduleInterval) || 0));
+	const params: Record<string, unknown> = { mode: participationScheduleMode };
+	if (participationScheduleMode === "once") {
+		const runAt = new Date(participationScheduleRunAt);
+		if (!participationScheduleRunAt || !Number.isFinite(runAt.getTime()) || runAt.getTime() <= Date.now()) {
+			participationScheduleError = "请选择晚于当前时间的执行日期";
+			participationScheduleBusy = false;
+			return;
+		}
+		params.run_at = runAt.toISOString();
+	} else if (participationScheduleMode === "daily") {
+		params.daily_time = participationScheduleDailyTime;
+	} else {
+		params.interval_seconds = intervalBase * (participationScheduleIntervalUnit === "hours" ? 3600 : 60);
+	}
+	try {
+		await engineRequest<ParticipationSchedule>("red_packet_participation.schedule.create", params);
+		await Promise.all([loadParticipationSchedules(), loadSidebarActivities()]);
+		showToast(`${participationScheduleModeLabel(participationScheduleMode)}计划已创建`);
+		participationScheduleBusy = false;
+		closeParticipationSchedule();
+		void claimDueParticipationSchedules();
+	} catch (error) {
+		participationScheduleError = error instanceof Error ? error.message : String(error);
+	} finally {
+		participationScheduleBusy = false;
+	}
+  }
+
+  async function deleteParticipationSchedule(schedule: ParticipationSchedule) {
+	if (participationScheduleBusy) return;
+	participationScheduleBusy = true;
+	try {
+		await engineRequest("red_packet_participation.schedule.delete", { schedule_id: schedule.id });
+		await Promise.all([loadParticipationSchedules(), loadSidebarActivities()]);
+		showToast("执行计划已删除");
+	} catch (error) {
+		participationScheduleError = error instanceof Error ? error.message : String(error);
+	} finally {
+		participationScheduleBusy = false;
+	}
+  }
+
+  async function claimDueParticipationSchedules() {
+	if (isDetachedPageWindow || !engineListenerReady || !isTauriDesktop() || participationScheduleClaiming || participationBatchRunning) return;
+	participationScheduleClaiming = true;
+	try {
+		const executions = await engineRequest<ParticipationScheduleExecution[]>("red_packet_participation.schedule.claim_due");
+		for (const execution of executions) {
+			await executeParticipationBatch(execution);
+		}
+		if (executions.length > 0) {
+			await Promise.all([loadParticipationSchedules(), loadSidebarActivities()]);
+		}
+	} catch {
+		// A later poll safely retries because Go claims each occurrence atomically.
+	} finally {
+		participationScheduleClaiming = false;
 	}
   }
 
@@ -1128,23 +1297,35 @@
 
   function followingLiveTooltip(instance: BrowserInstance) {
     const snapshot = followingLiveSnapshot(instance);
-    if (!snapshot) return browserFollowingLiveErrors[instance.id] ? "直播未知" : "读取直播";
+    const error = browserFollowingLiveErrors[instance.id];
+    if (error) return error;
+    if (!snapshot) return "读取直播";
     return `${snapshot.total} 个正在直播`;
   }
 
   async function loadBrowserFollowingLive(instance: BrowserInstance, force = false) {
-    if (browserFollowingLiveLoadingIds.includes(instance.id)) return;
+    const useNativePage = isTauriDesktop() && (
+      browserWebviewMountedIds.includes(instance.id) || browserWebviewReadyIds.includes(instance.id)
+    );
+    if (browserFollowingLiveLoadingIds.includes(instance.id)) {
+      if (useNativePage && !browserFollowingLivePendingNativeIds.includes(instance.id)) {
+        browserFollowingLivePendingNativeIds = [...browserFollowingLivePendingNativeIds, instance.id];
+      }
+      return;
+    }
     browserFollowingLiveLoadingIds = [...browserFollowingLiveLoadingIds, instance.id];
     const nextErrors = { ...browserFollowingLiveErrors };
     delete nextErrors[instance.id];
     browserFollowingLiveErrors = nextErrors;
     try {
-      const result = await engineRequest<FollowingLiveResult>("browser.following_live", {
-        instance_id: instance.id,
-        force,
-      });
+      const result = useNativePage
+        ? await invoke<FollowingLiveResult>("sync_browser_following_live", { instanceId: instance.id })
+        : await engineRequest<FollowingLiveResult>("browser.following_live", {
+            instance_id: instance.id,
+            force,
+          });
       browserFollowingLive = { ...browserFollowingLive, [instance.id]: result };
-      if (force && !result.stale) {
+      if ((force || useNativePage) && !result.stale) {
         await loadRooms(false);
         void loadRedPacketMonitors(true);
       }
@@ -1155,6 +1336,10 @@
       };
     } finally {
       browserFollowingLiveLoadingIds = browserFollowingLiveLoadingIds.filter((id) => id !== instance.id);
+      if (browserFollowingLivePendingNativeIds.includes(instance.id)) {
+        browserFollowingLivePendingNativeIds = browserFollowingLivePendingNativeIds.filter((id) => id !== instance.id);
+        window.setTimeout(() => void loadBrowserFollowingLive(instance, true), 0);
+      }
     }
   }
 
@@ -1606,6 +1791,7 @@
       instanceModalOpen ||
       licenseModalOpen ||
 	  participationSettingsModalOpen ||
+	  participationScheduleModalOpen ||
       !browserMountIsVisible(element)
     ) {
       return;
@@ -1635,7 +1821,7 @@
       // Keep that native instance alive but hidden so returning still resumes
       // the exact in-memory page. Filters and viewport exits continue to
       // release it below because they are resource-management boundaries.
-      if (activeView !== "browsers" || instanceModalOpen || licenseModalOpen || participationSettingsModalOpen) {
+      if (activeView !== "browsers" || instanceModalOpen || licenseModalOpen || participationSettingsModalOpen || participationScheduleModalOpen) {
         if (!browserWebviewMountedIds.includes(instance.id)) {
           browserWebviewMountedIds = [...browserWebviewMountedIds, instance.id];
         }
@@ -1709,6 +1895,7 @@
           instanceModalOpen ||
           licenseModalOpen
 		  || participationSettingsModalOpen
+		  || participationScheduleModalOpen
         ) {
           if (
             browserWebviewMountedIds.includes(instance.id) ||
@@ -1920,11 +2107,13 @@
   function toggleImportMenu() {
     importMenuOpen = !importMenuOpen;
     statusMenuOpen = false;
+	void closeParticipationTaskMenu();
   }
 
   function toggleStatusMenu() {
     statusMenuOpen = !statusMenuOpen;
     importMenuOpen = false;
+	void closeParticipationTaskMenu();
   }
 
   function closeFloatingMenus(event: PointerEvent) {
@@ -1936,6 +2125,8 @@
       statusMenuOpen = false;
       importMenuOpen = false;
       roomSortMenuOpen = false;
+	  participationScheduleUnitMenuOpen = false;
+	  void closeParticipationTaskMenu();
     }
   }
 
@@ -2994,6 +3185,7 @@
       browserWebviewMountingIds = browserWebviewMountingIds.filter((id) => id !== instance.id);
       browserWebviewLoadingIds = browserWebviewLoadingIds.filter((id) => id !== instance.id);
       browserWebviewReadyIds = browserWebviewReadyIds.filter((id) => id !== instance.id);
+      browserFollowingLivePendingNativeIds = browserFollowingLivePendingNativeIds.filter((id) => id !== instance.id);
       browserRedPacketContextIds = browserRedPacketContextIds.filter((id) => id !== instance.id);
       browserPendingClose = null;
       showToast(`已关闭「${instance.account_name}」的实例，账号环境已保留`);
@@ -3146,6 +3338,83 @@
     } finally {
       browserRedPacketPreparingIds = browserRedPacketPreparingIds.filter((id) => id !== instance.id);
     }
+  }
+
+  async function startBrowserRedPacketFromBatch(instance: BrowserInstance) {
+	const context = browserParticipationContexts[instance.id];
+	if (context?.accepting || context?.active || browserRedPacketContextIds.includes(instance.id)) return false;
+	const account = accounts.find((item) => item.id === instance.account_id);
+	if (!account || account.cookie_status === "expired" || !account.roles.includes("participation")) return false;
+	const target = browserRedPacketLiveTarget(instance);
+	if (!target || browserRedPacketPreparingIds.includes(instance.id)) return false;
+	const apiWasEnabled = Boolean(account.participation?.red_packet_api_enabled);
+	browserRedPacketPreparingIds = [...browserRedPacketPreparingIds, instance.id];
+	try {
+		if (!apiWasEnabled) {
+			const updated = await engineRequest<AccountItem>("account.set_red_packet_api_enabled", {
+				account_id: account.id,
+				enabled: true,
+			});
+			accounts = accounts.map((item) => item.id === account.id ? updated : item);
+		}
+		await invoke<string>("prepare_browser_red_packet_context", {
+			instanceId: instance.id,
+			webRid: target.webRID,
+			resultOnly: false,
+		});
+		if (!browserRedPacketContextIds.includes(instance.id)) {
+			browserRedPacketContextIds = [...browserRedPacketContextIds, instance.id];
+		}
+		return true;
+	} catch {
+		if (!apiWasEnabled) {
+			const restored = await engineRequest<AccountItem>("account.set_red_packet_api_enabled", {
+				account_id: account.id,
+				enabled: false,
+			}).catch(() => null);
+			if (restored) accounts = accounts.map((item) => item.id === account.id ? restored : item);
+		}
+		return false;
+	} finally {
+		browserRedPacketPreparingIds = browserRedPacketPreparingIds.filter((id) => id !== instance.id);
+	}
+  }
+
+  async function executeParticipationBatch(execution?: ParticipationScheduleExecution) {
+	closeParticipationTaskMenu();
+	if (participationBatchRunning) return;
+	if (!isTauriDesktop()) {
+		showToast("红包参与任务仅支持桌面客户端");
+		scheduleEmbeddedBrowserSync();
+		return;
+	}
+	participationBatchRunning = true;
+	browserError = "";
+	let started = 0;
+	let skipped = 0;
+	try {
+		await Promise.all([loadAccounts(false), loadBrowserParticipationContexts()]);
+		for (const instance of browserInstances) {
+			if (await startBrowserRedPacketFromBatch(instance)) started += 1;
+			else skipped += 1;
+		}
+		await engineRequest("red_packet_participation.batch_result", {
+			schedule_id: execution?.schedule_id || "",
+			mode: execution?.mode || "immediate",
+			started,
+			skipped,
+		});
+		await Promise.all([loadBrowserParticipationContexts(), loadSidebarActivities(), loadAccounts(false)]);
+		const prefix = execution ? `${participationScheduleModeLabel(execution.mode)}计划已执行` : "红包参与任务已启动";
+		showToast(`${prefix}：成功 ${started} 个${skipped > 0 ? `，跳过 ${skipped} 个` : ""}`);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		browserError = message;
+		showToast(message);
+	} finally {
+		participationBatchRunning = false;
+		scheduleEmbeddedBrowserSync();
+	}
   }
 
   async function deleteAccount() {
@@ -3304,14 +3573,14 @@
           void loadLicenseStatus();
           void loadAccounts(false);
           void loadRedPacketMonitors();
-          void loadRedPacketEvents();
+		  void loadRedPacketEvents();
 		  void loadSidebarActivities();
+		  void loadParticipationSchedules();
           if (activeView === "accounts") {
             void loadRooms();
           }
           if (activeView === "browsers") {
-            void loadAccounts();
-            void loadBrowserInstances();
+			void Promise.all([loadAccounts(), loadBrowserInstances()]).then(() => claimDueParticipationSchedules());
           }
         })
         .catch((error) => {
@@ -3348,6 +3617,8 @@
         if (!browserWebviewReadyIds.includes(instanceId)) {
           browserWebviewReadyIds = [...browserWebviewReadyIds, instanceId];
         }
+        const instance = browserInstances.find((item) => item.id === instanceId);
+        if (instance) void loadBrowserFollowingLive(instance, true);
         // The page can finish while a grid reflow is in progress. Reconcile
         // against the latest card bounds instead of trusting the geometry
         // captured when the child WebView was first created.
@@ -3398,6 +3669,9 @@
     const redPacketClockTimer = window.setInterval(() => {
       redPacketClock = Date.now();
     }, 1000);
+	const participationScheduleTimer = window.setInterval(() => {
+	  void claimDueParticipationSchedules();
+	}, 2000);
     const browserStatusTimer = window.setInterval(() => {
       void pollBrowserInstanceStatuses();
 	  void loadBrowserParticipationContexts();
@@ -3429,6 +3703,7 @@
       shellResizeObserver.disconnect();
       window.clearInterval(redPacketRefreshTimer);
       window.clearInterval(redPacketClockTimer);
+	  window.clearInterval(participationScheduleTimer);
       window.clearInterval(browserStatusTimer);
       window.clearInterval(followingRoomSyncTimer);
       window.clearInterval(browserCookieSyncTimer);
@@ -3607,9 +3882,8 @@
   <main class="main-panel">
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <header class="topbar" data-tauri-drag-region onpointerdown={startWindowDrag}>
-      {#if !isDetachedPageWindow && (isWindowsPlatform || sidebarCollapsed)}
+      {#if !isWindowsPlatform && !isDetachedPageWindow && sidebarCollapsed}
         <button
-          class:windows-sidebar-toggle={isWindowsPlatform}
           class="icon-button collapsed-sidebar-toggle"
           aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
           data-tooltip={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
@@ -3621,13 +3895,48 @@
       {/if}
       <div class="title-group" data-tauri-drag-region>
         <div class="title-line" data-tauri-drag-region>
-          {#if !isWindowsPlatform || isDetachedPageWindow}
-            <span class="title-icon" data-tauri-drag-region>
-              {#if activeView === "browsers"}<Browser size={18} />
-              {:else}<UserFocus size={18} />{/if}
+          <span class="title-icon" data-tauri-drag-region>
+            {#if activeView === "browsers"}<Browser size={18} />
+            {:else}<UserFocus size={18} />{/if}
+          </span>
+          <h1 data-tauri-drag-region>{viewMeta[activeView].title}</h1>
+          {#if activeView === "browsers"}
+            <span class="menu-anchor participation-task-anchor">
+              <button
+                class="participation-task-trigger"
+                aria-haspopup="menu"
+                aria-expanded={participationTaskMenuOpen}
+                disabled={participationBatchRunning}
+                onclick={toggleParticipationTaskMenu}
+              >
+                {#if participationBatchRunning}<ArrowClockwise class="spinning" size={11} />{:else}<Play size={10} weight="fill" />{/if}
+                <span>{participationBatchRunning ? "启动中…" : "启动任务"}</span>
+                <CaretDown size={9} />
+              </button>
+              {#if participationTaskMenuOpen}
+                <span class="floating-menu participation-task-menu" role="menu">
+                  <button role="menuitem" onclick={() => void executeParticipationBatch()}>
+                    <Play size={15} weight="fill" /><span>立即执行</span>
+                  </button>
+                  <button role="menuitem" onclick={() => openParticipationSchedule("once")}>
+                    <ClockCountdown size={15} /><span>指定日期</span>
+                  </button>
+                  <button role="menuitem" onclick={() => openParticipationSchedule("daily")}>
+                    <Radio size={15} /><span>每天固定时间</span>
+                  </button>
+                  <button role="menuitem" onclick={() => openParticipationSchedule("interval")}>
+                    <ArrowClockwise size={15} /><span>间隔执行</span>
+                  </button>
+                  {#if participationSchedules.length > 0}
+                    <span class="menu-divider"></span>
+                    <button role="menuitem" onclick={() => openParticipationSchedule("once")}>
+                      <ClockCountdown size={15} /><span>管理计划</span><small>{participationSchedules.length}</small>
+                    </button>
+                  {/if}
+                </span>
+              {/if}
             </span>
           {/if}
-          <h1 data-tauri-drag-region>{viewMeta[activeView].title}</h1>
         </div>
         <p data-tauri-drag-region>
           {activeView === "accounts" ? accountSubtitle : browserSubtitle}
@@ -4563,6 +4872,120 @@
         <button class="primary-action" disabled={participationSettingsBusy} onclick={saveParticipationSettings}>
           {#if participationSettingsBusy}<ArrowClockwise class="spinning" size={14} />{/if}
           {participationSettingsBusy ? "保存中…" : "保存设置"}
+        </button>
+      </div>
+    </dialog>
+  </div>
+{/if}
+
+{#if participationScheduleModalOpen}
+  <div
+    class="modal-backdrop"
+    role="presentation"
+    onclick={(event) => event.currentTarget === event.target && closeParticipationSchedule()}
+  >
+    <dialog class="modal participation-schedule-modal" open aria-labelledby="participation-schedule-title">
+      <div class="modal-head">
+        <div>
+          <span class="modal-icon participation-schedule-icon"><ClockCountdown size={18} /></span>
+          <h2 id="participation-schedule-title">新增执行计划</h2>
+        </div>
+        <button class="icon-button" aria-label="关闭" disabled={participationScheduleBusy} onclick={closeParticipationSchedule}><X size={17} /></button>
+      </div>
+
+      <p class="participation-settings-intro">计划由 Go 引擎持久化；触发时批量启动已登录实例的真实红包页面参与。</p>
+      <div class="participation-schedule-modes" role="tablist" aria-label="调度方式">
+        {#each ["once", "daily", "interval"] as mode}
+          <button
+            class:active={participationScheduleMode === mode}
+            role="tab"
+            aria-selected={participationScheduleMode === mode}
+            onclick={() => {
+              participationScheduleMode = mode as ParticipationScheduleMode;
+              participationScheduleUnitMenuOpen = false;
+            }}
+          >{participationScheduleModeLabel(mode as ParticipationScheduleMode)}</button>
+        {/each}
+      </div>
+
+      <div class="participation-schedule-fields">
+        {#if participationScheduleMode === "once"}
+          <label>
+            <span><strong>执行日期</strong><small>到达指定日期和时间后执行一次</small></span>
+            <input type="datetime-local" min={localDateTimeInput(new Date())} bind:value={participationScheduleRunAt} />
+          </label>
+        {:else if participationScheduleMode === "daily"}
+          <label>
+            <span><strong>每天固定时间</strong><small>每天在本机时间到达后执行一次</small></span>
+            <input type="time" bind:value={participationScheduleDailyTime} />
+          </label>
+        {:else}
+          <label>
+            <span><strong>执行间隔</strong><small>保存后立即执行一轮，之后按此间隔再次调度</small></span>
+            <span class="schedule-interval-field">
+              <input type="number" min="1" max={participationScheduleIntervalUnit === "hours" ? 720 : 43200} step="1" bind:value={participationScheduleInterval} />
+              <span class="menu-anchor schedule-unit-select">
+                <button
+                  class="schedule-unit-trigger"
+                  type="button"
+                  aria-label="间隔单位"
+                  aria-haspopup="listbox"
+                  aria-expanded={participationScheduleUnitMenuOpen}
+                  onclick={() => (participationScheduleUnitMenuOpen = !participationScheduleUnitMenuOpen)}
+                >
+                  <span>{participationScheduleIntervalUnit === "hours" ? "小时" : "分钟"}</span>
+                  <CaretDown size={12} />
+                </button>
+                {#if participationScheduleUnitMenuOpen}
+                  <span class="floating-menu schedule-unit-menu" role="listbox" aria-label="选择间隔单位">
+                    {#each [["minutes", "分钟"], ["hours", "小时"]] as option}
+                      <button
+                        class:active={participationScheduleIntervalUnit === option[0]}
+                        type="button"
+                        role="option"
+                        aria-selected={participationScheduleIntervalUnit === option[0]}
+                        onclick={() => {
+                          participationScheduleIntervalUnit = option[0] as "minutes" | "hours";
+                          participationScheduleUnitMenuOpen = false;
+                        }}
+                      >
+                        <span>{option[1]}</span>
+                        {#if participationScheduleIntervalUnit === option[0]}<CheckCircle size={13} weight="fill" />{/if}
+                      </button>
+                    {/each}
+                  </span>
+                {/if}
+              </span>
+            </span>
+          </label>
+        {/if}
+      </div>
+
+      {#if participationSchedules.length > 0}
+        <div class="participation-schedule-existing">
+          <span class="schedule-section-title">已启用计划</span>
+          {#each participationSchedules as schedule (schedule.id)}
+            <div class="participation-schedule-row">
+              <span><strong>{participationScheduleModeLabel(schedule.mode)}</strong><small>{participationScheduleDescription(schedule)}</small></span>
+              <button
+                class="icon-button"
+                aria-label="删除执行计划"
+                data-tooltip="删除执行计划"
+                data-tooltip-placement="left"
+                disabled={participationScheduleBusy}
+                onclick={() => deleteParticipationSchedule(schedule)}
+              ><Trash size={14} /></button>
+            </div>
+          {/each}
+        </div>
+      {/if}
+
+      {#if participationScheduleError}<div class="license-error"><WarningCircle size={14} />{participationScheduleError}</div>{/if}
+      <div class="modal-actions">
+        <button class="secondary-button" disabled={participationScheduleBusy} onclick={closeParticipationSchedule}>取消</button>
+        <button class="primary-action" disabled={participationScheduleBusy} onclick={saveParticipationSchedule}>
+          {#if participationScheduleBusy}<ArrowClockwise class="spinning" size={14} />{/if}
+          {participationScheduleBusy ? "保存中…" : "保存计划"}
         </button>
       </div>
     </dialog>

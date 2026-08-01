@@ -495,6 +495,45 @@ func main() {
 				OK:      true,
 				Result:  browserStore.List(),
 			})
+		case "browser.native_following_live":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			if browserStoreErr != nil {
+				writeError(encoder, req.ID, "browser_store_unavailable", browserStoreErr.Error())
+				continue
+			}
+			var params struct {
+				InstanceID string               `json:"instance_id"`
+				Items      []followinglive.Item `json:"items"`
+				Secret     string               `json:"secret"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.InstanceID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "原生关注直播参数无效")
+				continue
+			}
+			nativeSecret := strings.TrimSpace(os.Getenv("FUBAO_NATIVE_RPC_SECRET"))
+			if nativeSecret == "" || params.Secret != nativeSecret {
+				writeError(encoder, req.ID, "native_auth_failed", "原生关注直播请求未授权")
+				continue
+			}
+			accountID, err := browserStore.AccountID(params.InstanceID)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_following_live_failed", err.Error())
+				continue
+			}
+			credential, err := accountStore.ParticipationCredential(accountID)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_account_invalid", err.Error())
+				continue
+			}
+			result := followingLiveService.StoreNative(credential.AccountID, params.Items)
+			if err := mergeFollowingLiveResult(roomStore, redPacketStore, credential, result); err != nil {
+				writeError(encoder, req.ID, "browser_following_live_sync_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
 		case "browser.following_live":
 			if accountStoreErr != nil {
 				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
@@ -850,6 +889,76 @@ func main() {
 				}
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
+		case "red_packet_participation.schedule.list":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.ParticipationSchedules()})
+		case "red_packet_participation.schedule.create":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			var params redpacket.ParticipationSchedule
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "红包参与计划参数无效")
+				continue
+			}
+			result, err := redPacketStore.CreateParticipationSchedule(params, time.Now())
+			if err != nil {
+				writeError(encoder, req.ID, "participation_schedule_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
+		case "red_packet_participation.schedule.delete":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			var params struct {
+				ScheduleID string `json:"schedule_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.ScheduleID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "红包参与计划参数无效")
+				continue
+			}
+			if err := redPacketStore.DeleteParticipationSchedule(params.ScheduleID); err != nil {
+				writeError(encoder, req.ID, "participation_schedule_delete_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{"deleted": true}})
+		case "red_packet_participation.schedule.claim_due":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			result, err := redPacketStore.ClaimDueParticipationSchedules(time.Now())
+			if err != nil {
+				writeError(encoder, req.ID, "participation_schedule_claim_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
+		case "red_packet_participation.batch_result":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			var params struct {
+				ScheduleID string `json:"schedule_id"`
+				Mode       string `json:"mode"`
+				Started    int    `json:"started"`
+				Skipped    int    `json:"skipped"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || params.Started < 0 || params.Skipped < 0 {
+				writeError(encoder, req.ID, "invalid_params", "红包参与批量执行结果无效")
+				continue
+			}
+			if err := redPacketStore.RecordParticipationBatchResult(params.ScheduleID, params.Mode, params.Started, params.Skipped); err != nil {
+				writeError(encoder, req.ID, "participation_batch_result_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{"recorded": true}})
 		case "red_packet_participation.contexts":
 			if redPacketStoreErr != nil || browserStoreErr != nil || pageParticipation == nil {
 				writeError(encoder, req.ID, "participation_unavailable", "红包参与状态不可用")
