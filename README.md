@@ -38,7 +38,7 @@ cd src-tauri && cargo check
 - macOS Universal：同时支持 Apple Silicon 与 Intel，产出 DMG；
 - Windows x64：产出 NSIS EXE 安装包。
 
-可以在 GitHub Actions 中手动运行并下载构建产物；推送到 `main` 时也会自动编译。手动发布或推送 `v*` 标签时，工作流会将安装包、SHA-256 校验信息和 `latest.json` 同步到 `ccvar/fubao-v2-releases` 的 GitHub Release，并更新该发布仓库主分支中的更新清单。发布前需要在源码仓库配置 `FUBAO_RELEASES_TOKEN` Actions secret。
+可以在 GitHub Actions 中手动运行并下载构建产物；推送到 `main` 时也会自动编译。手动发布或推送 `v*` 标签时，工作流会将安装包、SHA-256 校验信息和 `latest.json` 同步到 `ccvar/fubao-v2-releases` 的 GitHub Release，并更新该发布仓库主分支中的更新清单。发布前需要在源码仓库配置 `FUBAO_V2_RELEASES_TOKEN` Actions secret。
 
 ## 当前范围
 

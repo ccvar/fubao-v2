@@ -192,12 +192,12 @@ jobs:
 
       - name: Initialize packages repository
         env:
-          RELEASE_TOKEN: ${{ secrets.FUBAO_RELEASES_TOKEN }}
+          RELEASE_TOKEN: ${{ secrets.FUBAO_V2_RELEASES_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
           if [[ -z "${RELEASE_TOKEN}" ]]; then
-            echo "Missing required secret: FUBAO_RELEASES_TOKEN" >&2
+            echo "Missing required secret: FUBAO_V2_RELEASES_TOKEN" >&2
             exit 1
           fi
           git clone "https://x-access-token:${RELEASE_TOKEN}@github.com/${RELEASE_REPOSITORY}.git" release-repo
@@ -218,13 +218,13 @@ jobs:
 
       - name: Create or update packages release
         env:
-          GH_TOKEN: ${{ secrets.FUBAO_RELEASES_TOKEN }}
+          GH_TOKEN: ${{ secrets.FUBAO_V2_RELEASES_TOKEN }}
           RELEASE_NOTES: ${{ inputs.notes }}
         shell: bash
         run: |
           set -euo pipefail
           if [[ -z "${GH_TOKEN}" ]]; then
-            echo "Missing required secret: FUBAO_RELEASES_TOKEN" >&2
+            echo "Missing required secret: FUBAO_V2_RELEASES_TOKEN" >&2
             exit 1
           fi
           TAG="${{ steps.metadata.outputs.tag }}"
