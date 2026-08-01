@@ -38,7 +38,7 @@ cd src-tauri && cargo check
 - macOS Universal：同时支持 Apple Silicon 与 Intel，产出 DMG；
 - Windows x64：产出 NSIS EXE 与 MSI 安装包。
 
-可以在 GitHub Actions 中手动运行并下载构建产物。推送 `v*` 标签时，工作流还会自动创建或更新当前仓库对应版本的 GitHub Release。
+可以在 GitHub Actions 中手动运行并下载构建产物；推送到 `main` 时也会自动编译。推送 `v*` 标签时，工作流还会自动创建或更新当前仓库对应版本的 GitHub Release。
 
 ## 当前范围
 
