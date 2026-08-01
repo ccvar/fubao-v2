@@ -396,7 +396,7 @@ func (s *Store) RedPacketParticipationCredentials(now time.Time) []RedPacketPart
 
 // RecordRedPacketParticipation stores only safe result metadata and counters.
 // Raw response bodies and Cookie values never enter the account view.
-func (s *Store) RecordRedPacketParticipation(accountID, status, message string, joined bool, cooldown time.Duration, cookieExpired bool) {
+func (s *Store) RecordRedPacketParticipation(accountID, status, message string, joined, won bool, cooldown time.Duration, cookieExpired bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	account := s.accounts[accountID]
@@ -411,6 +411,9 @@ func (s *Store) RecordRedPacketParticipation(accountID, status, message string, 
 		profile.JoinCount++
 		profile.LastJoinAt = now.Format(time.RFC3339Nano)
 	}
+	if won {
+		profile.WinCount++
+	}
 	if cooldown > 0 {
 		profile.RedPacketCooldownUntil = now.Add(cooldown).Format(time.RFC3339Nano)
 	} else {
@@ -422,6 +425,25 @@ func (s *Store) RecordRedPacketParticipation(accountID, status, message string, 
 		account.CookieChecked = now.Format(time.RFC3339Nano)
 	}
 	account.UpdatedAt = now.Format(time.RFC3339Nano)
+	_ = s.saveLocked()
+}
+
+// RecordRedPacketDrawResult stores only a definitive personal draw outcome.
+// It is separate from join accounting so a pending join never counts as a win.
+func (s *Store) RecordRedPacketDrawResult(accountID, message string, won bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account := s.accounts[accountID]
+	if account == nil || account.Participation == nil {
+		return
+	}
+	account.Participation.LastRedPacketStatus = "not_won"
+	if won {
+		account.Participation.WinCount++
+		account.Participation.LastRedPacketStatus = "won"
+	}
+	account.Participation.LastRedPacketMessage = strings.TrimSpace(message)
+	account.UpdatedAt = time.Now().Format(time.RFC3339Nano)
 	_ = s.saveLocked()
 }
 

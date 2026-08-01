@@ -57,11 +57,23 @@ button {
 
 .app-shell {
   display: grid;
-  grid-template-columns: var(--sidebar-width, 252px) minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width, 232px) minmax(0, 1fr);
   width: 100%;
   height: 100vh;
   overflow: hidden;
   background: var(--canvas);
+}
+
+.app-shell.detached-page-window {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.detached-page-window .topbar {
+  padding-left: 122px;
+}
+
+.detached-page-window.windows-platform .topbar {
+  padding-left: 34px;
 }
 
 .sidebar {
@@ -97,12 +109,10 @@ button {
   left: 87px;
 }
 
-/* Windows keeps a native non-client title bar, so the web control cannot sit
-   inside it without replacing all system window controls. Anchor the toggle
-   to the sidebar edge instead of leaving it floating in the strip. */
-.windows-platform .sidebar-toggle {
-  right: 10px;
-  left: auto;
+/* Windows already supplies a native title bar. Do not stack the macOS web
+   chrome strip beneath it; navigation starts directly below native chrome. */
+.windows-platform .window-strip {
+  display: none;
 }
 
 .icon-button {
@@ -326,11 +336,24 @@ button {
   flex: 1 1 auto;
 }
 
+.sidebar-data-overview {
+  flex: 0 0 auto;
+  overflow: visible;
+}
+
+.sidebar-recent-activity {
+  flex: 1 1 auto;
+  padding-top: 16px;
+  padding-bottom: 10px;
+  scrollbar-color: #d5d1c9 transparent;
+  scrollbar-width: thin;
+}
+
 .quick-row {
   display: flex;
   align-items: center;
   width: 100%;
-  gap: 9px;
+  gap: 5px;
   min-height: 26px;
   padding: 4px 10px;
   border: 0;
@@ -349,7 +372,8 @@ button {
 
 .quick-status {
   display: grid;
-  width: 20px;
+  width: 17px;
+  flex: 0 0 17px;
   color: #98948b;
   place-items: center;
 }
@@ -365,6 +389,35 @@ button {
 
 .quick-row.warning:hover {
   color: #965e0b;
+}
+
+.recent-activity-row {
+  min-height: 40px;
+  align-items: flex-start;
+  padding-block: 5px;
+}
+
+.recent-activity-row .quick-status {
+  padding-top: 1px;
+}
+
+.recent-activity-copy {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.recent-activity-copy > span,
+.recent-activity-copy small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-activity-copy small {
+  color: #aaa69e;
+  font-size: 9.5px;
+  line-height: 13px;
 }
 
 .sidebar-footer {
@@ -510,6 +563,19 @@ button {
   left: 16px;
 }
 
+.windows-platform:not(.detached-page-window) .topbar {
+  padding-left: 34px;
+}
+
+.windows-platform.sidebar-collapsed .topbar .icon-button.windows-sidebar-toggle,
+.windows-platform .topbar .icon-button.windows-sidebar-toggle {
+  position: absolute !important;
+  top: 11px;
+  left: 8px;
+  width: 22px;
+  height: 22px;
+}
+
 .collapsed-sidebar-toggle svg {
   display: block;
   width: 15px;
@@ -549,6 +615,11 @@ button {
 
 .title-group p span {
   color: #b3afa8;
+}
+
+.title-group p .browser-resource-usage {
+  color: #858078;
+  white-space: nowrap;
 }
 
 .toolbar {
@@ -868,6 +939,40 @@ label.browser-column-control[data-tooltip]:focus-within {
   border-radius: 9px;
   background: #fff;
   box-shadow: 0 12px 34px rgb(45 39 31 / 14%), 0 2px 8px rgb(45 39 31 / 8%);
+}
+
+.nav-context-menu {
+  position: fixed;
+  z-index: 1000;
+  min-width: 148px;
+  padding: 4px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  background: #fff;
+  box-shadow: 0 12px 34px rgb(45 39 31 / 14%), 0 2px 8px rgb(45 39 31 / 8%);
+}
+
+.nav-context-menu button {
+  display: flex;
+  width: 100%;
+  min-height: 29px;
+  align-items: center;
+  gap: 8px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #514d46;
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.nav-context-menu button:hover,
+.nav-context-menu button:focus-visible {
+  outline: 0;
+  background: #f1efeb;
+  color: var(--ink);
 }
 
 .floating-menu button {
@@ -1531,7 +1636,8 @@ label.browser-column-control[data-tooltip]:focus-within {
 }
 
 .browser-account-row .browser-open-button,
-.browser-account-row .browser-close-button {
+.browser-account-row .browser-close-button,
+.browser-account-row .browser-red-packet-button {
   position: relative;
   width: 24px;
   height: 24px;
@@ -1548,9 +1654,29 @@ label.browser-column-control[data-tooltip]:focus-within {
 .browser-account-row .browser-open-button:hover:not(:disabled),
 .browser-account-row .browser-open-button:focus-visible,
 .browser-account-row .browser-close-button:hover:not(:disabled),
-.browser-account-row .browser-close-button:focus-visible {
+.browser-account-row .browser-close-button:focus-visible,
+.browser-account-row .browser-red-packet-button:hover:not(:disabled),
+.browser-account-row .browser-red-packet-button:focus-visible {
   background: #efede9;
   color: #302e2a;
+}
+
+.browser-account-row .browser-red-packet-button.enabled {
+  color: #df4c40;
+  background: #fff0ed;
+}
+
+.browser-account-row .browser-red-packet-button:hover:not(:disabled),
+.browser-account-row .browser-red-packet-button:focus-visible {
+  background: #fff0ed;
+  color: #cc3e34;
+}
+
+.browser-account-row .browser-red-packet-button.limit-reached,
+.browser-account-row .browser-red-packet-button.limit-reached:hover:not(:disabled),
+.browser-account-row .browser-red-packet-button.limit-reached:focus-visible {
+  background: #f4f2ee;
+  color: #aaa69f;
 }
 
 .browser-account-row .browser-close-button {
@@ -1564,7 +1690,8 @@ label.browser-column-control[data-tooltip]:focus-within {
 }
 
 .browser-account-row .browser-open-button:disabled,
-.browser-account-row .browser-close-button:disabled {
+.browser-account-row .browser-close-button:disabled,
+.browser-account-row .browser-red-packet-button:disabled {
   cursor: default;
   opacity: .48;
 }
@@ -2750,6 +2877,155 @@ label.browser-column-control[data-tooltip]:focus-within {
 	white-space: nowrap;
 }
 
+.participation-record-list {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: #d5d1c9 transparent;
+  scrollbar-width: thin;
+}
+
+.participation-record-head,
+.participation-record-row {
+  display: grid;
+  grid-template-columns: minmax(170px, .9fr) minmax(240px, 1.35fr) minmax(180px, 1fr) minmax(90px, .5fr) minmax(78px, auto);
+  align-items: center;
+  column-gap: 16px;
+  padding-inline: var(--management-inline-padding);
+}
+
+.participation-record-head {
+  position: sticky;
+  z-index: 2;
+  top: 0;
+  min-height: 34px;
+  border-bottom: 1px solid var(--line);
+  background: #fff;
+  color: #9a968e;
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: .04em;
+}
+
+.participation-record-row {
+  min-height: 68px;
+  border-bottom: 1px solid var(--line);
+}
+
+.participation-record-row:hover {
+  background: #fcfbf9;
+}
+
+.participation-record-account,
+.participation-record-event {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.participation-record-icon {
+  display: grid;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  place-items: center;
+  border-radius: 9px;
+  background: #e7f5f1;
+  color: #238266;
+}
+
+.participation-record-account > div,
+.participation-record-event,
+.participation-record-result,
+.participation-record-endpoint {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.participation-record-account strong,
+.participation-record-account small,
+.participation-record-event strong,
+.participation-record-event small,
+.participation-record-result small,
+.participation-record-endpoint strong,
+.participation-record-endpoint small,
+.participation-record-time {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.participation-record-account strong,
+.participation-record-event strong,
+.participation-record-endpoint strong {
+  color: var(--ink);
+  font-size: 11.5px;
+  font-weight: 650;
+}
+
+.participation-record-account small,
+.participation-record-event small,
+.participation-record-result small,
+.participation-record-endpoint small,
+.participation-record-time {
+  color: #918d85;
+  font-size: 9.5px;
+}
+
+.participation-record-event-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+}
+
+.participation-record-event-title strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.participation-result-pill {
+  display: inline-flex;
+  width: max-content;
+  min-height: 20px;
+  align-items: center;
+  padding: 0 7px;
+  border-radius: 999px;
+  background: #efede9;
+  color: #716c64;
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.participation-result-pill.success {
+  background: #e7f5ee;
+  color: #277d5f;
+}
+
+.participation-result-pill.warning,
+.participation-result-pill.pending {
+  background: #fbf0da;
+  color: #9a6a1e;
+}
+
+.participation-result-pill.error {
+  background: #fae7e3;
+  color: #bd493b;
+}
+
+.participation-result-pill.muted {
+  background: #efede9;
+  color: #858078;
+}
+
+.participation-record-time {
+  justify-self: start;
+}
+
 .account-list-head {
   position: sticky;
   z-index: 2;
@@ -3152,6 +3428,99 @@ label.browser-column-control[data-tooltip]:focus-within {
 .license-modal {
   width: min(500px, 100%);
   padding: 18px;
+}
+
+.participation-settings-modal {
+  width: min(520px, 100%);
+  padding: 18px;
+}
+
+.participation-settings-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: #fce9e5;
+  color: #d85843;
+}
+
+.participation-settings-intro {
+  margin: 13px 2px 9px;
+  color: #8b867e;
+  font-size: 10px;
+}
+
+.participation-settings-list {
+  overflow: hidden;
+  border: 1px solid #e7e3dd;
+  border-radius: 11px;
+  background: #fbfaf8;
+}
+
+.participation-setting-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-height: 62px;
+  align-items: center;
+  gap: 18px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #ebe7e1;
+}
+
+.participation-setting-row:last-child {
+  border-bottom: 0;
+}
+
+.participation-setting-row > span:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.participation-setting-row strong {
+  color: #413d37;
+  font-size: 12px;
+}
+
+.participation-setting-row small {
+  color: #918c84;
+  font-size: 9.5px;
+  line-height: 1.45;
+}
+
+.participation-setting-row .number-field {
+  display: flex;
+  width: 108px;
+  height: 30px;
+  align-items: center;
+  overflow: hidden;
+  border: 1px solid #dedad3;
+  border-radius: 8px;
+  background: #fff;
+}
+
+.participation-setting-row .number-field:focus-within {
+  border-color: #cf7565;
+  box-shadow: 0 0 0 2px rgb(207 117 101 / 10%);
+}
+
+.participation-setting-row input {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  padding: 0 4px 0 9px;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #3f3a34;
+  font: inherit;
+  font-size: 11px;
+}
+
+.participation-setting-row em {
+  padding-right: 9px;
+  color: #99948c;
+  font-size: 9.5px;
+  font-style: normal;
 }
 
 .update-modal {
@@ -3900,6 +4269,12 @@ label.browser-column-control[data-tooltip]:focus-within {
     column-gap: 12px;
   }
 
+  .participation-record-head,
+  .participation-record-row {
+    grid-template-columns: minmax(145px, .85fr) minmax(190px, 1.2fr) minmax(155px, .95fr) 82px 72px;
+    column-gap: 10px;
+  }
+
   .room-list-head,
   .room-row {
     grid-template-columns: minmax(180px, 1.15fr) minmax(180px, .95fr) minmax(150px, .7fr) 64px;
@@ -3946,10 +4321,27 @@ label.browser-column-control[data-tooltip]:focus-within {
     column-gap: 12px;
   }
 
+  .participation-record-head,
+  .participation-record-row {
+    grid-template-columns: minmax(125px, .8fr) minmax(160px, 1.1fr) minmax(125px, .9fr) 74px 64px;
+    column-gap: 8px;
+  }
+
   .room-list-head,
   .room-row {
     grid-template-columns: minmax(145px, 1.05fr) minmax(145px, .9fr) minmax(132px, .72fr) 54px;
     column-gap: 10px;
+  }
+
+  .participation-record-head,
+  .participation-record-row {
+    grid-template-columns: minmax(118px, .8fr) minmax(150px, 1.15fr) minmax(120px, .9fr) 64px;
+    column-gap: 7px;
+  }
+
+  .participation-record-head > span:nth-child(4),
+  .participation-record-row > .participation-record-endpoint {
+    display: none;
   }
 
   .red-packet-monitor-head,

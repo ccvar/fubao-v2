@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -27,6 +28,7 @@ const (
 
 type ResourceSnapshot struct {
 	CPUCount        int              `json:"cpu_count"`
+	CPUUsage        float64          `json:"cpu_usage_percent"`
 	MemoryTotal     uint64           `json:"memory_total_bytes"`
 	MemoryAvailable uint64           `json:"memory_available_bytes"`
 	Pressure        ResourcePressure `json:"pressure"`
@@ -61,10 +63,100 @@ func detectResources() ResourceSnapshot {
 	}
 	return ResourceSnapshot{
 		CPUCount:        maxInt(1, runtime.NumCPU()),
+		CPUUsage:        detectCPUUsage(),
 		MemoryTotal:     total,
 		MemoryAvailable: available,
 		Pressure:        pressure,
 	}
+}
+
+func detectCPUUsage() float64 {
+	switch runtime.GOOS {
+	case "darwin":
+		output, err := exec.Command("/usr/bin/top", "-l", "1", "-n", "0").Output()
+		if err == nil {
+			return parseDarwinCPUUsage(string(output))
+		}
+	case "linux":
+		return detectLinuxCPUUsage()
+	}
+	return 0
+}
+
+func parseDarwinCPUUsage(output string) float64 {
+	for _, line := range strings.Split(output, "\n") {
+		if !strings.Contains(line, "CPU usage:") {
+			continue
+		}
+		fields := strings.Fields(strings.ReplaceAll(line, ",", ""))
+		for index := 0; index+1 < len(fields); index++ {
+			if fields[index+1] != "idle" {
+				continue
+			}
+			idle, err := strconv.ParseFloat(strings.TrimSuffix(fields[index], "%"), 64)
+			if err == nil {
+				return clampPercent(100 - idle)
+			}
+		}
+	}
+	return 0
+}
+
+func detectLinuxCPUUsage() float64 {
+	firstTotal, firstIdle, ok := readLinuxCPUTimes()
+	if !ok {
+		return 0
+	}
+	time.Sleep(100 * time.Millisecond)
+	secondTotal, secondIdle, ok := readLinuxCPUTimes()
+	if !ok || secondTotal <= firstTotal {
+		return 0
+	}
+	totalDelta := secondTotal - firstTotal
+	idleDelta := secondIdle - firstIdle
+	if idleDelta > totalDelta {
+		idleDelta = totalDelta
+	}
+	return clampPercent(100 * float64(totalDelta-idleDelta) / float64(totalDelta))
+}
+
+func readLinuxCPUTimes() (uint64, uint64, bool) {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return 0, 0, false
+	}
+	line, _, _ := strings.Cut(string(data), "\n")
+	fields := strings.Fields(line)
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return 0, 0, false
+	}
+	values := make([]uint64, 0, len(fields)-1)
+	for _, field := range fields[1:] {
+		value, parseErr := strconv.ParseUint(field, 10, 64)
+		if parseErr != nil {
+			return 0, 0, false
+		}
+		values = append(values, value)
+	}
+	total := uint64(0)
+	for _, value := range values {
+		total += value
+	}
+	idle := values[3]
+	if len(values) > 4 {
+		idle += values[4]
+	}
+	return total, idle, true
+}
+
+func clampPercent(value float64) float64 {
+	if value < 0 {
+		return 0
+	}
+	if value > 100 {
+		return 100
+	}
+	return value
 }
 
 func recommendedLimit(resources ResourceSnapshot) int {

@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "福宝桌面客户端默认权限",
-  "windows": ["main", "monitor-log"],
+  "windows": ["main", "monitor-log", "page-*"],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",

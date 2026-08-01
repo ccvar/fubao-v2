@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	storeVersion         = 2
+	storeVersion         = 5
 	unknownProbeInterval = 10 * time.Second
 	offlineProbeInterval = 60 * time.Second
 	livePacketInterval   = 15 * time.Second
@@ -93,40 +93,98 @@ type ParticipationRecord struct {
 	EventID       string `json:"event_id"`
 	AccountID     string `json:"account_id"`
 	AccountName   string `json:"account_name"`
+	TaskID        string `json:"task_id,omitempty"`
 	RoomID        string `json:"room_id,omitempty"`
 	WebRID        string `json:"web_rid,omitempty"`
+	ActualRoomID  string `json:"actual_room_id,omitempty"`
 	RoomName      string `json:"room_name,omitempty"`
 	StreamerName  string `json:"streamer_name,omitempty"`
 	PacketID      string `json:"packet_id"`
 	Title         string `json:"title,omitempty"`
 	Prize         string `json:"prize,omitempty"`
+	Award         string `json:"award,omitempty"`
+	DrawAt        string `json:"draw_at,omitempty"`
+	ExpiresAt     string `json:"expires_at,omitempty"`
 	Endpoint      string `json:"endpoint,omitempty"`
 	Status        string `json:"status"`
 	Message       string `json:"message,omitempty"`
 	AttemptCount  int    `json:"attempt_count"`
 	Joined        bool   `json:"joined"`
+	Won           bool   `json:"won,omitempty"`
+	JoinedAt      string `json:"joined_at,omitempty"`
 	CooldownUntil string `json:"cooldown_until,omitempty"`
 	CreatedAt     string `json:"created_at"`
 	UpdatedAt     string `json:"updated_at"`
 }
 
+// ParticipationState explains why a browser account can or cannot accept new
+// join tasks. It contains only safe counters and timing metadata.
+type ParticipationState struct {
+	AccountID     string `json:"account_id"`
+	TaskID        string `json:"task_id,omitempty"`
+	Active        bool   `json:"active"`
+	JoinCount     int    `json:"join_count"`
+	WinCount      int    `json:"win_count"`
+	Stopped       bool   `json:"stopped"`
+	StopReason    string `json:"stop_reason,omitempty"`
+	WaitingDraw   bool   `json:"waiting_draw"`
+	WaitingReason string `json:"waiting_reason,omitempty"`
+	CooldownUntil string `json:"cooldown_until,omitempty"`
+}
+
+// ParticipationTask is one explicit browser-card start. Stop limits are
+// scoped to this task; historical participation records remain statistics and
+// never prevent a later start from creating a fresh task.
+type ParticipationTask struct {
+	ID        string `json:"id"`
+	AccountID string `json:"account_id"`
+	Active    bool   `json:"active"`
+	StartedAt string `json:"started_at"`
+	EndedAt   string `json:"ended_at,omitempty"`
+	EndReason string `json:"end_reason,omitempty"`
+}
+
+// ParticipationSettings are safe global limits applied independently to each
+// participation account. Zero keeps the corresponding limit disabled.
+type ParticipationSettings struct {
+	StopAfterJoins  int `json:"stop_after_joins"`
+	CooldownSeconds int `json:"cooldown_seconds"`
+	StopAfterWins   int `json:"stop_after_wins"`
+}
+
+// Activity is safe sidebar history. It never contains credentials, request
+// URLs, signatures, headers, or raw interface responses.
+type Activity struct {
+	ID        string `json:"id"`
+	Kind      string `json:"kind"`
+	AccountID string `json:"account_id,omitempty"`
+	Label     string `json:"label"`
+	CreatedAt string `json:"created_at"`
+}
+
 type file struct {
-	Version              int                    `json:"version"`
-	Monitors             []*Monitor             `json:"monitors"`
-	Events               []*Event               `json:"events"`
-	ParticipationRecords []*ParticipationRecord `json:"participation_records,omitempty"`
+	Version               int                    `json:"version"`
+	Monitors              []*Monitor             `json:"monitors"`
+	Events                []*Event               `json:"events"`
+	ParticipationRecords  []*ParticipationRecord `json:"participation_records,omitempty"`
+	ParticipationSettings ParticipationSettings  `json:"participation_settings"`
+	ParticipationTasks    []*ParticipationTask   `json:"participation_tasks,omitempty"`
+	Activities            []*Activity            `json:"activities,omitempty"`
 }
 
 type Store struct {
-	mu              sync.Mutex
-	path            string
-	monitors        map[string]*Monitor
-	events          map[string]*Event
-	participations  map[string]*ParticipationRecord
-	runtime         map[string]context.CancelFunc
-	pool            *accountPool
-	requestRecorder func(accountID string, requestErr error)
-	eventHandler    func(Event)
+	mu                 sync.Mutex
+	path               string
+	monitors           map[string]*Monitor
+	events             map[string]*Event
+	participations     map[string]*ParticipationRecord
+	participationTasks map[string]*ParticipationTask
+	settings           ParticipationSettings
+	activities         map[string]*Activity
+	runtime            map[string]context.CancelFunc
+	pool               *accountPool
+	requestRecorder    func(accountID string, requestErr error)
+	eventHandler       func(Event)
 }
 
 type monitorJob struct {
@@ -146,11 +204,13 @@ func NewStore(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("创建红包监测数据目录失败: %w", err)
 	}
 	s := &Store{
-		path:           filepath.Join(dataDir, "red_packet_monitors.json"),
-		monitors:       map[string]*Monitor{},
-		events:         map[string]*Event{},
-		participations: map[string]*ParticipationRecord{},
-		runtime:        map[string]context.CancelFunc{},
+		path:               filepath.Join(dataDir, "red_packet_monitors.json"),
+		monitors:           map[string]*Monitor{},
+		events:             map[string]*Event{},
+		participations:     map[string]*ParticipationRecord{},
+		participationTasks: map[string]*ParticipationTask{},
+		activities:         map[string]*Activity{},
+		runtime:            map[string]context.CancelFunc{},
 	}
 	if err := s.load(); err != nil {
 		return nil, err
@@ -209,6 +269,17 @@ func (s *Store) load() error {
 			s.participations[record.ID] = record
 		}
 	}
+	for _, task := range payload.ParticipationTasks {
+		if task != nil && task.ID != "" && task.AccountID != "" {
+			s.participationTasks[task.AccountID] = task
+		}
+	}
+	s.settings = normalizeParticipationSettings(payload.ParticipationSettings)
+	for _, activity := range payload.Activities {
+		if activity != nil && activity.ID != "" && activity.Label != "" {
+			s.activities[activity.ID] = activity
+		}
+	}
 	return nil
 }
 
@@ -228,11 +299,26 @@ func (s *Store) saveLocked() error {
 		copy := *item
 		participations = append(participations, &copy)
 	}
+	participationTasks := make([]*ParticipationTask, 0, len(s.participationTasks))
+	for _, item := range s.participationTasks {
+		copy := *item
+		participationTasks = append(participationTasks, &copy)
+	}
+	activities := make([]*Activity, 0, len(s.activities))
+	for _, item := range s.activities {
+		copy := *item
+		activities = append(activities, &copy)
+	}
 	sort.Slice(monitors, func(i, j int) bool { return monitors[i].Name < monitors[j].Name })
 	sort.Slice(events, func(i, j int) bool { return events[i].DetectedAt > events[j].DetectedAt })
 	sort.Slice(participations, func(i, j int) bool { return participations[i].UpdatedAt > participations[j].UpdatedAt })
+	sort.Slice(activities, func(i, j int) bool { return activities[i].CreatedAt > activities[j].CreatedAt })
+	if len(activities) > 50 {
+		activities = activities[:50]
+	}
 	payload, err := json.MarshalIndent(file{
 		Version: storeVersion, Monitors: monitors, Events: events, ParticipationRecords: participations,
+		ParticipationSettings: s.settings, ParticipationTasks: participationTasks, Activities: activities,
 	}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("序列化红包监测数据失败: %w", err)
@@ -262,6 +348,10 @@ func (s *Store) ReserveParticipation(event Event, accountID, accountName string)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	task := s.participationTasks[accountID]
+	if task == nil || !task.Active {
+		return false, errors.New("红包参与任务尚未启动")
+	}
 	id := participationRecordID(accountID, event.ID)
 	if s.participations[id] != nil {
 		return false, nil
@@ -269,10 +359,11 @@ func (s *Store) ReserveParticipation(event Event, accountID, accountName string)
 	now := time.Now().Format(time.RFC3339Nano)
 	s.participations[id] = &ParticipationRecord{
 		ID: id, EventID: event.ID,
-		AccountID: accountID, AccountName: strings.TrimSpace(accountName),
-		RoomID: event.RoomID, WebRID: event.WebRID,
+		AccountID: accountID, AccountName: strings.TrimSpace(accountName), TaskID: task.ID,
+		RoomID: event.RoomID, WebRID: event.WebRID, ActualRoomID: event.ActualRoomID,
 		RoomName: event.RoomName, StreamerName: event.StreamerName,
 		PacketID: event.JoinBoxID, Title: event.Title, Prize: event.Prize,
+		DrawAt: event.DrawAt, ExpiresAt: event.ExpiresAt,
 		Status: "pending", Message: "等待发送红包参与请求",
 		CreatedAt: now, UpdatedAt: now,
 	}
@@ -284,7 +375,7 @@ func (s *Store) ReserveParticipation(event Event, accountID, accountName string)
 }
 
 // CompleteParticipation updates a reserved record with safe result metadata.
-func (s *Store) CompleteParticipation(eventID, accountID, endpoint, status, message string, attempts int, joined bool, cooldown time.Duration) error {
+func (s *Store) CompleteParticipation(eventID, accountID, endpoint, status, message string, attempts int, joined, won bool, cooldown time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	record := s.participations[participationRecordID(accountID, eventID)]
@@ -297,12 +388,291 @@ func (s *Store) CompleteParticipation(eventID, accountID, endpoint, status, mess
 	record.Message = strings.TrimSpace(message)
 	record.AttemptCount = attempts
 	record.Joined = joined
+	record.Won = won
+	if joined && record.JoinedAt == "" {
+		record.JoinedAt = now.Format(time.RFC3339Nano)
+	}
 	record.CooldownUntil = ""
 	if cooldown > 0 {
 		record.CooldownUntil = now.Add(cooldown).Format(time.RFC3339Nano)
 	}
 	record.UpdatedAt = now.Format(time.RFC3339Nano)
 	return s.saveLocked()
+}
+
+func normalizeParticipationSettings(settings ParticipationSettings) ParticipationSettings {
+	if settings.StopAfterJoins < 0 {
+		settings.StopAfterJoins = 0
+	}
+	if settings.StopAfterJoins > 100000 {
+		settings.StopAfterJoins = 100000
+	}
+	if settings.CooldownSeconds < 0 {
+		settings.CooldownSeconds = 0
+	}
+	if settings.CooldownSeconds > 86400 {
+		settings.CooldownSeconds = 86400
+	}
+	if settings.StopAfterWins < 0 {
+		settings.StopAfterWins = 0
+	}
+	if settings.StopAfterWins > 100000 {
+		settings.StopAfterWins = 100000
+	}
+	return settings
+}
+
+// GetParticipationSettings returns a safe copy for frontend display.
+func (s *Store) GetParticipationSettings() ParticipationSettings {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.settings
+}
+
+// SetParticipationSettings persists global per-account participation limits.
+func (s *Store) SetParticipationSettings(settings ParticipationSettings) (ParticipationSettings, error) {
+	settings = normalizeParticipationSettings(settings)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.settings
+	s.settings = settings
+	if err := s.saveLocked(); err != nil {
+		s.settings = previous
+		return ParticipationSettings{}, err
+	}
+	return settings, nil
+}
+
+// ParticipationPolicy is re-checked immediately before each native request.
+// Counts are local durable records, so changing a limit takes effect without
+// leaking or re-reading browser credentials.
+func (s *Store) ParticipationPolicy(accountID string, now time.Time) (bool, time.Duration) {
+	state, cooldown := s.participationState(accountID, now)
+	return !state.Stopped && !state.WaitingDraw && state.CooldownUntil == "", cooldown
+}
+
+// GetParticipationState returns the safe limit/cooldown state used by browser
+// card controls. A stop limit is distinct from a temporary cooldown.
+func (s *Store) GetParticipationState(accountID string, now time.Time) ParticipationState {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	state, _ := s.participationStateLocked(accountID, now)
+	return state
+}
+
+func (s *Store) participationState(accountID string, now time.Time) (ParticipationState, time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.participationStateLocked(accountID, now)
+}
+
+func (s *Store) participationStateLocked(accountID string, now time.Time) (ParticipationState, time.Duration) {
+	task := s.participationTasks[accountID]
+	if task == nil || !task.Active {
+		return ParticipationState{AccountID: accountID}, 0
+	}
+	joins, wins, waitingDraws := 0, 0, 0
+	var lastJoined time.Time
+	for _, record := range s.participations {
+		if record.AccountID != accountID || record.TaskID != task.ID {
+			continue
+		}
+		if record.Joined {
+			joins++
+			joinedAt := firstNonEmpty(record.JoinedAt, record.UpdatedAt)
+			if parsed, err := time.Parse(time.RFC3339Nano, joinedAt); err == nil && parsed.After(lastJoined) {
+				lastJoined = parsed
+			}
+		}
+		if record.Won {
+			wins++
+		}
+		if record.Joined && !record.Won && record.Status != "won" && record.Status != "not_won" {
+			waitingDraws++
+		}
+	}
+	state := ParticipationState{AccountID: accountID, TaskID: task.ID, Active: true, JoinCount: joins, WinCount: wins}
+	if s.settings.StopAfterJoins > 0 && joins >= s.settings.StopAfterJoins {
+		state.Stopped = true
+		state.StopReason = fmt.Sprintf("已达到参与停止上限（%d 次）", s.settings.StopAfterJoins)
+		return state, 0
+	}
+	if s.settings.StopAfterWins > 0 && wins >= s.settings.StopAfterWins {
+		state.Stopped = true
+		state.StopReason = fmt.Sprintf("已达到中奖停止上限（%d 次）", s.settings.StopAfterWins)
+		return state, 0
+	}
+	if waitingDraws > 0 {
+		state.WaitingDraw = true
+		state.WaitingReason = "上一轮红包尚未开奖"
+		return state, 0
+	}
+	cooldown := time.Duration(s.settings.CooldownSeconds) * time.Second
+	if cooldown > 0 && !lastJoined.IsZero() {
+		remaining := lastJoined.Add(cooldown).Sub(now)
+		if remaining > 0 {
+			state.CooldownUntil = lastJoined.Add(cooldown).Format(time.RFC3339Nano)
+			return state, remaining
+		}
+	}
+	return state, cooldown
+}
+
+// PendingDraws returns accepted records whose personal draw result is still
+// unresolved. The returned Event contains no credentials or signed data.
+func (s *Store) PendingDraws(accountID string) []Event {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task := s.participationTasks[accountID]
+	if task == nil || !task.Active {
+		return nil
+	}
+	items := make([]Event, 0)
+	for _, record := range s.participations {
+		if record.AccountID != accountID || record.TaskID != task.ID || !record.Joined || record.Won || record.Status == "won" || record.Status == "not_won" {
+			continue
+		}
+		item := Event{
+			ID: record.EventID, RoomID: record.RoomID, WebRID: record.WebRID,
+			ActualRoomID: record.ActualRoomID, JoinBoxID: record.PacketID,
+			RoomName: record.RoomName, StreamerName: record.StreamerName,
+			Title: record.Title, Prize: record.Prize, DrawAt: record.DrawAt, ExpiresAt: record.ExpiresAt,
+		}
+		if event := s.events[record.EventID]; event != nil {
+			item.MonitorID = event.MonitorID
+			item.WebRID = firstNonEmpty(item.WebRID, event.WebRID)
+			item.ActualRoomID = firstNonEmpty(item.ActualRoomID, event.ActualRoomID)
+			item.DrawAt = firstNonEmpty(item.DrawAt, event.DrawAt)
+			item.ExpiresAt = firstNonEmpty(item.ExpiresAt, event.ExpiresAt)
+			item.AnchorID = event.AnchorID
+		}
+		if monitor := s.monitors[item.MonitorID]; monitor != nil {
+			item.WebRID = firstNonEmpty(item.WebRID, monitor.WebRID)
+			item.ActualRoomID = firstNonEmpty(item.ActualRoomID, monitor.ActualRoomID)
+		}
+		items = append(items, item)
+	}
+	return items
+}
+
+// ResolveParticipationDraw persists one definitive personal result. It returns
+// true only when the record newly transitions into a confirmed win.
+func (s *Store) ResolveParticipationDraw(eventID, accountID, status, message, award string, attempts int) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := s.participations[participationRecordID(accountID, eventID)]
+	if record == nil {
+		return false, errors.New("红包参与记录不存在")
+	}
+	if record.Status == "won" || record.Status == "not_won" {
+		return false, nil
+	}
+	newWin := status == "won" && !record.Won
+	record.Status = status
+	record.Message = strings.TrimSpace(message)
+	record.Award = strings.TrimSpace(award)
+	record.Won = status == "won"
+	record.Endpoint = "receive"
+	record.AttemptCount += attempts
+	record.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+	return newWin, s.saveLocked()
+}
+
+// RecordParticipationStarted appends one real explicit start action.
+func (s *Store) RecordParticipationStarted(accountID, accountName string) error {
+	accountName = strings.TrimSpace(accountName)
+	if accountName == "" {
+		accountName = "参与账号"
+	}
+	now := time.Now()
+	sum := sha256.Sum256([]byte(accountID + "\x00" + now.Format(time.RFC3339Nano)))
+	activity := &Activity{
+		ID: hex.EncodeToString(sum[:12]), Kind: "participation_started", AccountID: strings.TrimSpace(accountID),
+		Label: fmt.Sprintf("参与账号“%s”启动了红包参与", accountName), CreatedAt: now.Format(time.RFC3339Nano),
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.participationTasks[accountID] = &ParticipationTask{
+		ID: activity.ID, AccountID: strings.TrimSpace(accountID), Active: true, StartedAt: now.Format(time.RFC3339Nano),
+	}
+	s.activities[activity.ID] = activity
+	return s.saveLocked()
+}
+
+// FinishParticipationTask closes only the current explicit start. A later
+// click creates a fresh task with zero per-task counters.
+func (s *Store) FinishParticipationTask(accountID, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	task := s.participationTasks[strings.TrimSpace(accountID)]
+	if task == nil || !task.Active {
+		return nil
+	}
+	task.Active = false
+	task.EndedAt = time.Now().Format(time.RFC3339Nano)
+	task.EndReason = strings.TrimSpace(reason)
+	return s.saveLocked()
+}
+
+// Activities returns newest-first safe sidebar history.
+func (s *Store) Activities() []Activity {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := make([]Activity, 0, len(s.activities))
+	for _, activity := range s.activities {
+		items = append(items, *activity)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt > items[j].CreatedAt })
+	if len(items) > 20 {
+		items = items[:20]
+	}
+	return items
+}
+
+// CancelParticipation removes a reservation only when no native request was
+// issued. It is used when the user stops a browser card context while its task
+// is still queued, so the event remains eligible if the context is enabled
+// again before the packet expires.
+func (s *Store) CancelParticipation(eventID, accountID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := participationRecordID(accountID, eventID)
+	record := s.participations[id]
+	if record == nil {
+		return nil
+	}
+	if record.Status != "pending" || record.AttemptCount != 0 {
+		return errors.New("已发送的红包参与记录不能取消")
+	}
+	delete(s.participations, id)
+	if err := s.saveLocked(); err != nil {
+		s.participations[id] = record
+		return err
+	}
+	return nil
+}
+
+// ResetParticipation reopens only a failed native attempt after the user
+// explicitly prepares the matching browser page context. Successful,
+// already-joined, expired and in-flight records remain idempotently sealed.
+func (s *Store) ResetParticipation(eventID, accountID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id := participationRecordID(accountID, eventID)
+	record := s.participations[id]
+	if record == nil {
+		return true, nil
+	}
+	retryable := record.Status == "failed" || record.Status == "context_required" || record.Status == "network_error"
+	if record.Joined || !retryable {
+		return false, nil
+	}
+	delete(s.participations, id)
+	if err := s.saveLocked(); err != nil {
+		s.participations[id] = record
+		return false, err
+	}
+	return true, nil
 }
 
 // ParticipationRecords returns newest-first safe audit rows for frontend IPC.
@@ -944,6 +1314,14 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 			if packet.participants > 0 {
 				existing.ParticipantCount = packet.participants
 			}
+			// activity_id is a grouping key and may be a shared non-numeric
+			// business identifier (for example AC2025...). Participation must
+			// use the row's real numeric box_id_str instead.
+			existing.JoinBoxID = firstNonEmpty(packet.boxID, existing.JoinBoxID)
+			existing.AnchorID = firstNonEmpty(packet.anchorID, existing.AnchorID)
+			existing.BoxType = firstNonEmpty(packet.boxType, existing.BoxType)
+			existing.SendTime = firstNonEmpty(packet.sendTime, existing.SendTime)
+			existing.DelayTime = firstNonEmpty(packet.delayTime, existing.DelayTime)
 			continue
 		}
 		event := &Event{
@@ -956,8 +1334,13 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 			DrawAt: packet.drawAt, ExpiresAt: packet.expiresAt,
 			ParticipantCount: packet.participants,
 			ActualRoomID:     firstNonEmpty(snapshot.ActualRoomID, monitor.ActualRoomID),
-			JoinBoxID:        packet.id,
-			AnchorID:         packet.anchorID, BoxType: packet.boxType,
+			JoinBoxID: firstNonEmpty(packet.boxID, func() string {
+				if validLuckyboxID(packet.id) {
+					return packet.id
+				}
+				return ""
+			}()),
+			AnchorID: packet.anchorID, BoxType: packet.boxType,
 			SendTime: packet.sendTime, DelayTime: packet.delayTime,
 		}
 		s.events[eventID] = event
@@ -988,9 +1371,9 @@ func monitorStaggerDelay(id string) time.Duration {
 }
 
 type packetMeta struct {
-	id, title, prize, drawAt, expiresAt    string
-	anchorID, boxType, sendTime, delayTime string
-	participants                           int
+	id, boxID, title, prize, drawAt, expiresAt string
+	anchorID, boxType, sendTime, delayTime     string
+	participants                               int
 }
 
 var redMarkers = []string{"红包", "red_packet", "redpacket", "luckybox", "lucky_box", "抢红包", "领红包"}
@@ -1021,6 +1404,10 @@ func extractRedPacket(data map[string]any) (packetMeta, bool) {
 	}
 	meta := packetMeta{}
 	meta.id = firstPairValue(pairs, "red_packet_id", "redPacketId", "redpacket_id", "activity_id", "activityId", "lottery_id_str", "lotteryIdStr", "box_id_str", "boxIdStr", "box_id", "boxId")
+	meta.boxID = firstPairValue(pairs, "box_id_str", "boxIdStr", "box_id", "boxId", "luckybox_id", "luckyboxId", "red_packet_id", "redPacketId")
+	if !validLuckyboxID(meta.boxID) {
+		meta.boxID = ""
+	}
 	meta.anchorID = firstPairValue(pairs, "anchor_id", "anchorId")
 	meta.boxType = firstPairValue(pairs, "box_type", "boxType")
 	meta.sendTime = firstPairValue(pairs, "send_time", "sendTime", "start_time", "startTime")
@@ -1057,6 +1444,19 @@ func extractRedPacket(data map[string]any) (packetMeta, bool) {
 	}
 	meta.participants = firstPairInt(pairs, "participant_count", "participantCount", "candidate_user_num", "candidateUserNum", "user_count", "userCount")
 	return meta, true
+}
+
+func validLuckyboxID(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) < 3 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func formatPacketPrize(pairs []pair) string {

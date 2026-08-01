@@ -20,6 +20,10 @@ Build app UI in `src/`. Keep `.openai/hosting.json`, `worker/index.js`, `scripts
 
 The Pilot screenshot is a layout reference only. Preserve the two-column desktop structure and visual rhythm, but never reuse Pilot/gcms navigation, onboarding copy, site-management concepts, or business behavior. This product is 福宝控制台, centered on 红包监测、参与任务、浏览器实例、账号与代理, with a Go business engine.
 
+The primary sidebar exposes only “浏览器实例” and “账号与直播间”. “监测总览” and “红包任务” are not standalone pages; their live data remains available through the sidebar data overview and the 红包/直播间 tabs on “账号与直播间”. Show the current total browser-instance count as the compact badge on “浏览器实例”.
+
+Closing the main window hides it to the native system tray instead of terminating the client, so the Go engine and active monitoring/participation work continue running. A left click on the tray icon or the tray “打开福宝控制台” action restores and focuses the main window; macOS Dock reopen does the same. Only the explicit tray “彻底退出” action terminates the Go engine and exits the application.
+
 Keep the desktop development URL pinned to this project's dedicated port and use Vite `strictPort` so Tauri cannot silently attach to another local project's dev server.
 
 On the 账号与直播间 page, keep the 直播间/参与账号/监测账号 tab strip outside the table card so the table is the only framed surface. The account status filter belongs in that external tab strip; do not repeat the old explanatory account-copy in the content area.
@@ -32,6 +36,8 @@ Single-press dragging and double-press maximize/restore must both work from non-
 
 Keep persistent desktop chrome very compact: the main top bar should stay around 60px high, the primary sidebar navigation should use dense 34px rows with no unnecessary inter-row gaps, and the bottom workspace/status footer should stay around 48px high. Keep page titles near 16px, title-bar and footer icon hover boxes near 24px with minimal internal padding, the sidebar toggle hover box near 22px, and the primary title-bar action near 24px high. In both expanded and collapsed states, the native macOS traffic lights, sidebar toggle, page-title row, and right-side toolbar must share the same horizontal center axis; the subtitle sits on the second line.
 
+Primary sidebar pages support desktop-style detached windows: normal left-click switches the current window, while the row context menu, Command/Ctrl-click, and middle-click open that page in its own native window. Reopening the same page focuses its existing detached window. Detached windows show only the selected business page and share the same Go engine/account store; native child WebViews for browser cards and account login/rebind flows must attach to the invoking page window rather than being hard-coded to `main`.
+
 Use one compact modal-footer button standard across every dialog: right-align actions, use a 30px control height, 8px radius, 6px gap, and content-sized widths with a small minimum; the destructive confirmation dialog follows the same dimensions.
 
 Render the top-bar “新建监测” action as plain icon-and-text chrome with no filled button background, border, shadow, rounded container, or press translation. Keep it 24px high and separate the top-bar action groups by about 9px while preserving the compact 24px icon hover boxes.
@@ -39,6 +45,8 @@ Render the top-bar “新建监测” action as plain icon-and-text chrome with 
 In the expanded desktop layout, use the same 34px left and right inset for the main top bar and scrollable content so the title group aligns with the search/cards and the right action group aligns with the filter/cards. At narrow widths, both regions use a 16px horizontal inset. The collapsed title bar may keep its larger left inset to clear native macOS controls.
 
 Keep the compact sidebar footer permanently visible at the bottom of the window. The recent-activity list owns the flexible/scrollable space above it; it must never push the footer below the viewport. Do not hide the footer settings button at narrow breakpoints.
+
+The sidebar names its live counters section “数据概览”. A separate “最近活动” section sits below it, reuses the same compact icon-and-copy row language, owns the remaining scrollable space above the fixed footer, and may use clearly local sample entries until a real activity event source is connected.
 
 The DY-KIRO-derived application icon uses a flat pure-white interior tile while preserving transparent outer corners and the original colored artwork. Background replacement must not redraw, resize, move, or simplify the heart line, circular arcs, dots, envelope, coin, highlights, or shadows.
 
@@ -55,6 +63,8 @@ Each browser instance belongs to exactly one participation account. Creating an 
 One participation account owns at most one browser instance. Repeated create/open operations for the same account must reuse that stable instance and its account-keyed browser profile. The account rebind WebView and browser instance share the same native account data store so login state is continuous; completing a CK rebind must immediately refresh any mounted instance for that account. Different accounts must still use separate profiles and data stores.
 
 Successful login inside an independently opened browser instance must return changed Douyin cookies through an authenticated loopback-only channel, update and revalidate the canonical Go account, and refresh its mounted embedded preview. Raw CK must never enter frontend JavaScript.
+
+The compact sidebar footer gear opens 红包参与设置 rather than license management. Its global values are persisted by the Go red-packet store and enforced independently for each participation account: 参与停止 blocks future assignments after the configured joined count, 参与冷却 waits the configured seconds after an accepted join, and 中奖停止 blocks future assignments after the configured confirmed-win count; zero means unlimited. Each explicit browser-account start of red-packet participation appends a safe persistent “参与账号…启动了红包参与” entry to the sidebar recent-activity feed. License management remains available from the edition badge.
 
 The data-management screen is named “账号与直播间” and orders its tabs as “红包 / 直播间 / 参与账号 / 监测账号”. The red-packet monitor reuses 福宝’s signed `luckybox/box/list` request path (with `lottery_info` as a safe fallback) but must surface only explicit 红包 payloads; 福袋/lottery payloads are filtered out. Legacy room migration copies `rooms_config.json` into the Go engine’s permission-restricted local store and must never modify the old 福宝 data. The top-bar action is named “导入数据”, with “导入直播间” kept as a distinct first menu action.
 
@@ -82,9 +92,9 @@ On the browser-instance screen, keep only a compact 1–10 column slider in a fl
 
 Embedded browser previews must mount as soon as a useful portion of their preview surface intersects the scrollable content viewport; never require the whole card or preview to be visible first. Clip native child-WebView bounds to the content viewport while scrolling, and resynchronize them through intersection/resize/scroll observation so a first-row card cannot remain on its HTML placeholder after entering view.
 
-Returning to the browser-instance screen must restore each stable instance with the same account-keyed native profile and its last safe Douyin page. Continue destroying native child WebViews while the screen is hidden to release runtime leases, but retain a lightweight native restore location and show a compact restoring state until the remounted page is ready; never make a returning instance look like a newly created login environment.
+Returning to the browser-instance screen must show each already-rendered instance exactly as it was left, including its in-memory page, scroll, playback, dialog, and login state. Switching to another application page hides the native child WebViews without destroying them or releasing their runtime leases; returning repositions and reveals those same WebViews immediately and must not show a restoring state. A newly mounted instance still uses the same account-keyed native profile and last safe Douyin page.
 
-Browser instance records are not a fixed concurrency allowance. The Go engine computes a recommended runtime limit from the current machine's CPU and available memory, admits visible or explicitly opened instances into shared resource leases, and queues the rest in stable order. Existing work is never killed merely because pressure rises, but critical memory pressure closes new admission until recovery. Leaving the browser view or scrolling a card out of the usable viewport destroys its embedded child WebView and releases its lease; waiting cards retry automatically and show their queue state. Independently opened browser windows consume the same shared runtime capacity.
+Browser instance records are not a fixed concurrency allowance. The Go engine computes a recommended runtime limit from the current machine's CPU and available memory, admits visible or explicitly opened instances into shared resource leases, and queues the rest in stable order. Existing work is never killed merely because pressure rises, but critical memory pressure closes new admission until recovery. Switching application pages only hides mounted child WebViews and retains their leases so their exact in-memory state survives; scrolling a card out of the usable viewport still destroys its embedded child WebView and releases its lease. Waiting cards retry automatically and show their queue state. Independently opened browser windows consume the same shared runtime capacity.
 
 Room records without a valid 6–20 digit `web_rid` are invalid and must be removed rather than displayed as record-only rooms. Red-packet bulk controls reflect actual runtime state: hide “全部停止” when none are running, hide “全部启动” when all eligible rooms are running, visually distinguish start from stop, and provide a compact runtime-log entry point.
 
@@ -98,6 +108,10 @@ Monitoring-account request counters are local to this desktop client: never impo
 
 Participation-role labels use a compact teal palette, never the red/pink error palette used by CK expiry. Participation and monitoring role labels must remain equal, fixed-width compact pills and must not stretch when both roles are present.
 
+Every explicit browser-card red-packet start creates one independent participation task. Participation-count and win-count stop limits apply only inside that task, never to the account's lifetime statistics. When the current task reaches either limit, its control returns to low-contrast gray, new join assignments stop, and the native context remains only long enough to finish result queries for already accepted packets; once those results are resolved, end the task automatically. A later click always creates a fresh task with zero task counters. After an accepted packet reaches its draw time, query Douyin's personal `luckybox/receive` result in the native account page context and persist a definitive “未中奖” or “已中奖” result with the real prize. Missing, mismatched, or temporarily unavailable result data stays pending and must never be fabricated.
+
+One participation account may have only one unresolved accepted red packet at a time. Until that packet has a definitive personal draw result, do not send the account into a later red-packet round. Once the result is resolved, re-check the configured cooldown and stop limits, then retry only newer red packets that are still unexpired; result lookup for the accepted packet must remain allowed while join assignment is blocked.
+
 Browser-instance refinements: the identity-row instance tile is 20px. Account names and Douyin IDs expose the shared dark in-app Tooltip only when the rendered text is actually truncated. Cards expose compact icon-only “打开实例” and “关闭实例” actions with shared in-app tooltips; closing always requires the compact confirmation dialog, then destroys the mounted child WebView and removes the card while preserving the account-keyed profile for later reuse. The CK-expired badge keeps its coral surface unchanged on hover and does not add a gray hover fill. The “新建实例” dialog supports multi-select batch creation for eligible participation accounts, while accounts that already own an instance remain excluded.
 
 Each browser-instance identity row may show the number of accounts currently live among that instance account's Douyin follows. Read it through the Go engine with the instance's canonical participation credential, never through frontend Cookie access. Clicking the count opens safe room metadata only: avatar, account name, live title, room number, room identifier, viewer count, and an external room action. Legacy 福宝 discovery/seed-room code and `similar_room_by_anchor` are references for signing and resilient parsing only; similar-room expansion must never be presented as the current account's followed-live list.
@@ -110,7 +124,7 @@ Red-packet prize parsing follows 福宝's luckybox grouping rule: group every bo
 
 The 红包 tab defaults to current, unexpired red packets only. Its tab badge and the main title subtitle count only unexpired red packets. Keep expired records behind a compact right-aligned “历史红包” entry; history mode shows non-current records and provides an equally compact return to current red packets.
 
-Differentiate red-packet kinds in the event list: use a compact diamond icon for “钻石红包” and retain the gift icon for gift/other red packets. In the “账号与直播间” title subtitle, report the live runtime workload as `x 个房间正在监测` rather than repeating the total canonical room count; the 直播间 tab badge remains the total room count.
+Differentiate red-packet kinds in the event list: use a compact faceted gemstone icon for “钻石红包” (never a plain filled rhombus) and retain the gift icon for gift/other red packets. In the “账号与直播间” title subtitle, report the live runtime workload as `x 个房间正在监测` rather than repeating the total canonical room count; the 直播间 tab badge remains the total room count.
 
 Expired red-packet rows must say “已过期” instead of freezing the countdown at `00:00`; keep the absolute expiry timestamp beside that label.
 
@@ -126,6 +140,16 @@ Every successful followed-live account snapshot is authoritative only for that a
 
 Windows in-app upgrades follow Pilot/Tauri Updater behavior: launch the NSIS package in passive update mode with `/P /R /UPDATE`, never as a normal installer that shows the “Already Installed” uninstall-choice wizard. Keep the PowerShell update helper hidden, wait for the current client to exit, preserve local application data, and let the installer relaunch the upgraded client.
 
-Keep the native Windows title bar instead of replacing the system minimize/maximize/close controls merely to host the sidebar toggle. On Windows, anchor the expanded sidebar toggle to the right edge of the sidebar title strip so it follows sidebar resizing; when collapsed, anchor it near the left edge of the main top bar rather than leaving it centered.
+Keep the native Windows title bar instead of replacing the system minimize/maximize/close controls merely to host the sidebar toggle. On Windows, remove the macOS-only web title strip entirely so primary navigation starts directly below the native title bar. Keep the sidebar toggle inside the main top bar immediately before the page title at the same position in both expanded and collapsed states, with its shared dark Tooltip opening below. Preserve the existing macOS title strip, traffic-light alignment, and right-opening toggle Tooltip.
 
 参与账号拥有持久化的红包接口参与开关，默认关闭；灰色表示关闭、红色表示开启。只有开关开启、CK 有效且不在冷却期的参与账号才能被 Go 引擎分配红包参与任务。参与请求按账号和红包事件幂等去重；关闭开关仅阻止未来分配，不中断已发出的请求。原始 CK 和签名请求始终留在 Go/Rust 原生层。
+
+红包接口参与必须使用参与账号专属浏览器实例的真实直播页面上下文。实例卡片提供紧凑的红包图标；点击后先将该账号的原生子 WebView 切换到已确认开播的直播间并验证登录，再允许 Go 调度红包参与。`join/rush` 必须由直播页面中的 `bdms.js`/`window.fetch` 生成动态签名，禁止回退到脱离页面上下文的 Go HTTP 直连。页面上下文未准备好时不要创建误导性的参与失败记录；原始 Cookie、签名 URL 和原始接口响应不得进入前端 JavaScript。
+
+浏览器实例卡片的红包图标必须是真实的双向开关：启用后再次点击应通过原生通道注销该账号的页面参与上下文并取消所有尚未发出的任务，不能只改变前端样式；已经发出的单次请求允许结束。自动页面参与对每个红包事件只允许发送一次 `join`，禁止在未捕获真实页面交互请求模板时猜测式追加 `rush` 回退，因为同一次事件的 `join → rush` 双请求会触发 `rush_spam` 风控。
+
+红包监测 payload 中的 `activity_id` 只是活动分组键，可能是跨直播间重复的 `AC...` 业务标识；参与接口必须优先使用当前原始盒子行里 3 位以上的纯数字 `box_id_str/box_id`，缺少真实数字 box ID 时不得发送参与请求。单个参与账号的页面参与任务必须严格串行，并在每次发送前重新检查冷却状态，禁止同账号并发 `join/rush` 造成假性 `rush_spam` 风控。
+
+在“账号与直播间”的“监测账号”后保留独立“参与记录”页签。每个账号与红包事件的参与尝试必须在 Go redpacket store 中先持久化占位再发送请求，以提供跨客户端重启的幂等去重；记录只向前端暴露账号、红包、直播间、接口类型、请求次数、结果、冷却和时间等安全元数据，绝不保存或返回 CK、签名参数、请求头或原始响应体。
+
+浏览器实例页的标题副文案在“本机运行”后紧凑显示实时 CPU 与内存占用百分比；资源数据由 Go 原生层采样并随现有容量轮询刷新，详细内存用量使用共享暗色 Tooltip 展示。

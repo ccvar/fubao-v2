@@ -15,7 +15,7 @@
     CheckCircleIcon as CheckCircle,
     ClockCountdownIcon as ClockCountdown,
     ClipboardTextIcon as ClipboardText,
-    DiamondIcon as Diamond,
+    SketchLogoIcon as DiamondGem,
     DotsThreeIcon as DotsThree,
     DownloadSimpleIcon as DownloadSimple,
     FileArrowUpIcon as FileArrowUp,
@@ -43,7 +43,7 @@
     XIcon as X,
   } from "phosphor-svelte";
 
-  type NavKey = "overview" | "tasks" | "browsers" | "accounts";
+  type NavKey = "browsers" | "accounts";
   type MonitorState = "running" | "paused" | "warning";
   type AccountRole = "monitoring" | "participation";
   type ManagementTab = "redpackets" | "rooms" | "participation-records" | AccountRole;
@@ -152,6 +152,7 @@
     estimated_per_instance_bytes: number;
     resources: {
       cpu_count: number;
+      cpu_usage_percent: number;
       memory_total_bytes: number;
       memory_available_bytes: number;
       pressure: "unknown" | "normal" | "constrained" | "critical";
@@ -164,6 +165,24 @@
     state: "stopped" | "waiting" | "running";
     queue_position?: number;
     capacity: BrowserCapacity;
+  };
+
+  type BrowserParticipationContext = {
+	instance_id: string;
+	account_id: string;
+	prepared: boolean;
+	accepting: boolean;
+	active?: boolean;
+	task_id?: string;
+	stopped: boolean;
+	stop_reason?: string;
+	waiting_draw?: boolean;
+	waiting_reason?: string;
+	pending_draw_count?: number;
+	pending_result_web_rid?: string;
+	cooldown_until?: string;
+	join_count: number;
+	win_count: number;
   };
 
   type FollowingLiveItem = {
@@ -263,25 +282,41 @@
   };
 
   type ParticipationRecord = {
+    id: string;
+    event_id: string;
+    account_id: string;
+    account_name: string;
+    room_id?: string;
+    web_rid?: string;
+    room_name?: string;
+    streamer_name?: string;
+    packet_id: string;
+    title?: string;
+    prize?: string;
+    award?: string;
+    endpoint?: "join" | "rush" | string;
+    status: string;
+    message?: string;
+    attempt_count: number;
+    joined: boolean;
+	won?: boolean;
+    cooldown_until?: string;
+    created_at: string;
+    updated_at: string;
+  };
+
+  type ParticipationSettings = {
+	stop_after_joins: number;
+	cooldown_seconds: number;
+	stop_after_wins: number;
+  };
+
+  type SidebarActivity = {
 	id: string;
-	event_id: string;
-	account_id: string;
-	account_name: string;
-	room_id?: string;
-	web_rid?: string;
-	room_name?: string;
-	streamer_name?: string;
-	packet_id: string;
-	title?: string;
-	prize?: string;
-	endpoint?: "join" | "rush" | string;
-	status: string;
-	message?: string;
-	attempt_count: number;
-	joined: boolean;
-	cooldown_until?: string;
+	kind: "participation_started" | string;
+	account_id?: string;
+	label: string;
 	created_at: string;
-	updated_at: string;
   };
 
   type MonitorRuntimeLog = {
@@ -313,23 +348,39 @@
   };
 
   const navItems = [
-    { key: "overview" as NavKey, label: "监测总览", icon: Monitor },
-    { key: "tasks" as NavKey, label: "红包任务", icon: Gift },
     { key: "browsers" as NavKey, label: "浏览器实例", icon: Browser },
     { key: "accounts" as NavKey, label: "账号与直播间", icon: UserFocus },
   ];
 
+  const sampleRecentActivityItems = [
+    { id: "sample-red-packet", label: "发现 2 个新红包", time: "刚刚", icon: Gift, tone: "live", view: "accounts" as NavKey },
+    { id: "sample-monitor", label: "星选福利直播间恢复监测", time: "3 分钟前", icon: Radio, tone: "live", view: "accounts" as NavKey },
+    { id: "sample-account", label: "参与账号“川、”恢复可用", time: "12 分钟前", icon: UserCircle, tone: "neutral", view: "accounts" as NavKey },
+    { id: "sample-browser", label: "浏览器实例完成登录同步", time: "18 分钟前", icon: Browser, tone: "neutral", view: "browsers" as NavKey },
+  ];
+
   const viewMeta: Record<NavKey, { title: string; subtitle: string }> = {
-    overview: { title: "监测总览", subtitle: "4 个直播间 · 3 个运行中" },
-    tasks: { title: "红包任务", subtitle: "12 个候选 · 2 个等待结果" },
     browsers: { title: "浏览器实例", subtitle: "3 个实例 · 2 个在线" },
     accounts: { title: "账号与直播间", subtitle: "直播间与账号数据" },
   };
 
   const isWindowsPlatform =
-    typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
+    typeof navigator !== "undefined" &&
+    (/Windows/i.test(navigator.userAgent) ||
+      (import.meta.env.DEV &&
+        typeof window !== "undefined" &&
+        new URLSearchParams(window.location.search).get("platform") === "windows"));
 
-  let activeView: NavKey = "overview";
+  const pageWindowParams =
+    typeof window !== "undefined" ? new URLSearchParams(window.location.search) : null;
+  const requestedPageView = pageWindowParams?.get("view") || "";
+  const detachedPageView = navItems.some((item) => item.key === requestedPageView)
+    ? (requestedPageView as NavKey)
+    : null;
+  const isDetachedPageWindow = pageWindowParams?.get("window") === "page" && Boolean(detachedPageView);
+
+  let activeView: NavKey = detachedPageView ?? "browsers";
+  let navContextMenu: { key: NavKey; x: number; y: number } | null = null;
   let clientVersion = __APP_VERSION__;
   let updateStatus: UpdateStatus | null = null;
   let updateChecking = false;
@@ -352,15 +403,21 @@
   let licenseBusy = false;
   let licenseError = "";
   let licenseReplacing = false;
+  let participationSettingsModalOpen = false;
+  let participationSettingsBusy = false;
+  let participationSettingsError = "";
+  let participationSettings: ParticipationSettings = {
+	stop_after_joins: 0,
+	cooldown_seconds: 0,
+	stop_after_wins: 0,
+  };
+  let sidebarActivities: SidebarActivity[] = [];
   $: licenseDaysRemaining = getLicenseDaysRemaining(licenseStatus.expires_at);
   let query = "";
   let searchOpen = false;
   let topbarSearchInput: HTMLInputElement;
-  let modalOpen = false;
   let toast = "";
   let refreshing = false;
-  let newRoom = "";
-  let newName = "";
   let instanceModalOpen = false;
   let browserInstances: BrowserInstance[] = [];
   let browserCapacity: BrowserCapacity | null = null;
@@ -371,6 +428,9 @@
   let browserCreating = false;
   let browserOpeningId = "";
   let browserClosingId = "";
+  let browserRedPacketPreparingIds: string[] = [];
+  let browserRedPacketContextIds: string[] = [];
+  let browserParticipationContexts: Record<string, BrowserParticipationContext> = {};
   let browserPendingClose: BrowserInstance | null = null;
   let browserFollowingLive: Record<string, FollowingLiveResult> = {};
   let browserFollowingLiveLoadingIds: string[] = [];
@@ -413,10 +473,10 @@
   let redPacketEventsLoading = false;
   let redPacketEventError = "";
   let redPacketRenderLimit = 300;
-	let participationRecords: ParticipationRecord[] = [];
-	let participationRecordsLoading = false;
-	let participationRecordError = "";
-	let participationRecordRenderLimit = 300;
+  let participationRecords: ParticipationRecord[] = [];
+  let participationRecordsLoading = false;
+  let participationRecordError = "";
+  let participationRecordRenderLimit = 300;
   let redPacketClock = Date.now();
   let redPacketHistoryVisible = false;
   let roomSortMode: RoomSortMode = "default";
@@ -447,7 +507,7 @@
   let accountRebindSyncFrame = 0;
   let cookieValidatingAccountIds: string[] = [];
   let engineListenerReady = false;
-  let sidebarWidth = 252;
+  let sidebarWidth = 232;
 	let sidebarCollapsed = false;
   let resizingSidebar = false;
   let resizeStartX = 0;
@@ -511,6 +571,16 @@
   });
   $: monitoringAccounts = accounts.filter((account) => account.roles.includes("monitoring"));
   $: participationAccounts = accounts.filter((account) => account.roles.includes("participation"));
+  $: recentActivityItems = sidebarActivities.length > 0
+	? sidebarActivities.slice(0, 4).map((activity) => ({
+		id: activity.id,
+		label: activity.label,
+		time: formatMonitorTime(activity.created_at, redPacketClock),
+		icon: activity.kind === "participation_started" ? Gift : Radio,
+		tone: activity.kind === "participation_started" ? "live" : "neutral",
+		view: activity.kind === "participation_started" ? ("browsers" as NavKey) : ("accounts" as NavKey),
+	}))
+	: sampleRecentActivityItems;
   $: filteredRooms = rooms.filter((room) => {
     const followAccounts = (room.follow_sources ?? []).map((source) => source.account_name).join(" ");
     const haystack = `${room.name ?? ""} ${room.streamer_name ?? ""} ${room.web_rid ?? ""} ${room.actual_room_id ?? ""} ${room.id} ${followAccounts}`.toLowerCase();
@@ -566,14 +636,14 @@
       .some((value) => String(value).toLowerCase().includes(needle));
   });
   $: visibleRedPacketEvents = filteredRedPacketEvents.slice(0, redPacketRenderLimit);
-	$: filteredParticipationRecords = participationRecords.filter((record) => {
-		const needle = query.trim().toLowerCase();
-		if (!needle) return true;
-		return [record.account_name, record.room_name, record.streamer_name, record.web_rid, record.room_id, record.title, record.prize, record.message]
-			.filter(Boolean)
-			.some((value) => String(value).toLowerCase().includes(needle));
-	});
-	$: visibleParticipationRecords = filteredParticipationRecords.slice(0, participationRecordRenderLimit);
+  $: filteredParticipationRecords = participationRecords.filter((record) => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return true;
+    return [record.account_name, record.room_name, record.streamer_name, record.web_rid, record.room_id, record.title, record.prize, record.message]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(needle));
+  });
+  $: visibleParticipationRecords = filteredParticipationRecords.slice(0, participationRecordRenderLimit);
   $: browserSubtitle = browserCapacity
     ? `${browserInstances.length} 个实例 · ${browserCapacity.running} 个运行 · 建议上限 ${browserCapacity.recommended_limit}${browserCapacity.waiting > 0 ? ` · ${browserCapacity.waiting} 个等待` : ""}`
     : `${browserInstances.length} 个实例 · ${browserInstances.filter((item) => item.status === "online").length} 个在线 · ${browserInstances.filter(browserCookieExpired).length} 个失效`;
@@ -581,7 +651,7 @@
     const haystack = `${item.name} ${item.account_name} ${item.browser}`.toLowerCase();
     return haystack.includes(query.trim().toLowerCase());
   });
-  $: browserWebviewLayoutKey = `${activeView}:${browserViewSettled}:${instanceModalOpen}:${licenseModalOpen}:${sidebarCollapsed}:${query}:${visibleBrowserInstances
+  $: browserWebviewLayoutKey = `${activeView}:${browserViewSettled}:${instanceModalOpen}:${licenseModalOpen}:${participationSettingsModalOpen}:${sidebarCollapsed}:${query}:${visibleBrowserInstances
     .map((instance) => instance.id)
     .join(",")}`;
   $: if (browserWebviewLayoutKey) scheduleEmbeddedBrowserSync();
@@ -681,6 +751,72 @@
     scheduleEmbeddedBrowserSync();
   }
 
+  async function loadSidebarActivities() {
+	if (!engineListenerReady) return;
+	try {
+		sidebarActivities = await engineRequest<SidebarActivity[]>("activity.list");
+	} catch {
+		// Sidebar history is supplementary and must never block the main UI.
+	}
+  }
+
+  async function openParticipationSettings() {
+	await hideEmbeddedBrowsers();
+	participationSettingsError = "";
+	participationSettingsModalOpen = true;
+	if (!isTauriDesktop()) return;
+	participationSettingsBusy = true;
+	try {
+		participationSettings = await engineRequest<ParticipationSettings>("red_packet_participation.settings");
+	} catch (error) {
+		participationSettingsError = error instanceof Error ? error.message : String(error);
+	} finally {
+		participationSettingsBusy = false;
+	}
+  }
+
+  function closeParticipationSettings() {
+	if (participationSettingsBusy) return;
+	participationSettingsModalOpen = false;
+	participationSettingsError = "";
+	scheduleEmbeddedBrowserSync();
+  }
+
+  function normalizedParticipationSetting(value: number, maximum: number) {
+	const parsed = Number(value);
+	if (!Number.isFinite(parsed)) return 0;
+	return Math.max(0, Math.min(maximum, Math.trunc(parsed)));
+  }
+
+  async function saveParticipationSettings() {
+	if (participationSettingsBusy) return;
+	participationSettingsBusy = true;
+	participationSettingsError = "";
+	const next = {
+		stop_after_joins: normalizedParticipationSetting(participationSettings.stop_after_joins, 100000),
+		cooldown_seconds: normalizedParticipationSetting(participationSettings.cooldown_seconds, 86400),
+		stop_after_wins: normalizedParticipationSetting(participationSettings.stop_after_wins, 100000),
+	};
+	if (!isTauriDesktop()) {
+		participationSettings = next;
+		participationSettingsBusy = false;
+		toast = "红包参与设置已保存";
+		closeParticipationSettings();
+		return;
+	}
+	try {
+		participationSettings = await engineRequest<ParticipationSettings>("red_packet_participation.set_settings", next);
+		await loadBrowserParticipationContexts();
+		toast = "红包参与设置已保存";
+		participationSettingsBusy = false;
+		closeParticipationSettings();
+	} catch (error) {
+		participationSettingsError = error instanceof Error ? error.message : String(error);
+	} finally {
+		participationSettingsBusy = false;
+	}
+  }
+
   function beginLicenseReplacement() {
     licenseKey = "";
     licenseError = "";
@@ -760,6 +896,22 @@
       value /= 1024;
     }
     return `${value.toFixed(1)} GB`;
+  }
+
+  function browserCPUUsagePercent(capacity: BrowserCapacity) {
+    return Math.round(Math.max(0, Math.min(100, capacity.resources.cpu_usage_percent || 0)));
+  }
+
+  function browserMemoryUsagePercent(capacity: BrowserCapacity) {
+    const { memory_total_bytes: total, memory_available_bytes: available } = capacity.resources;
+    if (!total) return 0;
+    return Math.round(Math.max(0, Math.min(100, ((total - Math.min(total, available)) / total) * 100)));
+  }
+
+  function browserResourceUsageTooltip(capacity: BrowserCapacity) {
+    const { memory_total_bytes: total, memory_available_bytes: available } = capacity.resources;
+    const used = total ? total - Math.min(total, available) : 0;
+    return `CPU ${browserCPUUsagePercent(capacity)}% · 内存已用 ${formatFileSize(used)} / ${formatFileSize(total)}`;
   }
 
   async function checkForAppUpdate(silent = false, openWhenAvailable = false) {
@@ -1214,8 +1366,16 @@
   }
 
   function switchView(key: NavKey) {
-    if (activeView === "browsers" && key !== "browsers") {
-      void releaseEmbeddedBrowsers();
+    const leavingBrowsers = activeView === "browsers" && key !== "browsers";
+    const enteringBrowsers = activeView !== "browsers" && key === "browsers";
+    if (leavingBrowsers || enteringBrowsers) {
+      // A browser-page transition must invalidate pending geometry/show work.
+      // Mounted child WebViews stay alive so returning preserves the exact
+      // in-memory page, scroll, playback, dialog, and login state.
+      browserLayoutRevision += 1;
+    }
+    if (leavingBrowsers) {
+      void queueBrowserNativeLayout(hideEmbeddedBrowsers);
     }
     browserViewSettled = false;
     activeView = key;
@@ -1231,10 +1391,54 @@
       void loadRooms();
       void loadRedPacketMonitors();
       void loadRedPacketEvents();
+      void loadParticipationRecords();
     }
     if (key === "browsers" && engineListenerReady) {
       void loadBrowserInstances();
     }
+  }
+
+  async function openViewInNewWindow(key: NavKey) {
+    navContextMenu = null;
+    if (isTauriDesktop()) {
+      try {
+        await invoke("open_page_window", { view: key });
+      } catch (error) {
+        toast = error instanceof Error ? error.message : String(error);
+      }
+      return;
+    }
+    const url = new URL(window.location.href);
+    url.search = "";
+    url.searchParams.set("window", "page");
+    url.searchParams.set("view", key);
+    window.open(url.toString(), `fubao-${key}`, "noopener");
+  }
+
+  function handleNavClick(event: MouseEvent, key: NavKey) {
+    if (event.metaKey || event.ctrlKey) {
+      event.preventDefault();
+      void openViewInNewWindow(key);
+      return;
+    }
+    switchView(key);
+  }
+
+  function handleNavAuxClick(event: MouseEvent, key: NavKey) {
+    if (event.button !== 1) return;
+    event.preventDefault();
+    void openViewInNewWindow(key);
+  }
+
+  function showNavContextMenu(event: MouseEvent, key: NavKey) {
+    event.preventDefault();
+    const menuWidth = 148;
+    const menuHeight = 38;
+    navContextMenu = {
+      key,
+      x: Math.max(6, Math.min(event.clientX, window.innerWidth - menuWidth - 6)),
+      y: Math.max(6, Math.min(event.clientY, window.innerHeight - menuHeight - 6)),
+    };
   }
 
   function isTauriDesktop() {
@@ -1360,6 +1564,7 @@
       if (isTauriDesktop() && mounted) {
         await invoke("close_browser_webview", { instanceId: instance.id }).catch(() => undefined);
       }
+      browserRedPacketContextIds = browserRedPacketContextIds.filter((id) => id !== instance.id);
       browserWebviewMountedIds = browserWebviewMountedIds.filter((id) => id !== instance.id);
       browserWebviewMountingIds = browserWebviewMountingIds.filter((id) => id !== instance.id);
       browserWebviewLoadingIds = browserWebviewLoadingIds.filter((id) => id !== instance.id);
@@ -1384,6 +1589,7 @@
       activeView !== "browsers" ||
       instanceModalOpen ||
       licenseModalOpen ||
+	  participationSettingsModalOpen ||
       !browserMountIsVisible(element)
     ) {
       return;
@@ -1409,14 +1615,18 @@
         instanceId: instance.id,
         bounds: embeddedBrowserBounds(element),
       });
-      // The native mount can finish after the user has switched views, opened
-      // a modal, or scrolled the card away. Re-check the final UI state before
-      // publishing the mounted surface so a late response cannot leave an
-      // orphan WebView consuming a runtime slot.
+      // A mount can finish after the user switches pages or opens a modal.
+      // Keep that native instance alive but hidden so returning still resumes
+      // the exact in-memory page. Filters and viewport exits continue to
+      // release it below because they are resource-management boundaries.
+      if (activeView !== "browsers" || instanceModalOpen || licenseModalOpen || participationSettingsModalOpen) {
+        if (!browserWebviewMountedIds.includes(instance.id)) {
+          browserWebviewMountedIds = [...browserWebviewMountedIds, instance.id];
+        }
+        await hideEmbeddedBrowser(instance.id);
+        return;
+      }
       if (
-        activeView !== "browsers" ||
-        instanceModalOpen ||
-        licenseModalOpen ||
         !element.isConnected ||
         !browserMountIsVisible(element)
       ) {
@@ -1477,14 +1687,25 @@
     await Promise.all(
       browserInstances.map(async (instance) => {
         if (browserLayoutChanging || expectedRevision !== browserLayoutRevision) return;
-        const element = document.querySelector<HTMLElement>(
-          `[data-browser-instance="${instance.id}"]`,
-        );
         if (
           activeView !== "browsers" ||
           !browserViewSettled ||
           instanceModalOpen ||
-          licenseModalOpen ||
+          licenseModalOpen
+		  || participationSettingsModalOpen
+        ) {
+          if (
+            browserWebviewMountedIds.includes(instance.id) ||
+            browserWebviewMountingIds.includes(instance.id)
+          ) {
+            await hideEmbeddedBrowser(instance.id);
+          }
+          return;
+        }
+        const element = document.querySelector<HTMLElement>(
+          `[data-browser-instance="${instance.id}"]`,
+        );
+        if (
           !visibleIds.has(instance.id) ||
           !element ||
           !browserMountIsVisible(element) ||
@@ -1584,16 +1805,21 @@
     query = "";
     roomRenderLimit = 300;
     redPacketRenderLimit = 300;
-	participationRecordRenderLimit = 300;
+    participationRecordRenderLimit = 300;
     if (tab === "redpackets") redPacketHistoryVisible = false;
     accountStatusFilter = "all";
     if (tab === "participation" || tab === "monitoring") accountRole = tab;
     if (tab === "redpackets" && engineListenerReady) void loadRedPacketEvents();
-	if (tab === "participation-records" && engineListenerReady) void loadParticipationRecords();
+    if (tab === "participation-records" && engineListenerReady) void loadParticipationRecords();
     if (tab === "rooms" && engineListenerReady) {
       void loadRooms();
       void loadRedPacketMonitors();
     }
+  }
+
+  function openManagementTab(tab: ManagementTab) {
+    switchView("accounts");
+    selectManagementTab(tab);
   }
 
   function toggleRedPacketHistory() {
@@ -1687,6 +1913,9 @@
 
   function closeFloatingMenus(event: PointerEvent) {
     const target = event.target as HTMLElement;
+    if (!target.closest(".nav-context-menu")) {
+      navContextMenu = null;
+    }
     if (!target.closest(".menu-anchor")) {
       statusMenuOpen = false;
       importMenuOpen = false;
@@ -2046,11 +2275,11 @@
     return "正在判断直播状态";
   }
 
-  function formatMonitorTime(value?: string) {
+  function formatMonitorTime(value?: string, clock = Date.now()) {
     if (!value) return "暂无";
     const timestamp = Date.parse(value);
     if (!Number.isFinite(timestamp)) return value.replace("T", " ").slice(0, 16);
-    const seconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+    const seconds = Math.max(0, Math.floor((clock - timestamp) / 1000));
     if (seconds < 10) return "刚刚";
     if (seconds < 60) return `${seconds} 秒前`;
     if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
@@ -2176,35 +2405,45 @@
     }
   }
 
-	async function loadParticipationRecords() {
-		if (participationRecordsLoading) return;
-		participationRecordsLoading = true;
-		participationRecordError = "";
-		try {
-			participationRecords = await engineRequest<ParticipationRecord[]>("red_packet_participation.list");
-		} catch (error) {
-			participationRecordError = error instanceof Error ? error.message : String(error);
-		} finally {
-			participationRecordsLoading = false;
-		}
-	}
+  async function loadParticipationRecords() {
+    if (participationRecordsLoading) return;
+    participationRecordsLoading = true;
+    participationRecordError = "";
+    try {
+      participationRecords = await engineRequest<ParticipationRecord[]>("red_packet_participation.list");
+    } catch (error) {
+      participationRecordError = error instanceof Error ? error.message : String(error);
+    } finally {
+      participationRecordsLoading = false;
+    }
+  }
 
-	function participationRecordStatus(record: ParticipationRecord) {
-		if (record.status === "pending") return { label: "等待中", tone: "pending" };
-		if (record.status === "joined") return { label: "参与成功", tone: "success" };
-		if (record.status === "already_joined") return { label: "已参与", tone: "success" };
-		if (record.status === "risk_control") return { label: "风控冷却", tone: "warning" };
-		if (record.status === "login_expired") return { label: "CK 失效", tone: "error" };
-		if (record.status === "network_error") return { label: "网络异常", tone: "warning" };
-		if (record.status === "expired") return { label: "已过期", tone: "muted" };
-		return { label: "参与失败", tone: "error" };
-	}
+  function participationRecordStatus(record: ParticipationRecord) {
+    if (record.status === "pending") return { label: "等待中", tone: "pending" };
+    if (record.status === "won") return { label: record.award ? `已中${record.award}` : "已中奖", tone: "success" };
+    if (record.status === "not_won") return { label: "未中奖", tone: "muted" };
+    if (record.status === "joined") return { label: "参与成功", tone: "success" };
+    if (record.status === "already_joined") return { label: "已参与", tone: "success" };
+    if (record.status === "risk_control") return { label: "风控冷却", tone: "warning" };
+    if (record.status === "login_expired") return { label: "CK 失效", tone: "error" };
+    if (record.status === "network_error") return { label: "网络异常", tone: "warning" };
+    if (record.status === "expired") return { label: "已过期", tone: "muted" };
+    return { label: "参与失败", tone: "error" };
+  }
 
-	function participationRecordEndpoint(record: ParticipationRecord) {
-		if (record.endpoint === "rush") return "rush 回退";
-		if (record.endpoint === "join") return "join 接口";
-		return "等待请求";
-	}
+  function participationRecordEndpoint(record: ParticipationRecord) {
+    if (record.endpoint === "receive") return "开奖结果";
+    if (record.endpoint === "rush") return "rush 回退";
+    if (record.endpoint === "join") return "join 接口";
+    return "等待请求";
+  }
+
+  function participationRecordExactTime(record: ParticipationRecord) {
+    const timestamp = Date.parse(record.updated_at);
+    return Number.isFinite(timestamp)
+      ? new Date(timestamp).toLocaleString("zh-CN", { hour12: false })
+      : record.updated_at;
+  }
 
   async function toggleRoomRedPacketMonitor(monitor: RedPacketMonitor) {
     if (redPacketMonitorActionId || redPacketBatchAction) return;
@@ -2515,6 +2754,7 @@
       ]);
       browserInstances = instances;
       browserCapacity = capacity;
+	  void loadBrowserParticipationContexts();
       void loadBrowserFollowingLives(instances);
       await tick();
       if (activeView === "browsers" && isTauriDesktop()) {
@@ -2531,6 +2771,17 @@
     } finally {
       browserLoading = false;
     }
+  }
+
+  async function loadBrowserParticipationContexts() {
+	if (!engineListenerReady) return;
+	try {
+		const items = await engineRequest<BrowserParticipationContext[]>("red_packet_participation.contexts");
+		browserParticipationContexts = Object.fromEntries(items.map((item) => [item.instance_id, item]));
+		browserRedPacketContextIds = items.filter((item) => item.accepting).map((item) => item.instance_id);
+	} catch {
+		// Keep the last native context state during a transient sidecar refresh.
+	}
   }
 
   function updateBrowserColumns(event: Event) {
@@ -2684,6 +2935,7 @@
       browserWebviewMountingIds = browserWebviewMountingIds.filter((id) => id !== instance.id);
       browserWebviewLoadingIds = browserWebviewLoadingIds.filter((id) => id !== instance.id);
       browserWebviewReadyIds = browserWebviewReadyIds.filter((id) => id !== instance.id);
+      browserRedPacketContextIds = browserRedPacketContextIds.filter((id) => id !== instance.id);
       browserPendingClose = null;
       showToast(`已关闭「${instance.account_name}」的实例，账号环境已保留`);
     } catch (error) {
@@ -2747,6 +2999,96 @@
     }
   }
 
+  function browserRedPacketLiveTarget(instance: BrowserInstance) {
+    const followed = followingLiveSnapshot(instance)?.items.find((item) => /^\d{6,20}$/.test(item.web_rid));
+    if (followed) return { webRID: followed.web_rid, label: followed.nickname || followed.title || followed.web_rid };
+    const activeEvent = redPacketEvents.find(
+      (event) => redPacketEventIsActive(event, redPacketClock) && /^\d{6,20}$/.test(event.web_rid || ""),
+    );
+    if (activeEvent) {
+      return {
+        webRID: activeEvent.web_rid!,
+        label: activeEvent.streamer_name || activeEvent.room_name || activeEvent.web_rid!,
+      };
+    }
+    const liveMonitor = redPacketMonitors.find(
+      (monitor) => monitor.live_status === "live" && /^\d{6,20}$/.test(monitor.web_rid || monitor.room_id),
+    );
+    if (liveMonitor) {
+      return {
+        webRID: liveMonitor.web_rid || liveMonitor.room_id,
+        label: liveMonitor.streamer_name || liveMonitor.name || liveMonitor.web_rid || liveMonitor.room_id,
+      };
+    }
+    return null;
+  }
+
+  async function toggleBrowserRedPacketContext(instance: BrowserInstance) {
+    if (browserRedPacketPreparingIds.includes(instance.id)) return;
+	const participationContext = browserParticipationContexts[instance.id];
+	const canResumePendingResult = Boolean(
+		participationContext?.active && !participationContext.prepared && participationContext.pending_draw_count &&
+		/^\d{6,20}$/.test(participationContext.pending_result_web_rid || ""),
+	);
+	if (participationContext?.stopped && !canResumePendingResult) {
+		showToast(participationContext.stop_reason || "已达到红包参与停止条件，请先调整参与设置");
+		return;
+	}
+    if (!isTauriDesktop()) {
+      showToast("红包页面参与仅支持桌面客户端");
+      return;
+    }
+    const enabled = browserRedPacketContextIds.includes(instance.id);
+    if (enabled) {
+      browserRedPacketPreparingIds = [...browserRedPacketPreparingIds, instance.id];
+      browserError = "";
+      try {
+        await invoke<void>("stop_browser_red_packet_context", { instanceId: instance.id });
+        browserRedPacketContextIds = browserRedPacketContextIds.filter((id) => id !== instance.id);
+		void loadBrowserParticipationContexts();
+        showToast(`已停止「${instance.account_name}」的红包页面参与，未发出的任务已取消`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        browserError = message;
+        showToast(message);
+      } finally {
+        browserRedPacketPreparingIds = browserRedPacketPreparingIds.filter((id) => id !== instance.id);
+      }
+      return;
+    }
+    const target = canResumePendingResult
+		? { webRID: participationContext!.pending_result_web_rid!, label: "待开奖记录直播间" }
+		: browserRedPacketLiveTarget(instance);
+    if (!target) {
+      showToast("暂未找到正在直播的房间，请先刷新该账号的关注直播或启动直播间监测");
+      return;
+    }
+    browserRedPacketPreparingIds = [...browserRedPacketPreparingIds, instance.id];
+    browserError = "";
+    try {
+      await invoke<string>("prepare_browser_red_packet_context", {
+        instanceId: instance.id,
+        webRid: target.webRID,
+		resultOnly: canResumePendingResult,
+      });
+      if (!participationContext?.stopped && !browserRedPacketContextIds.includes(instance.id)) {
+        browserRedPacketContextIds = [...browserRedPacketContextIds, instance.id];
+      }
+	  void loadBrowserParticipationContexts();
+	  void loadSidebarActivities();
+      showToast(canResumePendingResult
+		? `「${instance.account_name}」已恢复待开奖记录查询，不会参与新的红包`
+		: `「${instance.account_name}」已进入「${target.label}」，红包接口将使用真实页面签名`);
+    } catch (error) {
+      browserRedPacketContextIds = browserRedPacketContextIds.filter((id) => id !== instance.id);
+      const message = error instanceof Error ? error.message : String(error);
+      browserError = message;
+      showToast(message);
+    } finally {
+      browserRedPacketPreparingIds = browserRedPacketPreparingIds.filter((id) => id !== instance.id);
+    }
+  }
+
   async function deleteAccount() {
     if (!accountPendingDelete || accountDeleting) return;
     const account = accountPendingDelete;
@@ -2807,29 +3149,6 @@
       );
       showToast("运行状态已刷新");
     }, 650);
-  }
-
-  function addMonitor() {
-    if (!newRoom.trim()) return;
-    monitors = [
-      ...monitors,
-      {
-        id: Date.now(),
-        name: newName.trim() || `直播间 ${newRoom.trim().slice(-4)}`,
-        room: newRoom.trim(),
-        anchor: "等待首次识别",
-        state: "running",
-        lastSeen: "准备连接",
-        events: 0,
-        account: "自动分配",
-        accent: "#8b6db3",
-      },
-    ];
-    newName = "";
-    newRoom = "";
-    modalOpen = false;
-    activeView = "overview";
-    showToast("新监测已创建");
   }
 
   function showToast(message: string) {
@@ -2925,6 +3244,7 @@
           void loadAccounts(false);
           void loadRedPacketMonitors();
           void loadRedPacketEvents();
+		  void loadSidebarActivities();
           if (activeView === "accounts") {
             void loadRooms();
           }
@@ -2994,12 +3314,15 @@
       void loadAccounts(false);
       void loadRedPacketMonitors();
       void loadRedPacketEvents();
+	  void loadSidebarActivities();
+      if (managementTab === "participation-records") void loadParticipationRecords();
     }, 5000);
     const redPacketClockTimer = window.setInterval(() => {
       redPacketClock = Date.now();
     }, 1000);
     const browserStatusTimer = window.setInterval(() => {
       void pollBrowserInstanceStatuses();
+	  void loadBrowserParticipationContexts();
     }, 2000);
     const followingRoomSyncTimer = window.setInterval(() => {
       if (!engineListenerReady) return;
@@ -3059,21 +3382,25 @@
   class:sidebar-collapsed={sidebarCollapsed}
   class:sidebar-resizing={resizingSidebar}
   class:windows-platform={isWindowsPlatform}
+  class:detached-page-window={isDetachedPageWindow}
   class="app-shell"
-  style={`--sidebar-width:${sidebarCollapsed ? 0 : sidebarWidth}px`}
+  style={`--sidebar-width:${isDetachedPageWindow || sidebarCollapsed ? 0 : sidebarWidth}px`}
 >
+  {#if !isDetachedPageWindow}
   <aside class="sidebar">
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <div class="window-strip" data-tauri-drag-region onpointerdown={startWindowDrag}>
-      <button
-        class="icon-button sidebar-toggle"
-        aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
-        data-tooltip={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
-        data-tooltip-placement="right"
-        onclick={toggleSidebar}
-      >
-        <SidebarSimple size={15} weight="regular" />
-      </button>
+      {#if !isWindowsPlatform}
+        <button
+          class="icon-button sidebar-toggle"
+          aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
+          data-tooltip={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
+          data-tooltip-placement="right"
+          onclick={toggleSidebar}
+        >
+          <SidebarSimple size={15} weight="regular" />
+        </button>
+      {/if}
     </div>
 
     <nav class="main-nav" aria-label="主要导航">
@@ -3081,22 +3408,25 @@
         <button
           class:active={activeView === item.key}
           class="nav-item"
-          onclick={() => switchView(item.key)}
+          aria-current={activeView === item.key ? "page" : undefined}
+          onclick={(event) => handleNavClick(event, item.key)}
+          onauxclick={(event) => handleNavAuxClick(event, item.key)}
+          oncontextmenu={(event) => showNavContextMenu(event, item.key)}
         >
           <svelte:component this={item.icon} size={19} weight="regular" />
           <span>{item.label}</span>
-          {#if item.key === "tasks"}<span class="nav-count">12</span>{/if}
+          {#if item.key === "browsers"}<span class="nav-count">{browserInstances.length}</span>{/if}
         </button>
       {/each}
     </nav>
 
-    <div class="quick-list">
-      <p class="section-label">最近活动</p>
-      <button class="quick-row" onclick={() => switchView("overview")}>
+    <div class="quick-list sidebar-data-overview">
+      <p class="section-label">数据概览</p>
+      <button class="quick-row" onclick={() => openManagementTab("rooms")}>
         <span class="quick-status live"><Radio size={14} weight="fill" /></span>
         <span>{runningRedPacketMonitorCount} 个直播间正在监测</span>
       </button>
-      <button class="quick-row" onclick={() => switchView("tasks")}>
+      <button class="quick-row" onclick={() => openManagementTab("redpackets")}>
         <span class="quick-status live"><Gift size={14} weight="fill" /></span>
         <span>{activeRedPacketCount} 个红包发放中</span>
       </button>
@@ -3108,6 +3438,21 @@
         <span class="quick-status"><UserFocus size={15} /></span>
         <span>{expiredMonitoringAccountCount} 个监测账号 CK 失效</span>
       </button>
+    </div>
+
+    <div class="quick-list sidebar-recent-activity">
+      <p class="section-label">最近活动</p>
+      {#each recentActivityItems as activity (activity.id)}
+        <button class="quick-row recent-activity-row" onclick={() => switchView(activity.view)}>
+          <span class:live={activity.tone === "live"} class="quick-status">
+            <svelte:component this={activity.icon} size={14} weight={activity.tone === "live" ? "fill" : "regular"} />
+          </span>
+          <span class="recent-activity-copy">
+            <span>{activity.label}</span>
+            <small>{activity.time}</small>
+          </span>
+        </button>
+      {/each}
     </div>
 
     <div class="sidebar-footer">
@@ -3152,10 +3497,10 @@
       </span>
       <button
         class="icon-button"
-        aria-label="授权与设置"
-        data-tooltip="授权与设置"
+        aria-label="红包参与设置"
+        data-tooltip="红包参与设置"
         data-tooltip-placement="top"
-        onclick={openLicenseModal}
+        onclick={openParticipationSettings}
       ><GearSix size={16} /></button>
     </div>
 
@@ -3173,15 +3518,17 @@
       onkeydown={resizeSidebarByKeyboard}
     ></div>
   </aside>
+  {/if}
 
   <main class="main-panel">
     <!-- svelte-ignore a11y_no_static_element_interactions -->
     <header class="topbar" data-tauri-drag-region onpointerdown={startWindowDrag}>
-      {#if sidebarCollapsed}
+      {#if !isDetachedPageWindow && (isWindowsPlatform || sidebarCollapsed)}
         <button
+          class:windows-sidebar-toggle={isWindowsPlatform}
           class="icon-button collapsed-sidebar-toggle"
-          aria-label="展开侧栏"
-          data-tooltip="展开侧栏"
+          aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
+          data-tooltip={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}
           data-tooltip-placement="bottom"
           onclick={toggleSidebar}
         >
@@ -3191,20 +3538,23 @@
       <div class="title-group" data-tauri-drag-region>
         <div class="title-line" data-tauri-drag-region>
           <span class="title-icon" data-tauri-drag-region>
-            {#if activeView === "overview"}<Monitor size={18} />
-            {:else if activeView === "tasks"}<Gift size={18} />
-            {:else if activeView === "browsers"}<Browser size={18} />
+            {#if activeView === "browsers"}<Browser size={18} />
             {:else}<UserFocus size={18} />{/if}
           </span>
           <h1 data-tauri-drag-region>{viewMeta[activeView].title}</h1>
         </div>
         <p data-tauri-drag-region>
-          {activeView === "accounts"
-            ? accountSubtitle
-            : activeView === "browsers"
-              ? browserSubtitle
-              : viewMeta[activeView].subtitle}
+          {activeView === "accounts" ? accountSubtitle : browserSubtitle}
           <span data-tauri-drag-region>·</span>本机运行
+          {#if activeView === "browsers"}
+            <span data-tauri-drag-region>·</span>
+            <span
+              class="browser-resource-usage"
+              data-tauri-drag-region
+              data-tooltip={browserCapacity ? browserResourceUsageTooltip(browserCapacity) : "正在读取本机资源占用"}
+              data-tooltip-placement="bottom"
+            >CPU {browserCapacity ? browserCPUUsagePercent(browserCapacity) : "--"}% · 内存 {browserCapacity ? browserMemoryUsagePercent(browserCapacity) : "--"}%</span>
+          {/if}
         </p>
       </div>
 
@@ -3286,93 +3636,12 @@
             <Plus size={14} weight="bold" />
             <span>新建实例</span>
           </button>
-        {:else}
-          <button class="primary-action" onclick={() => (modalOpen = true)}>
-            <Plus size={14} weight="bold" />
-            <span>新建监测</span>
-          </button>
         {/if}
       </div>
     </header>
 
     <section class:account-content={activeView === "accounts"} class="content">
-      {#if activeView !== "accounts" && activeView !== "browsers"}
-        <div class="view-tools">
-          <button class="filter-button">
-            <SlidersHorizontal size={16} />
-            <span>全部状态</span>
-            <CaretDown size={12} />
-          </button>
-        </div>
-      {/if}
-
-      {#if activeView === "overview"}
-        <div class="card-grid monitor-grid">
-          {#each visibleMonitors as item}
-            <article class="monitor-card">
-              <div class="card-head">
-                <span class="room-mark" style={`--accent:${item.accent}`}>
-                  <Activity size={23} weight="bold" />
-                </span>
-                <div class="card-title">
-                  <h2>{item.name}</h2>
-                  <p>{item.anchor} · {item.events} 个红包事件</p>
-                </div>
-                <span class:running={item.state === "running"} class:warning={item.state === "warning"} class:paused={item.state === "paused"} class="status-pill">
-                  <span></span>{stateLabel(item.state)}
-                </span>
-              </div>
-
-              <div class="card-row">
-                <div class="row-label"><WifiHigh size={17} /><strong>实时状态</strong></div>
-                <span>{item.state === "warning" ? "等待账号恢复" : `上次响应 ${item.lastSeen}`}</span>
-              </div>
-              <div class="card-row">
-                <div class="row-label"><UserCircle size={17} /><strong>运行账号</strong></div>
-                <span>{item.account}</span>
-              </div>
-              <div class="card-foot">
-                <span>房间号 {item.room}</span>
-                <div class="card-actions">
-                  <button aria-label="更多操作"><DotsThree size={18} weight="bold" /></button>
-                  <button
-                    class:resume={item.state !== "running"}
-                    class="play-button"
-                    aria-label={item.state === "running" ? "暂停监测" : "继续监测"}
-                    onclick={() => toggleMonitor(item.id)}
-                  >
-                    {#if item.state === "running"}<Pause size={15} weight="fill" />
-                    {:else}<Play size={15} weight="fill" />{/if}
-                  </button>
-                </div>
-              </div>
-            </article>
-          {/each}
-        </div>
-        {#if visibleMonitors.length === 0}
-          <div class="empty-state"><MagnifyingGlass size={30} /><strong>没有找到匹配的监测</strong><span>换个关键词试试</span></div>
-        {/if}
-      {:else if activeView === "tasks"}
-        <div class="summary-grid">
-          {#each taskCards as task}
-            <article class={`summary-card ${task.tone}`}>
-              <span class="summary-icon"><Gift size={20} weight="fill" /></span>
-              <div><p>{task.title}</p><strong>{task.value}</strong><small>{task.detail}</small></div>
-              <CaretDown class="side-caret" size={15} />
-            </article>
-          {/each}
-        </div>
-        <section class="table-card">
-          <div class="table-title"><h2>最近任务</h2><span>任务状态会由 Go 引擎实时推送</span></div>
-          {#each monitors.slice(0, 3) as item, index}
-            <div class="task-row">
-              <span class={`task-state state-${index}`}><Gift size={17} weight="fill" /></span>
-              <div><strong>{item.name}</strong><small>{index === 0 ? "等待参与窗口" : index === 1 ? "等待开奖结果" : "已完成"}</small></div>
-              <span>{index === 0 ? "42 秒后" : index === 1 ? "1 分 18 秒后" : "今天 18:40"}</span>
-            </div>
-          {/each}
-        </section>
-      {:else if activeView === "browsers"}
+      {#if activeView === "browsers"}
         {#if browserError}
           <div class="account-notice error browser-notice">
             <WarningCircle size={17} />
@@ -3395,6 +3664,13 @@
             style={`--browser-columns:${browserColumns}`}
           >
             {#each visibleBrowserInstances as item, index}
+			  {@const participationContext = browserParticipationContexts[item.id]}
+			  {@const participationStopped = Boolean(participationContext?.stopped)}
+			  {@const participationEnabled = browserRedPacketContextIds.includes(item.id)}
+			  {@const pendingResultCanResume = Boolean(participationContext?.active && !participationContext?.prepared && participationContext?.pending_draw_count && /^\d{6,20}$/.test(participationContext?.pending_result_web_rid || ""))}
+			  {@const participationTip = participationStopped
+				? `${participationContext?.stop_reason || "已达到红包参与停止条件"}${pendingResultCanResume ? "；点击仅恢复待开奖记录查询" : ""}`
+				: pendingResultCanResume ? "恢复待开奖记录查询" : participationEnabled ? "停止红包页面参与" : "进入直播间并启用红包页面参与"}
               <article class="simple-card browser-instance-card">
                 <div class="browser-card-preview" aria-label={`${item.account_name} 的真实抖音浏览器`}>
                   <div
@@ -3474,6 +3750,22 @@
                         <Radio size={10} weight="fill" />
                       {/if}
                       <span>{followingLiveSnapshot(item) ? followingLiveSnapshot(item).total : browserFollowingLiveErrors[item.id] ? "未知" : "读取"}</span>
+                    </button>
+                    <button
+                      class="secondary-button browser-red-packet-button"
+                      class:enabled={participationEnabled}
+                      class:limit-reached={participationStopped}
+                      aria-label={participationTip}
+                      data-tooltip={participationTip}
+                      data-tooltip-placement="left"
+                      disabled={browserRedPacketPreparingIds.includes(item.id) || browserClosingId === item.id}
+                      onclick={() => toggleBrowserRedPacketContext(item)}
+                    >
+                      {#if browserRedPacketPreparingIds.includes(item.id)}
+                        <ArrowClockwise class="spinning" size={13} />
+                      {:else}
+                        <Gift size={13} weight={participationEnabled ? "fill" : "regular"} />
+                      {/if}
                     </button>
                     <button
                       class="secondary-button browser-close-button"
@@ -3571,6 +3863,14 @@
           >
             监测账号 <span>{monitoringAccounts.length}</span>
           </button>
+          <button
+            class:active={managementTab === "participation-records"}
+            role="tab"
+            aria-selected={managementTab === "participation-records"}
+            onclick={() => selectManagementTab("participation-records")}
+          >
+            参与记录 <span>{participationRecords.length}</span>
+          </button>
           {#if managementTab === "redpackets"}
             <div class="red-packet-history-entry">
               <button
@@ -3609,7 +3909,7 @@
                 </button>
               {/if}
             </div>
-          {:else}
+          {:else if managementTab === "participation" || managementTab === "monitoring"}
             <div class="menu-anchor filter-anchor account-filter-anchor">
               <button
                 class="filter-button"
@@ -3645,7 +3945,7 @@
           {/if}
         </div>
         <section
-          class:fill-panel={managementTab === "redpackets" || managementTab === "rooms" || visibleAccounts.length > 8}
+          class:fill-panel={managementTab === "redpackets" || managementTab === "rooms" || managementTab === "participation-records" || visibleAccounts.length > 8}
           class="account-panel"
         >
           {#if managementTab === "redpackets"}
@@ -3674,7 +3974,7 @@
                     <div class="red-packet-event-identity">
                       <span class="room-avatar red-packet-avatar">
                         {#if redPacketEventIsDiamond(event)}
-                          <Diamond size={18} weight="fill" />
+                          <DiamondGem size={18} weight="fill" />
                         {:else}
                           <Gift size={17} weight="fill" />
                         {/if}
@@ -3874,6 +4174,67 @@
                 {/if}
               </div>
             {/if}
+          {:else if managementTab === "participation-records"}
+            {#if participationRecordError}
+              <div class="account-notice error">
+                <WarningCircle size={17} />
+                <span>{participationRecordError}</span>
+                <button onclick={loadParticipationRecords}>重试</button>
+              </div>
+            {:else if participationRecordsLoading && participationRecords.length === 0}
+              <div class="account-empty"><ArrowClockwise class="spinning" size={22} /><span>正在读取参与记录…</span></div>
+            {:else if visibleParticipationRecords.length === 0}
+              <div class="account-empty">
+                <Gift size={28} />
+                <strong>{query ? "没有匹配的参与记录" : "还没有参与记录"}</strong>
+                <span>{query ? "换个关键词试试" : "开启参与账号的红包接口开关后，真实参与结果会保留在这里"}</span>
+              </div>
+            {:else}
+              <div class="participation-record-list">
+                <div class="participation-record-head">
+                  <span>参与账号</span><span>红包 / 直播间</span><span>参与结果</span><span>接口</span><span>时间</span>
+                </div>
+                {#each visibleParticipationRecords as record}
+                  {@const result = participationRecordStatus(record)}
+                  <article class="participation-record-row">
+                    <div class="participation-record-account">
+                      <span class="participation-record-icon"><UserCircle size={16} weight="fill" /></span>
+                      <div><strong>{record.account_name || "已删除账号"}</strong><small>账号记录 {record.account_id.slice(0, 8)}</small></div>
+                    </div>
+                    <div class="participation-record-event">
+                      <div class="participation-record-event-title">
+                        <strong>{record.title || record.prize || "直播红包"}</strong>
+                        {#if record.web_rid && /^\d{6,24}$/.test(record.web_rid)}
+                          <button
+                            class="icon-button room-open-live-action"
+                            aria-label="打开参与记录对应直播间"
+                            data-tooltip="打开直播间"
+                            data-tooltip-placement="top"
+                            onclick={() => openLiveRoomByWebRID(record.web_rid!)}
+                          ><ArrowSquareOut size={11} /></button>
+                        {/if}
+                      </div>
+                      <small>{record.room_name || record.streamer_name || `直播间 ${record.web_rid || record.room_id || "未知"}`} · {record.prize || "奖品待解析"}</small>
+                    </div>
+                    <div class="participation-record-result">
+                      <span class={`participation-result-pill ${result.tone}`} data-tooltip={record.message || result.label} data-tooltip-placement="top">{result.label}</span>
+                      <small>{record.message || "等待结果"}</small>
+                    </div>
+                    <div class="participation-record-endpoint">
+                      <strong>{participationRecordEndpoint(record)}</strong>
+                      <small>{record.attempt_count ? `${record.attempt_count} 次请求` : "尚未请求"}</small>
+                    </div>
+                    <span class="participation-record-time" data-tooltip={participationRecordExactTime(record)} data-tooltip-placement="left">{formatMonitorTime(record.updated_at)}</span>
+                  </article>
+                {/each}
+                {#if visibleParticipationRecords.length < filteredParticipationRecords.length}
+                  <div class="room-list-more">
+                    <span>已显示 {visibleParticipationRecords.length} / {filteredParticipationRecords.length} 条</span>
+                    <button onclick={() => (participationRecordRenderLimit += 300)}>继续显示</button>
+                  </div>
+                {/if}
+              </div>
+            {/if}
           {:else if accountError}
             <div class="account-notice error">
               <WarningCircle size={17} />
@@ -3992,6 +4353,20 @@
   </main>
 </div>
 
+{#if navContextMenu}
+  <div
+    class="nav-context-menu"
+    role="menu"
+    aria-label="页面菜单"
+    style={`left:${navContextMenu.x}px;top:${navContextMenu.y}px`}
+  >
+    <button role="menuitem" onclick={() => openViewInNewWindow(navContextMenu!.key)}>
+      <ArrowSquareOut size={14} />
+      <span>在新窗口打开</span>
+    </button>
+  </div>
+{/if}
+
 {#if updateModalOpen && updateStatus}
   <div
     class="modal-backdrop"
@@ -4047,6 +4422,49 @@
             <DownloadSimple size={14} />{updateDownloading ? `下载中 ${updateProgress.percent}%` : "立即升级"}
           </button>
         {/if}
+      </div>
+    </dialog>
+  </div>
+{/if}
+
+{#if participationSettingsModalOpen}
+  <div
+    class="modal-backdrop"
+    role="presentation"
+    onclick={(event) => event.currentTarget === event.target && closeParticipationSettings()}
+  >
+    <dialog class="modal participation-settings-modal" open aria-labelledby="participation-settings-title">
+      <div class="modal-head">
+        <div>
+          <span class="modal-icon participation-settings-icon"><Gift size={18} weight="fill" /></span>
+          <h2 id="participation-settings-title">红包参与设置</h2>
+        </div>
+        <button class="icon-button" aria-label="关闭" disabled={participationSettingsBusy} onclick={closeParticipationSettings}><X size={17} /></button>
+      </div>
+
+      <p class="participation-settings-intro">以下限制按每个参与账号独立计算，填 0 表示不限制。</p>
+      <div class="participation-settings-list">
+        <label class="participation-setting-row">
+          <span><strong>参与停止</strong><small>参与达到指定次数后，不再分配后续红包任务</small></span>
+          <span class="number-field"><input type="number" min="0" max="100000" step="1" bind:value={participationSettings.stop_after_joins} /><em>次</em></span>
+        </label>
+        <label class="participation-setting-row">
+          <span><strong>参与冷却</strong><small>参与成功后，等待指定秒数才能参与下一次</small></span>
+          <span class="number-field"><input type="number" min="0" max="86400" step="1" bind:value={participationSettings.cooldown_seconds} /><em>秒</em></span>
+        </label>
+        <label class="participation-setting-row">
+          <span><strong>中奖停止</strong><small>累计中奖达到指定次数后，不再分配后续红包任务</small></span>
+          <span class="number-field"><input type="number" min="0" max="100000" step="1" bind:value={participationSettings.stop_after_wins} /><em>次</em></span>
+        </label>
+      </div>
+
+      {#if participationSettingsError}<div class="license-error"><WarningCircle size={14} />{participationSettingsError}</div>{/if}
+      <div class="modal-actions">
+        <button class="secondary-button" disabled={participationSettingsBusy} onclick={closeParticipationSettings}>取消</button>
+        <button class="primary-action" disabled={participationSettingsBusy} onclick={saveParticipationSettings}>
+          {#if participationSettingsBusy}<ArrowClockwise class="spinning" size={14} />{/if}
+          {participationSettingsBusy ? "保存中…" : "保存设置"}
+        </button>
       </div>
     </dialog>
   </div>
@@ -4247,25 +4665,6 @@
           {#if roomImportBusy}<ArrowClockwise class="spinning" size={15} />{:else}<UploadSimple size={15} />{/if}
           {roomImportBusy ? "正在导入…" : "导入"}
         </button>
-      </div>
-    </dialog>
-  </div>
-{/if}
-
-{#if modalOpen}
-  <div class="modal-backdrop" role="presentation" onclick={(event) => event.currentTarget === event.target && (modalOpen = false)}>
-    <dialog class="modal" open aria-labelledby="modal-title">
-      <div class="modal-head">
-        <div><span class="modal-icon"><Radio size={19} weight="fill" /></span><h2 id="modal-title">新建直播间监测</h2></div>
-        <button class="icon-button" aria-label="关闭" onclick={() => (modalOpen = false)}><X size={18} /></button>
-      </div>
-      <p class="modal-intro">添加一个直播间到监测队列。创建后由 Go 引擎负责连接、调度和状态恢复。</p>
-      <label class="field"><span>直播间名称</span><input bind:value={newName} placeholder="例如：晚间红包专场" /></label>
-      <label class="field"><span>直播间地址或房间号</span><input bind:value={newRoom} placeholder="粘贴直播间链接或输入房间号" /></label>
-      <div class="notice"><WarningCircle size={17} /><span>基础架子暂使用演示数据，Go 引擎接入后这里会执行真实连接检查。</span></div>
-      <div class="modal-actions">
-        <button class="secondary-button" onclick={() => (modalOpen = false)}>取消</button>
-        <button class="primary-action" disabled={!newRoom.trim()} onclick={addMonitor}><Plus size={17} />创建监测</button>
       </div>
     </dialog>
   </div>

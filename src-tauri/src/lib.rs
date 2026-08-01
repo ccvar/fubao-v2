@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     hash::{DefaultHasher, Hash, Hasher},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -11,8 +11,11 @@ use std::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tauri::{
+    menu::{Menu, MenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     webview::{Cookie, PageLoadEvent, WebviewBuilder},
-    Emitter, LogicalPosition, LogicalSize, Manager, Url, WebviewUrl, WebviewWindowBuilder,
+    Emitter, LogicalPosition, LogicalSize, Manager, RunEvent, Url, WebviewUrl,
+    WebviewWindowBuilder, WindowEvent,
 };
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
@@ -34,6 +37,7 @@ struct EngineRuntime {
     // last safe Douyin location here so remounting the same stable instance
     // restores its page instead of always jumping back to the home page.
     browser_locations: Mutex<HashMap<String, String>>,
+    browser_red_packet_contexts: Mutex<HashSet<String>>,
 }
 
 impl Default for EngineRuntime {
@@ -44,6 +48,7 @@ impl Default for EngineRuntime {
             native_secret: Uuid::new_v4().to_string(),
             pending: Mutex::new(HashMap::new()),
             browser_locations: Mutex::new(HashMap::new()),
+            browser_red_packet_contexts: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -62,6 +67,8 @@ fn start_engine(app: tauri::AppHandle, runtime: Arc<EngineRuntime>) -> Result<()
     *runtime.child.lock().map_err(|_| "引擎状态锁不可用")? = Some(child);
 
     let event_runtime = runtime.clone();
+    let participation_runtime = runtime.clone();
+    let participation_app = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut stdout_buffer = String::new();
         while let Some(event) = receiver.recv().await {
@@ -107,6 +114,67 @@ fn start_engine(app: tauri::AppHandle, runtime: Arc<EngineRuntime>) -> Result<()
         runtime.online.store(false, Ordering::SeqCst);
     });
 
+    tauri::async_runtime::spawn(async move {
+        poll_page_participation_tasks(participation_app, participation_runtime).await;
+    });
+
+    Ok(())
+}
+
+fn stop_engine(app: &tauri::AppHandle) {
+    let runtime = app.state::<Arc<EngineRuntime>>();
+    if let Ok(mut guard) = runtime.child.lock() {
+        if let Some(child) = guard.take() {
+            let _ = child.kill();
+        }
+    }
+    runtime.online.store(false, Ordering::SeqCst);
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
+
+fn setup_system_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, "tray-show-main", "打开福宝控制台", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "tray-quit", "彻底退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+
+    let mut builder = TrayIconBuilder::with_id("fubao-main-tray")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .tooltip("福宝控制台 · 后台任务运行中")
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "tray-show-main" => show_main_window(app),
+            "tray-quit" => {
+                stop_engine(app);
+                app.exit(0);
+            }
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if matches!(
+                event,
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } | TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                }
+            ) {
+                show_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(icon);
+    }
+    builder.build(app)?;
     Ok(())
 }
 
@@ -183,13 +251,90 @@ struct NativeAccountCredential {
     cookie: String,
 }
 
+#[derive(Deserialize)]
+struct NativePageParticipationTask {
+    task_id: String,
+    action: String,
+    instance_id: String,
+    account_id: String,
+    web_rid: String,
+    actual_room_id: String,
+    box_id: String,
+    anchor_id: Option<String>,
+    box_type: Option<String>,
+    send_time: Option<String>,
+    delay_time: Option<String>,
+}
+
+struct NativePageParticipationResult {
+    endpoint: String,
+    http_status: i64,
+    body: String,
+    error: String,
+    attempts: i64,
+    context_missing: bool,
+    login_expired: bool,
+}
+
+impl NativePageParticipationResult {
+    fn context_missing(message: impl Into<String>) -> Self {
+        Self {
+            endpoint: "page".into(),
+            http_status: 0,
+            body: String::new(),
+            error: message.into(),
+            attempts: 0,
+            context_missing: true,
+            login_expired: false,
+        }
+    }
+
+    fn login_expired(message: impl Into<String>) -> Self {
+        Self {
+            endpoint: "page".into(),
+            http_status: 0,
+            body: String::new(),
+            error: message.into(),
+            attempts: 0,
+            context_missing: false,
+            login_expired: true,
+        }
+    }
+}
+
 const DOUYIN_CHROME_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-fn browser_webview_label(instance_id: &str) -> String {
+fn safe_window_label_part(value: &str) -> String {
+    value.replace(|character: char| !character.is_ascii_alphanumeric(), "-")
+}
+
+fn browser_webview_prefix(instance_id: &str) -> String {
+    format!("browser-{}--", safe_window_label_part(instance_id))
+}
+
+fn browser_webview_label(instance_id: &str, parent_label: &str) -> String {
     format!(
-        "browser-{}",
-        instance_id.replace(|character: char| !character.is_ascii_alphanumeric(), "-")
+        "{}{}",
+        browser_webview_prefix(instance_id),
+        safe_window_label_part(parent_label)
     )
+}
+
+fn browser_webviews_for_instance(app: &tauri::AppHandle, instance_id: &str) -> Vec<tauri::Webview> {
+    let prefix = browser_webview_prefix(instance_id);
+    app.webviews()
+        .into_values()
+        .filter(|webview| webview.label().starts_with(&prefix))
+        .collect()
+}
+
+fn browser_webview_for_instance(
+    app: &tauri::AppHandle,
+    instance_id: &str,
+) -> Option<tauri::Webview> {
+    browser_webviews_for_instance(app, instance_id)
+        .into_iter()
+        .next()
 }
 
 fn browser_data_store_identifier(account_id: &str) -> [u8; 16] {
@@ -205,17 +350,19 @@ fn browser_data_store_identifier(account_id: &str) -> [u8; 16] {
     result
 }
 
-fn rebind_webview_label(account_id: &str) -> String {
+fn rebind_webview_label(account_id: &str, parent_label: &str) -> String {
     format!(
-        "account-rebind-{}",
-        account_id.replace(|character: char| !character.is_ascii_alphanumeric(), "-")
+        "account-rebind-{}--{}",
+        safe_window_label_part(account_id),
+        safe_window_label_part(parent_label)
     )
 }
 
-fn create_account_webview_label(session_id: &str) -> String {
+fn create_account_webview_label(session_id: &str, parent_label: &str) -> String {
     format!(
-        "account-create-{}",
-        session_id.replace(|character: char| !character.is_ascii_alphanumeric(), "-")
+        "account-create-{}--{}",
+        safe_window_label_part(session_id),
+        safe_window_label_part(parent_label)
     )
 }
 
@@ -264,7 +411,9 @@ fn read_douyin_cookie(webview: &tauri::Webview) -> Result<String, String> {
             })
         })
     {
-        if cookie.name() == "fubao_login_probe" {
+        if cookie.name() == "fubao_login_probe"
+            || cookie.name().starts_with("fubao_participation_probe_")
+        {
             continue;
         }
         values.insert(cookie.name().to_string(), cookie.value().to_string());
@@ -316,7 +465,10 @@ fn canonical_cookie_values(raw_cookie: &str) -> HashMap<String, String> {
         .filter_map(|item| item.trim().split_once('='))
         .filter_map(|(name, value)| {
             let name = name.trim();
-            if name.is_empty() || name == "fubao_login_probe" {
+            if name.is_empty()
+                || name == "fubao_login_probe"
+                || name.starts_with("fubao_participation_probe_")
+            {
                 return None;
             }
             Some((name.to_string(), value.trim().to_string()))
@@ -396,6 +548,376 @@ async fn inspect_douyin_login(webview: &tauri::Webview) -> Result<BrowserLoginSn
     Ok(BrowserLoginSnapshot { raw_cookie, state })
 }
 
+fn valid_live_room_id(value: &str) -> bool {
+    let value = value.trim();
+    (6..=20).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn live_room_url(web_rid: &str) -> Result<Url, String> {
+    if !valid_live_room_id(web_rid) {
+        return Err("直播间标识无效".into());
+    }
+    format!("https://live.douyin.com/{}", web_rid.trim())
+        .parse::<Url>()
+        .map_err(|error| format!("解析直播间地址失败：{error}"))
+}
+
+async fn navigate_browser_to_live_room(
+    webview: &tauri::Webview,
+    web_rid: &str,
+) -> Result<(), String> {
+    let target = live_room_url(web_rid)?;
+    let already_there = webview.url().ok().is_some_and(|current| {
+        current.domain() == Some("live.douyin.com")
+            && current.path().trim_matches('/') == web_rid.trim()
+    });
+    if !already_there {
+        webview
+            .navigate(target)
+            .map_err(|error| format!("切换到直播间失败：{error}"))?;
+    }
+    for _ in 0..40 {
+        if webview.url().ok().is_some_and(|current| {
+            current.domain() == Some("live.douyin.com")
+                && current.path().trim_matches('/') == web_rid.trim()
+        }) {
+            tokio::time::sleep(Duration::from_millis(if already_there {
+                500
+            } else {
+                1_800
+            }))
+            .await;
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    Err("直播间页面加载超时，请确认直播间仍在开播".into())
+}
+
+fn decode_hex_utf8(value: &str) -> Result<String, String> {
+    if value.len() % 2 != 0 {
+        return Err("原生页面结果编码无效".into());
+    }
+    let mut bytes = Vec::with_capacity(value.len() / 2);
+    for pair in value.as_bytes().chunks_exact(2) {
+        let text = std::str::from_utf8(pair).map_err(|_| "原生页面结果编码无效")?;
+        bytes.push(u8::from_str_radix(text, 16).map_err(|_| "原生页面结果编码无效")?);
+    }
+    String::from_utf8(bytes).map_err(|_| "原生页面结果不是有效文本".into())
+}
+
+async fn execute_page_participation(
+    webview: &tauri::Webview,
+    task: &NativePageParticipationTask,
+) -> NativePageParticipationResult {
+    let cookie_name = format!(
+        "fubao_participation_probe_{}",
+        task.task_id
+            .chars()
+            .filter(|character| character.is_ascii_alphanumeric())
+            .take(20)
+            .collect::<String>()
+    );
+    let payload = json!({
+        "action": task.action,
+        "web_rid": task.web_rid,
+        "actual_room_id": task.actual_room_id,
+        "box_id": task.box_id,
+        "anchor_id": task.anchor_id.as_deref().unwrap_or_default(),
+        "box_type": task.box_type.as_deref().unwrap_or_default(),
+        "send_time": task.send_time.as_deref().unwrap_or_default(),
+        "delay_time": task.delay_time.as_deref().unwrap_or_default(),
+    });
+    let script = format!(
+        r#"(() => {{
+          const task = {payload};
+          const cookieName = {cookie_name};
+          const finish = (result) => {{
+            try {{
+              const text = JSON.stringify(result);
+              const bytes = new TextEncoder().encode(text);
+              const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+              document.cookie = `${{cookieName}}=${{hex}}; Path=/; Secure; SameSite=None; Max-Age=15`;
+            }} catch (error) {{}}
+          }};
+          const stripSignatures = (url) => {{
+            for (const key of ['msToken', 'a_bogus', 'X-Bogus', '__ac_signature', '__ac_nonce']) {{
+              url.searchParams.delete(key);
+            }}
+          }};
+          const commonRequestURL = () => {{
+            try {{
+              const entries = performance.getEntriesByType('resource').slice().reverse();
+              for (const entry of entries) {{
+                const candidate = new URL(String(entry.name || ''), location.href);
+                if (candidate.hostname === 'live.douyin.com' && candidate.pathname.startsWith('/webcast/')) {{
+                  return candidate;
+                }}
+              }}
+            }} catch (error) {{}}
+            return new URL('https://live.douyin.com/webcast/luckybox/join/');
+          }};
+          const requestURL = (endpoint) => {{
+            const url = commonRequestURL();
+            url.protocol = 'https:';
+            url.hostname = 'live.douyin.com';
+            url.pathname = `/webcast/luckybox/${{endpoint}}/`;
+            stripSignatures(url);
+            for (const key of ['cursor', 'count', 'offset', 'fetch_time', 'last_id', 'room_ids']) {{
+              url.searchParams.delete(key);
+            }}
+            const values = {{
+              aid: '6383', app_name: 'douyin_web', live_id: '1', device_platform: 'web',
+              room_id: task.actual_room_id, box_id: task.box_id, anchor_id: task.anchor_id
+            }};
+            for (const [key, value] of Object.entries(values)) {{
+              if (String(value || '').trim()) url.searchParams.set(key, String(value));
+            }}
+            if (!url.searchParams.has('browser_language')) url.searchParams.set('browser_language', navigator.language || 'zh-CN');
+            if (!url.searchParams.has('browser_platform')) url.searchParams.set('browser_platform', navigator.platform || 'MacIntel');
+            if (!url.searchParams.has('browser_name')) url.searchParams.set('browser_name', 'Mozilla');
+            if (!url.searchParams.has('browser_online')) url.searchParams.set('browser_online', String(navigator.onLine));
+            if (!url.searchParams.has('cookie_enabled')) url.searchParams.set('cookie_enabled', String(navigator.cookieEnabled));
+            return url;
+          }};
+          const send = async (endpoint) => {{
+            const response = await fetch(requestURL(endpoint).toString(), {{
+              method: 'POST', credentials: 'include', cache: 'no-store',
+              headers: {{'accept': 'application/json, text/plain, */*', 'content-type': 'application/x-www-form-urlencoded'}},
+              body: '', referrer: `https://live.douyin.com/${{task.web_rid}}`,
+              referrerPolicy: 'strict-origin-when-cross-origin'
+            }});
+            let text = await response.text();
+            if (endpoint === 'receive') {{
+              try {{
+                const parsed = JSON.parse(text);
+                const infos = parsed && parsed.data && parsed.data.receive_info;
+                let reduced = infos;
+                if (Array.isArray(infos)) {{
+                  const target = String(task.box_id || '');
+                  const matched = infos.find((item) => {{
+                    const id = String(item && (item.box_id_str || item.boxIdStr || item.box_id || item.boxId || item.activity_id || item.activityId) || '');
+                    return id === target;
+                  }});
+                  const onlyIdless = infos.length === 1 && !String(infos[0] && (infos[0].box_id_str || infos[0].boxIdStr || infos[0].box_id || infos[0].boxId || infos[0].activity_id || infos[0].activityId) || '');
+                  reduced = matched ? [matched] : onlyIdless ? [infos[0]] : infos.length === 0 ? [] : undefined;
+                }}
+                text = JSON.stringify({{status_code: parsed.status_code, status_msg: parsed.status_msg, data: {{receive_info: reduced}}}});
+              }} catch (error) {{}}
+            }}
+            return {{endpoint, status: response.status, text}};
+          }};
+          (async () => {{
+            try {{
+              if (location.hostname !== 'live.douyin.com' || location.pathname.replace(/^\/+|\/+$/g, '') !== String(task.web_rid)) {{
+                finish({{endpoint: 'page', http_status: 0, body: '', error: '浏览器实例未进入目标直播间', attempts: 0, context_missing: true}});
+                return;
+              }}
+              // A synthetic join -> rush fallback doubles account traffic and
+              // Douyin reports the second request as rush_spam. One detected
+              // packet therefore issues exactly one page-context join. A rush
+              // is only safe when it originates from a real page interaction
+              // whose complete request template was captured by the page.
+              const action = task.action === 'receive' ? 'receive' : 'join';
+              const response = await send(action);
+              finish({{
+                endpoint: response.endpoint,
+                http_status: response.status,
+                body: String(response.text || '').slice(0, 1200),
+                error: '',
+                attempts: 1,
+                context_missing: false,
+                login_expired: false
+              }});
+            }} catch (error) {{
+              finish({{endpoint: 'page', http_status: 0, body: '', error: String(error && (error.message || error) || '直播页面红包请求失败'), attempts: 1, context_missing: false, login_expired: false}});
+            }}
+          }})();
+        }})();"#,
+        payload = payload,
+        cookie_name = serde_json::to_string(&cookie_name)
+            .unwrap_or_else(|_| "\"fubao_participation_probe\"".into()),
+    );
+    if let Err(error) = webview.eval(&script) {
+        return NativePageParticipationResult {
+            endpoint: "page".into(),
+            http_status: 0,
+            body: String::new(),
+            error: format!("启动直播页面红包请求失败：{error}"),
+            attempts: 0,
+            context_missing: false,
+            login_expired: false,
+        };
+    }
+    for _ in 0..100 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let cookies = match webview.cookies() {
+            Ok(cookies) => cookies,
+            Err(_) => continue,
+        };
+        let Some(encoded) = cookies
+            .iter()
+            .find(|cookie| cookie.name() == cookie_name)
+            .map(|cookie| cookie.value().to_string())
+        else {
+            continue;
+        };
+        let _ = webview.eval(&format!(
+            "document.cookie={};",
+            serde_json::to_string(&format!(
+                "{cookie_name}=; Path=/; Secure; SameSite=None; Max-Age=0"
+            ))
+            .unwrap_or_else(|_| "\"\"".into())
+        ));
+        let decoded = match decode_hex_utf8(&encoded) {
+            Ok(value) => value,
+            Err(error) => return NativePageParticipationResult::context_missing(error),
+        };
+        let value: Value = match serde_json::from_str(&decoded) {
+            Ok(value) => value,
+            Err(error) => {
+                return NativePageParticipationResult::context_missing(format!(
+                    "解析直播页面红包结果失败：{error}"
+                ))
+            }
+        };
+        return NativePageParticipationResult {
+            endpoint: value
+                .get("endpoint")
+                .and_then(Value::as_str)
+                .unwrap_or("page")
+                .to_string(),
+            http_status: value
+                .get("http_status")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            body: value
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            error: value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            attempts: value.get("attempts").and_then(Value::as_i64).unwrap_or(1),
+            context_missing: value
+                .get("context_missing")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            login_expired: value
+                .get("login_expired")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        };
+    }
+    NativePageParticipationResult {
+        endpoint: "page".into(),
+        http_status: 0,
+        body: String::new(),
+        error: "等待直播页面红包接口响应超时".into(),
+        attempts: 1,
+        context_missing: false,
+        login_expired: false,
+    }
+}
+
+async fn handle_page_participation_task(
+    app: tauri::AppHandle,
+    runtime: Arc<EngineRuntime>,
+    task: NativePageParticipationTask,
+) {
+    let result = if task.account_id.trim().is_empty()
+        || !valid_live_room_id(&task.web_rid)
+        || task.actual_room_id.trim().is_empty()
+        || task.box_id.trim().is_empty()
+    {
+        NativePageParticipationResult::context_missing("红包参与任务缺少直播间参数")
+    } else if let Some(webview) = browser_webview_for_instance(&app, &task.instance_id) {
+        match navigate_browser_to_live_room(&webview, &task.web_rid).await {
+            Ok(()) => match inspect_douyin_login(&webview).await {
+                Ok(snapshot) if snapshot.state == BrowserLoginState::LoggedOut => {
+                    NativePageParticipationResult::login_expired("CK 已失效：直播页面要求重新登录")
+                }
+                Ok(snapshot) if snapshot.state == BrowserLoginState::LoggedIn => {
+                    execute_page_participation(&webview, &task).await
+                }
+                Ok(_) => NativePageParticipationResult::context_missing(
+                    "直播页面尚未完成加载，请稍后重试",
+                ),
+                Err(error) => NativePageParticipationResult::context_missing(error),
+            },
+            Err(error) => NativePageParticipationResult::context_missing(error),
+        }
+    } else {
+        NativePageParticipationResult::context_missing("浏览器实例页面未挂载，请先点击卡片红包图标")
+    };
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "[redpacket-page] task={} instance={} endpoint={} http={} attempts={} context_missing={} login_expired={} error={}",
+            task.task_id.chars().take(8).collect::<String>(),
+            task.instance_id,
+            result.endpoint,
+            result.http_status,
+            result.attempts,
+            result.context_missing,
+            result.login_expired,
+            if result.error.is_empty() { "none" } else { "present" },
+        );
+    }
+    let _ = native_engine_request(
+        runtime.clone(),
+        "red_packet_participation.native_complete",
+        json!({
+            "task_id": task.task_id,
+            "endpoint": result.endpoint,
+            "http_status": result.http_status,
+            "body": result.body,
+            "error": result.error,
+            "attempts": result.attempts,
+            "context_missing": result.context_missing,
+            "login_expired": result.login_expired,
+            "secret": runtime.native_secret,
+        }),
+    )
+    .await;
+}
+
+async fn poll_page_participation_tasks(app: tauri::AppHandle, runtime: Arc<EngineRuntime>) {
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    while runtime.online.load(Ordering::SeqCst) {
+        let has_prepared_context = runtime
+            .browser_red_packet_contexts
+            .lock()
+            .map(|contexts| !contexts.is_empty())
+            .unwrap_or(false);
+        if !has_prepared_context {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        let next = native_engine_request(
+            runtime.clone(),
+            "red_packet_participation.native_next",
+            json!({"secret": runtime.native_secret}),
+        )
+        .await;
+        match next {
+            Ok(value) if !value.is_null() => {
+                if let Ok(task) = serde_json::from_value::<NativePageParticipationTask>(value) {
+                    let task_app = app.clone();
+                    let task_runtime = runtime.clone();
+                    tauri::async_runtime::spawn(async move {
+                        handle_page_participation_task(task_app, task_runtime, task).await;
+                    });
+                }
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
+            _ => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+}
+
 fn build_login_webview(label: String) -> WebviewBuilder<tauri::Wry> {
     let blank_url = "about:blank".parse().expect("about:blank must parse");
     WebviewBuilder::new(label, WebviewUrl::External(blank_url))
@@ -414,6 +936,7 @@ fn build_login_webview(label: String) -> WebviewBuilder<tauri::Wry> {
 #[tauri::command]
 async fn open_account_rebind(
     app: tauri::AppHandle,
+    window: tauri::Window,
     runtime: tauri::State<'_, Arc<EngineRuntime>>,
     account_id: String,
     bounds: BrowserBounds,
@@ -422,7 +945,7 @@ async fn open_account_rebind(
     if account_id.is_empty() {
         return Err("账号标识不能为空".into());
     }
-    let label = rebind_webview_label(&account_id);
+    let label = rebind_webview_label(&account_id, window.label());
     if let Some(webview) = app.get_webview(&label) {
         webview
             .set_position(LogicalPosition::new(bounds.x, bounds.y))
@@ -482,8 +1005,7 @@ async fn open_account_rebind(
             .map_err(|error| format!("创建登录数据目录失败：{error}"))?;
         builder = builder.data_directory(data_dir);
     }
-    let main_window = app.get_window("main").ok_or("主窗口不存在")?;
-    let webview = main_window
+    let webview = window
         .add_child(
             builder,
             LogicalPosition::new(bounds.x, bounds.y),
@@ -493,7 +1015,7 @@ async fn open_account_rebind(
     if !credential.cookie.trim().is_empty() {
         inject_douyin_cookie(&webview, &credential.cookie)?;
     }
-    let douyin_url = "https://www.douyin.com/"
+    let douyin_url: Url = "https://www.douyin.com/"
         .parse()
         .map_err(|error| format!("解析抖音地址失败：{error}"))?;
     webview
@@ -509,11 +1031,12 @@ async fn open_account_rebind(
 #[tauri::command]
 fn sync_account_rebind(
     app: tauri::AppHandle,
+    window: tauri::Window,
     account_id: String,
     bounds: BrowserBounds,
 ) -> Result<(), String> {
     let webview = app
-        .get_webview(&rebind_webview_label(account_id.trim()))
+        .get_webview(&rebind_webview_label(account_id.trim(), window.label()))
         .ok_or("登录页面尚未创建")?;
     webview
         .set_position(LogicalPosition::new(bounds.x, bounds.y))
@@ -529,11 +1052,12 @@ fn sync_account_rebind(
 #[tauri::command]
 async fn complete_account_rebind(
     app: tauri::AppHandle,
+    window: tauri::Window,
     runtime: tauri::State<'_, Arc<EngineRuntime>>,
     account_id: String,
 ) -> Result<(), String> {
     let account_id = account_id.trim().to_string();
-    let label = rebind_webview_label(&account_id);
+    let label = rebind_webview_label(&account_id, window.label());
     let webview = app
         .get_webview(&label)
         .ok_or("登录页面已关闭，请重新打开")?;
@@ -555,8 +1079,13 @@ async fn complete_account_rebind(
 }
 
 #[tauri::command]
-fn cancel_account_rebind(app: tauri::AppHandle, account_id: String) -> Result<(), String> {
-    if let Some(webview) = app.get_webview(&rebind_webview_label(account_id.trim())) {
+fn cancel_account_rebind(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    account_id: String,
+) -> Result<(), String> {
+    if let Some(webview) = app.get_webview(&rebind_webview_label(account_id.trim(), window.label()))
+    {
         webview
             .hide()
             .map_err(|error| format!("隐藏登录页面失败：{error}"))?;
@@ -568,6 +1097,7 @@ fn cancel_account_rebind(app: tauri::AppHandle, account_id: String) -> Result<()
 #[tauri::command]
 fn open_account_create(
     app: tauri::AppHandle,
+    window: tauri::Window,
     session_id: String,
     bounds: BrowserBounds,
 ) -> Result<String, String> {
@@ -575,7 +1105,7 @@ fn open_account_create(
     if session_id.is_empty() {
         return Err("登录会话标识不能为空".into());
     }
-    let label = create_account_webview_label(&session_id);
+    let label = create_account_webview_label(&session_id, window.label());
     if let Some(webview) = app.get_webview(&label) {
         webview
             .set_position(LogicalPosition::new(bounds.x, bounds.y))
@@ -610,8 +1140,7 @@ fn open_account_create(
             .map_err(|error| format!("创建登录数据目录失败：{error}"))?;
         builder = builder.data_directory(data_dir);
     }
-    let main_window = app.get_window("main").ok_or("主窗口不存在")?;
-    let webview = main_window
+    let webview = window
         .add_child(
             builder,
             LogicalPosition::new(bounds.x, bounds.y),
@@ -633,11 +1162,15 @@ fn open_account_create(
 #[tauri::command]
 fn sync_account_create(
     app: tauri::AppHandle,
+    window: tauri::Window,
     session_id: String,
     bounds: BrowserBounds,
 ) -> Result<(), String> {
     let webview = app
-        .get_webview(&create_account_webview_label(session_id.trim()))
+        .get_webview(&create_account_webview_label(
+            session_id.trim(),
+            window.label(),
+        ))
         .ok_or("登录页面尚未创建")?;
     webview
         .set_position(LogicalPosition::new(bounds.x, bounds.y))
@@ -653,11 +1186,12 @@ fn sync_account_create(
 #[tauri::command]
 async fn complete_account_create(
     app: tauri::AppHandle,
+    window: tauri::Window,
     runtime: tauri::State<'_, Arc<EngineRuntime>>,
     session_id: String,
     role: String,
 ) -> Result<Value, String> {
-    let label = create_account_webview_label(session_id.trim());
+    let label = create_account_webview_label(session_id.trim(), window.label());
     let webview = app
         .get_webview(&label)
         .ok_or("登录页面已关闭，请重新打开")?;
@@ -677,8 +1211,15 @@ async fn complete_account_create(
 }
 
 #[tauri::command]
-fn cancel_account_create(app: tauri::AppHandle, session_id: String) -> Result<(), String> {
-    if let Some(webview) = app.get_webview(&create_account_webview_label(session_id.trim())) {
+fn cancel_account_create(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    session_id: String,
+) -> Result<(), String> {
+    if let Some(webview) = app.get_webview(&create_account_webview_label(
+        session_id.trim(),
+        window.label(),
+    )) {
         webview
             .hide()
             .map_err(|error| format!("隐藏登录页面失败：{error}"))?;
@@ -781,11 +1322,12 @@ fn browser_restore_location(runtime: &EngineRuntime, instance_id: &str) -> Url {
 #[tauri::command]
 async fn mount_browser_webview(
     app: tauri::AppHandle,
+    window: tauri::Window,
     runtime: tauri::State<'_, Arc<EngineRuntime>>,
     instance_id: String,
     bounds: BrowserBounds,
 ) -> Result<String, String> {
-    let label = browser_webview_label(&instance_id);
+    let label = browser_webview_label(&instance_id, window.label());
     if let Some(webview) = app.get_webview(&label) {
         apply_browser_bounds(&webview, &bounds)?;
         return Ok(label);
@@ -807,7 +1349,6 @@ async fn mount_browser_webview(
         return Err("浏览器实例凭据不匹配".into());
     }
 
-    let main_window = app.get_window("main").ok_or("主窗口不存在")?;
     let blank_url = "about:blank"
         .parse()
         .map_err(|error| format!("初始化浏览器地址失败：{error}"))?;
@@ -876,7 +1417,7 @@ async fn mount_browser_webview(
         builder = builder.data_directory(data_dir);
     }
 
-    let webview = main_window
+    let webview = window
         .add_child(
             builder,
             // Create the native surface outside the visible window first. A
@@ -924,11 +1465,12 @@ async fn mount_browser_webview(
 #[tauri::command]
 fn sync_browser_webview(
     app: tauri::AppHandle,
+    window: tauri::Window,
     instance_id: String,
     bounds: BrowserBounds,
     reveal: bool,
 ) -> Result<(), String> {
-    let label = browser_webview_label(&instance_id);
+    let label = browser_webview_label(&instance_id, window.label());
     let webview = app.get_webview(&label).ok_or("嵌入浏览器尚未创建")?;
     // Geometry synchronization must not reveal an initial white native
     // surface. Once the frontend has observed the first page-load event,
@@ -943,8 +1485,12 @@ fn sync_browser_webview(
 }
 
 #[tauri::command]
-fn hide_browser_webview(app: tauri::AppHandle, instance_id: String) -> Result<(), String> {
-    let label = browser_webview_label(&instance_id);
+fn hide_browser_webview(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    instance_id: String,
+) -> Result<(), String> {
+    let label = browser_webview_label(&instance_id, window.label());
     if let Some(webview) = app.get_webview(&label) {
         webview
             .hide()
@@ -956,10 +1502,11 @@ fn hide_browser_webview(app: tauri::AppHandle, instance_id: String) -> Result<()
 #[tauri::command]
 fn close_browser_webview(
     app: tauri::AppHandle,
+    window: tauri::Window,
     runtime: tauri::State<'_, Arc<EngineRuntime>>,
     instance_id: String,
 ) -> Result<(), String> {
-    let label = browser_webview_label(&instance_id);
+    let label = browser_webview_label(&instance_id, window.label());
     if let Some(webview) = app.get_webview(&label) {
         // Douyin is a SPA, so its current address can change without a full
         // page-load callback. Snapshot the live native URL immediately before
@@ -973,6 +1520,93 @@ fn close_browser_webview(
             .close()
             .map_err(|error| format!("关闭嵌入浏览器失败：{error}"))?;
     }
+    if let Ok(mut contexts) = runtime.browser_red_packet_contexts.lock() {
+        contexts.remove(&instance_id);
+    }
+    let runtime = runtime.inner().clone();
+    let closed_instance_id = instance_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let _ = native_engine_request(
+            runtime.clone(),
+            "red_packet_participation.native_context",
+            json!({
+                "instance_id": closed_instance_id,
+                "ready": false,
+                "secret": runtime.native_secret,
+            }),
+        )
+        .await;
+    });
+    Ok(())
+}
+
+#[tauri::command]
+async fn prepare_browser_red_packet_context(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    runtime: tauri::State<'_, Arc<EngineRuntime>>,
+    instance_id: String,
+    web_rid: String,
+    result_only: Option<bool>,
+) -> Result<String, String> {
+    let instance_id = instance_id.trim().to_string();
+    let web_rid = web_rid.trim().to_string();
+    let label = browser_webview_label(&instance_id, window.label());
+    let webview = app
+        .get_webview(&label)
+        .ok_or("浏览器实例页面尚未就绪，请等待卡片加载完成后重试")?;
+    navigate_browser_to_live_room(&webview, &web_rid).await?;
+    let snapshot = inspect_douyin_login(&webview).await?;
+    match snapshot.state {
+        BrowserLoginState::LoggedIn => {}
+        BrowserLoginState::LoggedOut => return Err("当前实例尚未登录，请先重新绑定 CK".into()),
+        BrowserLoginState::Unknown => return Err("直播页面尚未完成加载，请稍后重试".into()),
+    }
+    let runtime = runtime.inner().clone();
+    native_engine_request(
+        runtime.clone(),
+        "red_packet_participation.native_context",
+        json!({
+            "instance_id": instance_id,
+            "ready": true,
+            "result_only": result_only.unwrap_or(false),
+            "secret": runtime.native_secret,
+        }),
+    )
+    .await?;
+    runtime
+        .browser_red_packet_contexts
+        .lock()
+        .map_err(|_| "红包页面上下文状态锁不可用")?
+        .insert(instance_id);
+    Ok(format!("https://live.douyin.com/{web_rid}"))
+}
+
+#[tauri::command]
+async fn stop_browser_red_packet_context(
+    runtime: tauri::State<'_, Arc<EngineRuntime>>,
+    instance_id: String,
+) -> Result<(), String> {
+    let instance_id = instance_id.trim().to_string();
+    if instance_id.is_empty() {
+        return Err("浏览器实例参数无效".into());
+    }
+    let runtime = runtime.inner().clone();
+    native_engine_request(
+        runtime.clone(),
+        "red_packet_participation.native_context",
+        json!({
+            "instance_id": instance_id,
+            "ready": false,
+            "secret": runtime.native_secret,
+        }),
+    )
+    .await?;
+    runtime
+        .browser_red_packet_contexts
+        .lock()
+        .map_err(|_| "红包页面上下文状态锁不可用")?
+        .remove(&instance_id);
     Ok(())
 }
 
@@ -982,12 +1616,12 @@ async fn refresh_browser_account_cookie(
     runtime: tauri::State<'_, Arc<EngineRuntime>>,
     instance_id: String,
 ) -> Result<(), String> {
-    let label = browser_webview_label(&instance_id);
-    let Some(webview) = app.get_webview(&label) else {
+    let webviews = browser_webviews_for_instance(&app, &instance_id);
+    if webviews.is_empty() {
         // An unmounted instance receives the latest canonical Cookie during
         // its next mount, so there is nothing to refresh now.
         return Ok(());
-    };
+    }
     let runtime = runtime.inner().clone();
     let result = native_engine_request(
         runtime.clone(),
@@ -1000,24 +1634,31 @@ async fn refresh_browser_account_cookie(
     .await?;
     let credential: NativeBrowserCredential =
         serde_json::from_value(result).map_err(|error| format!("解析浏览器凭据失败：{error}"))?;
-    inject_douyin_cookie(&webview, &credential.cookie)?;
-    let douyin_url = "https://www.douyin.com/"
+    let douyin_url: Url = "https://www.douyin.com/"
         .parse()
         .map_err(|error| format!("解析抖音地址失败：{error}"))?;
-    webview
-        .navigate(douyin_url)
-        .map_err(|error| format!("刷新账号登录状态失败：{error}"))
+    for webview in webviews {
+        inject_douyin_cookie(&webview, &credential.cookie)?;
+        webview
+            .navigate(douyin_url.clone())
+            .map_err(|error| format!("刷新账号登录状态失败：{error}"))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
 async fn sync_browser_account_cookie(
     app: tauri::AppHandle,
+    window: tauri::Window,
     runtime: tauri::State<'_, Arc<EngineRuntime>>,
     instance_id: String,
     require_logged_in: Option<bool>,
 ) -> Result<bool, String> {
-    let label = browser_webview_label(&instance_id);
-    let Some(webview) = app.get_webview(&label) else {
+    let label = browser_webview_label(&instance_id, window.label());
+    let Some(webview) = app
+        .get_webview(&label)
+        .or_else(|| browser_webview_for_instance(&app, &instance_id))
+    else {
         if require_logged_in.unwrap_or(false) {
             return Err("当前卡片登录页面尚未就绪，请等待卡片加载完成后重试".into());
         }
@@ -1238,6 +1879,51 @@ async fn open_monitor_log(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn open_page_window(app: tauri::AppHandle, view: String) -> Result<(), String> {
+    let view = view.trim();
+    let title = match view {
+        "browsers" => "浏览器实例",
+        "accounts" => "账号与直播间",
+        _ => return Err("不支持在新窗口打开该页面".into()),
+    };
+    let label = format!("page-{view}");
+    if let Some(window) = app.get_webview_window(&label) {
+        window
+            .show()
+            .map_err(|error| format!("显示页面窗口失败：{error}"))?;
+        let _ = window.unminimize();
+        window
+            .set_focus()
+            .map_err(|error| format!("聚焦页面窗口失败：{error}"))?;
+        return Ok(());
+    }
+
+    let route = format!("index.html?window=page&view={view}");
+    let mut builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(route.into()))
+        .title(format!("福宝控制台 · {title}"))
+        .inner_size(1080.0, 720.0)
+        .min_inner_size(680.0, 500.0)
+        .resizable(true)
+        .decorations(true)
+        .center()
+        .focused(true);
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder
+            .title_bar_style(tauri::TitleBarStyle::Overlay)
+            .hidden_title(true)
+            .traffic_light_position(LogicalPosition::new(15.0, 20.0))
+            .background_color(tauri::webview::Color(255, 255, 255, 255));
+    }
+
+    builder
+        .build()
+        .map(|_| ())
+        .map_err(|error| format!("打开页面窗口失败：{error}"))
+}
+
+#[tauri::command]
 fn open_live_room(app: tauri::AppHandle, web_rid: String) -> Result<(), String> {
     let web_rid = web_rid.trim();
     if !(6..=24).contains(&web_rid.len())
@@ -1273,6 +1959,7 @@ pub fn run() {
             if let Err(error) = start_engine(app.handle().clone(), runtime) {
                 eprintln!("{error}");
             }
+            setup_system_tray(app.handle())?;
             #[cfg(debug_assertions)]
             if std::env::var("FUBAO_OPEN_DEVTOOLS").as_deref() == Ok("1") {
                 if let Some(window) = app.get_webview_window("main") {
@@ -1280,6 +1967,14 @@ pub fn run() {
                 }
             }
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() == "main" {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             engine_status,
@@ -1290,6 +1985,7 @@ pub fn run() {
             frontend_log,
             refresh_window_surface,
             open_monitor_log,
+            open_page_window,
             open_live_room,
             close_monitor_log,
             check_app_update,
@@ -1299,6 +1995,8 @@ pub fn run() {
             sync_browser_webview,
             hide_browser_webview,
             close_browser_webview,
+            prepare_browser_red_packet_context,
+            stop_browser_red_packet_context,
             refresh_browser_account_cookie,
             sync_browser_account_cookie,
             open_account_rebind,
@@ -1310,6 +2008,11 @@ pub fn run() {
             complete_account_create,
             cancel_account_create
         ])
-        .run(tauri::generate_context!())
-        .expect("福宝控制台启动失败");
+        .build(tauri::generate_context!())
+        .expect("福宝控制台初始化失败")
+        .run(|app, event| match event {
+            RunEvent::Reopen { .. } => show_main_window(app),
+            RunEvent::Exit => stop_engine(app),
+            _ => {}
+        });
 }

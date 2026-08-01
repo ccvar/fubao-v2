@@ -87,13 +87,18 @@ func main() {
 		roomStore, roomStoreErr = rooms.NewStore(dataDir)
 	}
 	var redPacketStore *redpacket.Store
+	var redPacketParticipant *redpacket.Participant
+	var pageParticipation *pageParticipationBroker
 	redPacketStoreErr := dataDirErr
 	if redPacketStoreErr == nil {
 		redPacketStore, redPacketStoreErr = redpacket.NewStore(dataDir)
 	}
 	if redPacketStoreErr == nil && accountStoreErr == nil {
 		redPacketStore.SetRequestRecorder(accountStore.RecordMonitoringRequest)
-		redPacketParticipant := redpacket.NewParticipant(accountStore, redPacketStore)
+	}
+	if redPacketStoreErr == nil && accountStoreErr == nil && browserStoreErr == nil {
+		pageParticipation = newPageParticipationBroker(browserStore)
+		redPacketParticipant = redpacket.NewPageParticipant(accountStore, pageParticipation, redPacketStore)
 		redPacketStore.SetEventHandler(redPacketParticipant.HandleEvent)
 	}
 	var licenseManager *license.Manager
@@ -798,6 +803,188 @@ func main() {
 				continue
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.ParticipationRecords()})
+		case "red_packet_participation.settings":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.GetParticipationSettings()})
+		case "red_packet_participation.set_settings":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			var params redpacket.ParticipationSettings
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "红包参与设置参数无效")
+				continue
+			}
+			result, err := redPacketStore.SetParticipationSettings(params)
+			if err != nil {
+				writeError(encoder, req.ID, "red_packet_settings_failed", err.Error())
+				continue
+			}
+			if pageParticipation != nil && browserStoreErr == nil {
+				for _, instance := range browserStore.List() {
+					state := redPacketStore.GetParticipationState(instance.AccountID, time.Now())
+					if state.Stopped && len(redPacketStore.PendingDraws(instance.AccountID)) == 0 {
+						_ = redPacketStore.FinishParticipationTask(instance.AccountID, state.StopReason)
+						pageParticipation.StopAccount(instance.AccountID)
+					}
+				}
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
+		case "red_packet_participation.contexts":
+			if redPacketStoreErr != nil || browserStoreErr != nil || pageParticipation == nil {
+				writeError(encoder, req.ID, "participation_unavailable", "红包参与状态不可用")
+				continue
+			}
+			prepared := map[string]bool{}
+			for _, context := range pageParticipation.Contexts() {
+				prepared[context.InstanceID] = true
+			}
+			states := make([]map[string]any, 0)
+			for _, instance := range browserStore.List() {
+				state := redPacketStore.GetParticipationState(instance.AccountID, time.Now())
+				pendingDraws := redPacketStore.PendingDraws(instance.AccountID)
+				pendingWebRID := ""
+				if len(pendingDraws) > 0 {
+					pendingWebRID = pendingDraws[0].WebRID
+				}
+				states = append(states, map[string]any{
+					"instance_id": instance.ID, "account_id": instance.AccountID,
+					"prepared": prepared[instance.ID], "accepting": prepared[instance.ID] && state.Active && !state.Stopped,
+					"active": state.Active, "task_id": state.TaskID,
+					"stopped": state.Stopped, "stop_reason": state.StopReason,
+					"waiting_draw": state.WaitingDraw, "waiting_reason": state.WaitingReason,
+					"pending_draw_count": len(pendingDraws), "pending_result_web_rid": pendingWebRID,
+					"cooldown_until": state.CooldownUntil,
+					"join_count":     state.JoinCount, "win_count": state.WinCount,
+				})
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: states})
+		case "activity.list":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.Activities()})
+		case "red_packet_participation.native_context":
+			var params struct {
+				InstanceID string `json:"instance_id"`
+				Ready      bool   `json:"ready"`
+				ResultOnly bool   `json:"result_only"`
+				Secret     string `json:"secret"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.InstanceID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "浏览器红包参与上下文参数无效")
+				continue
+			}
+			if strings.TrimSpace(params.Secret) == "" || params.Secret != strings.TrimSpace(os.Getenv("FUBAO_NATIVE_RPC_SECRET")) {
+				writeError(encoder, req.ID, "forbidden", "原生请求认证失败")
+				continue
+			}
+			if pageParticipation == nil || redPacketParticipant == nil {
+				writeError(encoder, req.ID, "participation_unavailable", "红包页面参与器不可用")
+				continue
+			}
+			accountID, err := browserStore.AccountID(params.InstanceID)
+			if err != nil {
+				writeError(encoder, req.ID, "participation_context_failed", err.Error())
+				continue
+			}
+			accountName := "参与账号"
+			if accountStoreErr == nil {
+				for _, account := range accountStore.List(accounts.RoleParticipation) {
+					if account.ID == accountID {
+						accountName = strings.TrimSpace(account.Nickname)
+						if accountName == "" {
+							accountName = strings.TrimSpace(account.Name)
+						}
+						break
+					}
+				}
+			}
+			if params.Ready && !params.ResultOnly {
+				if err := redPacketStore.RecordParticipationStarted(accountID, accountName); err != nil {
+					writeError(encoder, req.ID, "participation_task_start_failed", err.Error())
+					continue
+				}
+			}
+			accountID, err = pageParticipation.SetContext(params.InstanceID, params.Ready)
+			if err != nil {
+				if params.Ready && !params.ResultOnly {
+					_ = redPacketStore.FinishParticipationTask(accountID, "启动失败")
+				}
+				writeError(encoder, req.ID, "participation_context_failed", err.Error())
+				continue
+			}
+			if !params.Ready {
+				_ = redPacketStore.FinishParticipationTask(accountID, "手动停止")
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{
+				"account_id": accountID, "instance_id": params.InstanceID, "ready": params.Ready,
+			}})
+			if params.Ready && redPacketStore != nil {
+				// Explicit preparation should immediately retry current, unexpired
+				// events that previously failed outside a page context.
+				if !params.ResultOnly {
+					for _, item := range redPacketStore.EventsAll() {
+						expiresAt, parseErr := time.Parse(time.RFC3339Nano, item.ExpiresAt)
+						if parseErr == nil && time.Now().Before(expiresAt) {
+							redPacketParticipant.RetryEventForAccount(item, accountID)
+						}
+					}
+				}
+				redPacketParticipant.ResolvePendingDraws(accountID)
+			}
+		case "red_packet_participation.native_next":
+			var params struct {
+				Secret string `json:"secret"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.Secret) == "" || params.Secret != strings.TrimSpace(os.Getenv("FUBAO_NATIVE_RPC_SECRET")) {
+				writeError(encoder, req.ID, "forbidden", "原生请求认证失败")
+				continue
+			}
+			if pageParticipation == nil {
+				_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: nil})
+				continue
+			}
+			task, ok := pageParticipation.Next()
+			if !ok {
+				_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: nil})
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: task})
+		case "red_packet_participation.native_complete":
+			var params struct {
+				TaskID         string `json:"task_id"`
+				Endpoint       string `json:"endpoint"`
+				HTTPStatus     int    `json:"http_status"`
+				Body           string `json:"body"`
+				Error          string `json:"error"`
+				Attempts       int    `json:"attempts"`
+				ContextMissing bool   `json:"context_missing"`
+				LoginExpired   bool   `json:"login_expired"`
+				Secret         string `json:"secret"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.TaskID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "原生红包参与结果参数无效")
+				continue
+			}
+			if strings.TrimSpace(params.Secret) == "" || params.Secret != strings.TrimSpace(os.Getenv("FUBAO_NATIVE_RPC_SECRET")) {
+				writeError(encoder, req.ID, "forbidden", "原生请求认证失败")
+				continue
+			}
+			if pageParticipation == nil || !pageParticipation.Complete(params.TaskID, redpacket.PageParticipationResponse{
+				Endpoint: params.Endpoint, HTTPStatus: params.HTTPStatus, Body: params.Body,
+				Error: params.Error, Attempts: params.Attempts,
+				ContextMissing: params.ContextMissing, LoginExpired: params.LoginExpired,
+			}) {
+				writeError(encoder, req.ID, "participation_task_missing", "原生红包参与任务已结束或不存在")
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{"completed": true}})
 		case "red_packet_monitor.start_all":
 			if accountStoreErr != nil {
 				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())

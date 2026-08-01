@@ -127,6 +127,93 @@
 
 final result: passed
 
+## Browser title CPU and memory usage
+
+### Evidence
+
+- Source visual truth: `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-9435e317-61c2-469e-ae6e-8207bf192a1f.png` (1558 × 1000 px).
+- Browser-rendered implementation: `.design-qa/implementation-browser-resource-usage.png` (1247 × 1000 px at 1× density).
+- Same-input comparison: `.design-qa/compare-browser-resource-usage.png` (both captures proportionally normalized to a 720 px maximum content height and placed side by side).
+- Requested viewport: 1558 × 1000 CSS px; the in-app Browser surface exposed a 1247 × 1000 CSS-pixel content viewport after application chrome.
+- State: desktop “浏览器实例” page with the compact title subtitle visible. The source contains native child WebViews while the browser-rendered capture has the preview empty state, so fidelity judgment is intentionally scoped to the title strip requested in this change.
+
+### Full-view and focused comparison
+
+- The CPU and memory readout occupies the marked position immediately after “本机运行” without increasing the 60 px top-bar height or displacing the right toolbar.
+- The new text keeps the existing 10.5 px subtitle typography, muted token, six-pixel rhythm, and single-line hierarchy; no new panel, badge, icon, or decorative asset was introduced.
+- At the 760 px minimum-width check, the top bar reported equal `scrollWidth` and `clientWidth` (540 px), so the resource text does not create horizontal overflow.
+- A focused DOM/style check confirmed the resource label uses the shared dark Tooltip surface (`rgb(48, 46, 42)`) with white text for detailed memory usage.
+
+### Native data and interaction verification
+
+- The rebuilt Go sidecar returned a real local snapshot over `browser.capacity`: CPU `19.58%`, 64 GiB total memory, 25.13 GiB available memory, and normal pressure during validation.
+- Existing two-second browser-capacity polling refreshes both percentages without adding a second frontend timer.
+- The Tauri development client rebuilt and launched on this project's strict port 1437 with the updated sidecar.
+- Primary interaction tested: selecting “浏览器实例” renders the resource label in the title strip.
+- Browser console inspection found only the expected missing-Tauri-bridge error in the standalone browser preview; the actual Tauri launch log mounted without frontend errors.
+
+### Required fidelity surfaces
+
+- Typography: existing system font, subtitle size, line height, weight, and muted hierarchy are preserved.
+- Spacing and layout: the readout follows the same inline separator rhythm and introduces no title-bar height or toolbar-position change.
+- Colors and tokens: existing muted subtitle color and shared dark Tooltip colors are reused.
+- Image and icon quality: no new image asset or replacement icon is required for this text-only status addition.
+- Copy and content: concise `CPU N% · 内存 N%` copy matches the requested resource semantics; the Tooltip adds exact used/total memory without crowding the title.
+
+### Comparison history and findings
+
+- Initial comparison found no actionable P0, P1, or P2 difference in the requested title-strip region, so no visual-fix iteration was required.
+- No P3 follow-up remains for this scoped change.
+
+final result: passed
+
+## Windows sidebar-toggle Tooltip clipping follow-up
+
+- Source reference: `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-c8f8b43d-6d69-4b50-a55d-9a35f7f76a92.png`.
+- Implementation capture: `.design-qa/windows-sidebar-toggle-tooltip-left.png`.
+- State: Windows layout override, expanded sidebar, toggle focused/hover-help visible.
+
+### Requested refinement
+
+- The expanded Windows sidebar toggle keeps its right-edge position.
+- Its shared Tooltip now opens to the left, fully inside the sidebar, instead of crossing the sidebar/content clipping boundary.
+- macOS keeps the right-opening Tooltip and the collapsed toggle keeps the below placement.
+
+### Verification
+
+- The simulated Windows shell exposes `data-tooltip-placement="left"` on the unique “收起侧栏” control.
+- The toggle remains 10 px inside the 252 px sidebar's right edge and the complete help label is visible on the sidebar side of the control.
+- No page-title or navigation displacement is introduced.
+
+### Findings
+
+- No actionable P0, P1, or P2 issues remain for the reported Tooltip clipping.
+
+final result: passed
+
+## Diamond red-packet icon and live monitoring workload subtitle
+
+- Source references:
+  - `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-0efe2dfe-a94e-4efa-9a98-b11eea56abc8.png`.
+  - `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-990b4c05-8cbd-4cfd-b825-f902349059a5.png`.
+- Native implementation capture: `/tmp/fubao-current.png` (1180 × 760 CSS px / 2360 × 1520 Retina px).
+
+### Requested refinements
+
+- “钻石红包” rows use Phosphor’s compact faceted gemstone glyph (`SketchLogoIcon`); gift and other red-packet rows retain the gift glyph.
+- The “账号与直播间” subtitle reports the live runtime workload as `x 个房间正在监测`; the 直播间 tab badge continues to show the total canonical room count.
+
+### Verification
+
+- The native development client displays `1 个红包 · 0 个房间正在监测 · 6 个参与 · 99 个监测` in the title subtitle.
+- `npm run check`, `npm run build`, and all four `npm run test:sites` cases pass.
+
+### Findings
+
+- No actionable P0, P1, or P2 issue remains for the requested icon differentiation or runtime subtitle.
+
+final result: passed
+
 ## Windows sidebar-toggle edge alignment
 
 - Source reference: `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-7660d8fb-721f-41ce-a95d-783010c90261.png`.
@@ -354,5 +441,83 @@ final result: passed
 ### Findings
 
 - No actionable P0, P1, or P2 issues remain for the requested scaling, spacing, compact action, or tooltip visibility changes.
+
+final result: passed
+
+## Sidebar data overview and recent activity
+
+### Evidence
+
+- Source visual truth: `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-806c4ea6-aa3b-4116-be7b-377bfeed6df3.png` (650 × 1512 px).
+- Browser-rendered implementation: `.design-qa/implementation-sidebar-recent-activity.png` (1111 × 720 px at 1× browser density).
+- Focused same-input comparison: `.design-qa/compare-sidebar-recent-activity.png`.
+- Density normalization: the source sidebar crop was 440 × 1512 px and the implementation sidebar crop was 282 × 720 px; both were proportionally normalized to 300 px wide before side-by-side comparison.
+- State: desktop “监测总览” page with the expanded sidebar, fixed workspace footer, real overview counters, and four local sample activity entries.
+
+### Full-view and focused comparison
+
+- The former “最近活动” counter block is renamed “数据概览” without changing its compact row anatomy, colors, click targets, or live values.
+- A separate “最近活动” heading begins in the marked empty region and uses the same icon-and-copy row language, with a smaller muted relative time on the second line.
+- The activity section owns the flexible vertical area while the footer remains fixed: at the 720 px validation viewport, the footer ended exactly at y=720 and the activity section occupied the remaining 337 px without overflow.
+- Four sample rows provide realistic future event shapes while keeping the reference sidebar's quiet spacing and leaving breathing room above the footer.
+
+### Interaction and console verification
+
+- Clicking “发现 2 个新红包” navigated to the unique “红包任务” page heading; returning through “监测总览” also succeeded.
+- All rows remain keyboard-addressable buttons with accessible names containing event copy and relative time.
+- Browser console inspection found only the expected standalone-preview missing-Tauri-bridge surface message; no component rendering or interaction error was present.
+
+### Required fidelity surfaces
+
+- Typography: existing system font, 11 px section labels, 12 px row copy, and muted 9.5 px timestamps preserve the established hierarchy and truncation behavior.
+- Spacing and layout: overview rows remain dense; activity rows use a compact 40 px two-line rhythm and the footer stays permanently visible.
+- Colors and tokens: existing neutral, green-live, hover, sidebar, and divider tokens are reused without introducing a new palette.
+- Image and icon quality: all activity glyphs come from the project's existing Phosphor icon set; no raster placeholder, emoji, or improvised SVG was added.
+- Copy and content: “数据概览” and “最近活动” match the requested terminology; sample copy is clearly local implementation data ready to be replaced by a real event source.
+
+### Comparison history and findings
+
+- The initial same-input comparison found no actionable P0, P1, or P2 mismatch in the requested sidebar region, so no visual-fix iteration was required.
+- No P3 follow-up remains for this scoped structure change.
+
+final result: passed
+
+## Red-packet participation settings and activity source
+
+### Evidence
+
+- Source visual truth: `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-cf766612-ced5-45d5-bfa1-b2eab652ddbb.png` (2402 × 1566 px), specifically the compact footer gear and fixed sidebar footer.
+- Supporting activity reference: `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-7dbe5e4b-67cf-488b-9721-3f169d689435.png` (650 × 1260 px), specifically the recent-activity row anatomy.
+- Browser-rendered implementation: `.design-qa/implementation-participation-settings-latest.jpg` (1111 × 720 px, CSS viewport 1111 × 720 at 1× density).
+- Density normalization: the source is a roughly 2.16× higher-density desktop capture with a nearly identical aspect ratio; comparison used the full source and implementation together, then judged the footer/sidebar and centered modal as focused regions rather than treating native browser-card content as a fidelity target.
+- State: current browser-instances page, expanded sidebar, footer gear activated, “红包参与设置” dialog open with all values at their safe default of zero.
+
+### Full-view and focused comparison
+
+- The footer remains fixed at the bottom of the expanded sidebar and the compact gear stays in the reference position; the edition badge continues to own license management.
+- The new dialog follows the existing product modal system: quiet white surface, compact Phosphor gift icon, restrained coral accent, three dense setting rows, 30 px footer actions, and a softly blurred backdrop.
+- The three numeric controls retain the exact requested semantics and unit labels without adding a separate settings route or heavy configuration page.
+- The existing recent-activity structure is unchanged visually; real `participation_started` records use the same icon, copy, timestamp, and navigation anatomy as the prior sample rows.
+
+### Interaction and runtime verification
+
+- The footer button exposes the accessible name and shared tooltip “红包参与设置”; the edition badge still exposes “授权管理”.
+- Entering `5 / 30 / 2`, saving, and reopening preserved the values in the interactive preview; the native Go RPC was separately exercised against a temporary store and returned the same values after a process restart.
+- The current Tauri development client was rebuilt and restarted on strict port 1437. Its live runtime mounted the current project’s child WebViews without a frontend or sidecar crash.
+- Browser snapshot inspection found no component rendering error in the dialog state.
+
+### Required fidelity surfaces
+
+- Typography: existing system font and product weights are retained; 12 px setting labels and 9.5–10 px descriptions preserve the compact hierarchy.
+- Spacing and layout: three 62 px rows, 18 px modal padding, 11 px grouped radius, and 30 px actions match the established desktop density.
+- Colors and tokens: existing neutral borders/backgrounds plus the product coral gift accent are reused; no new competing palette was introduced.
+- Image and icon quality: the existing Phosphor gift and close icons are used; no placeholder, emoji, CSS drawing, or handcrafted SVG was added.
+- Copy and content: labels, descriptions, zero-as-unlimited guidance, and unit suffixes directly match the requested participation-stop, cooldown, and win-stop behavior.
+
+### Comparison history and findings
+
+- The first implementation capture exposed a standalone-preview native-bridge error inside the dialog. The preview path was corrected to keep local values functional while the desktop path continues to use the Go RPC.
+- The post-fix capture contains no actionable P0, P1, or P2 issue in the requested footer control, modal, or recent-activity structure.
+- P3/expected difference: the source screenshot does not specify a modal appearance, so the implementation intentionally reuses the project’s existing modal anatomy rather than inventing a new visual language.
 
 final result: passed

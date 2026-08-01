@@ -581,6 +581,20 @@ func (s *Store) AccountID(instanceID string) (string, error) {
 	return instance.AccountID, nil
 }
 
+// InstanceForAccount resolves the one stable browser instance owned by a
+// participation account without exposing any profile or credential data.
+func (s *Store) InstanceForAccount(accountID string) (Instance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	accountID = strings.TrimSpace(accountID)
+	for _, instance := range s.instances {
+		if instance.AccountID == accountID {
+			return s.decorateInstanceLocked(instance), nil
+		}
+	}
+	return Instance{}, errors.New("参与账号尚未创建浏览器实例")
+}
+
 func (s *Store) markStopped(instanceID string, pid int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

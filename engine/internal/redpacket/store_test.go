@@ -59,6 +59,9 @@ func TestParticipationRecordPersistsAndDeduplicates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := store.RecordParticipationStarted("account-1", "参与账号甲"); err != nil {
+		t.Fatal(err)
+	}
 	event := Event{
 		ID: "monitor:event-record", RoomID: "room-1", WebRID: "123456",
 		RoomName: "记录直播间", StreamerName: "主播甲",
@@ -71,7 +74,7 @@ func TestParticipationRecordPersistsAndDeduplicates(t *testing.T) {
 	if duplicate, err := store.ReserveParticipation(event, "account-1", "参与账号甲"); err != nil || duplicate {
 		t.Fatalf("same account/event must be deduplicated: reserved=%v err=%v", duplicate, err)
 	}
-	if err := store.CompleteParticipation(event.ID, "account-1", "rush", "already_joined", "红包已受理", 2, true, time.Minute); err != nil {
+	if err := store.CompleteParticipation(event.ID, "account-1", "rush", "already_joined", "红包已受理", 2, true, false, time.Minute); err != nil {
 		t.Fatal(err)
 	}
 
@@ -91,6 +94,173 @@ func TestParticipationRecordPersistsAndDeduplicates(t *testing.T) {
 		if strings.Contains(string(encoded), forbidden) {
 			t.Fatalf("safe participation records leaked %q: %s", forbidden, encoded)
 		}
+	}
+}
+
+func TestParticipationSettingsPolicyAndActivityPersist(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, err := store.SetParticipationSettings(ParticipationSettings{
+		StopAfterJoins: 2, CooldownSeconds: 30, StopAfterWins: 1,
+	})
+	if err != nil || settings.CooldownSeconds != 30 {
+		t.Fatalf("unexpected saved settings: %+v err=%v", settings, err)
+	}
+	if err := store.RecordParticipationStarted("account-1", "账号甲"); err != nil {
+		t.Fatal(err)
+	}
+	event := Event{ID: "event-1", RoomID: "room", WebRID: "123456", JoinBoxID: "123"}
+	if ok, err := store.ReserveParticipation(event, "account-1", "账号甲"); err != nil || !ok {
+		t.Fatalf("reserve: ok=%v err=%v", ok, err)
+	}
+	if err := store.CompleteParticipation(event.ID, "account-1", "join", "joined", "已受理", 1, true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, _ := store.ParticipationPolicy("account-1", time.Now()); allowed {
+		t.Fatal("an unresolved accepted packet must block the next task")
+	}
+	store.mu.Lock()
+	store.participations[participationRecordID("account-1", event.ID)].JoinedAt = time.Now().Add(-time.Minute).Format(time.RFC3339Nano)
+	store.participations[participationRecordID("account-1", event.ID)].UpdatedAt = time.Now().Add(-time.Minute).Format(time.RFC3339Nano)
+	store.mu.Unlock()
+	if state := store.GetParticipationState("account-1", time.Now()); !state.WaitingDraw || state.WaitingReason == "" {
+		t.Fatalf("pending personal result must be exposed as a safe temporary block: %+v", state)
+	}
+	if _, err := store.ResolveParticipationDraw(event.ID, "account-1", "not_won", "未中奖", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, cooldown := store.ParticipationPolicy("account-1", time.Now()); !allowed || cooldown != 30*time.Second {
+		t.Fatalf("expected account after cooldown to remain eligible: allowed=%v cooldown=%v", allowed, cooldown)
+	}
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.GetParticipationSettings(); got != settings {
+		t.Fatalf("settings did not persist: got=%+v want=%+v", got, settings)
+	}
+	activities := reloaded.Activities()
+	if len(activities) != 1 || activities[0].Kind != "participation_started" || !strings.Contains(activities[0].Label, "账号甲") {
+		t.Fatalf("unexpected persisted activity: %+v", activities)
+	}
+}
+
+func TestParticipationPolicyStopsAtJoinAndWinLimits(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = store.SetParticipationSettings(ParticipationSettings{StopAfterJoins: 1})
+	_ = store.RecordParticipationStarted("account", "账号")
+	taskID := store.participationTasks["account"].ID
+	store.participations["joined"] = &ParticipationRecord{ID: "joined", AccountID: "account", TaskID: taskID, Joined: true, UpdatedAt: time.Now().Add(-time.Hour).Format(time.RFC3339Nano)}
+	if allowed, _ := store.ParticipationPolicy("account", time.Now()); allowed {
+		t.Fatal("join limit must stop future tasks")
+	}
+	store.settings = ParticipationSettings{StopAfterWins: 1}
+	store.participations["joined"].Won = true
+	if allowed, _ := store.ParticipationPolicy("account", time.Now()); allowed {
+		t.Fatal("win limit must stop future tasks")
+	}
+	if err := store.FinishParticipationTask("account", "本次任务达到上限"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordParticipationStarted("account", "账号"); err != nil {
+		t.Fatal(err)
+	}
+	state := store.GetParticipationState("account", time.Now())
+	if !state.Active || state.JoinCount != 0 || state.WinCount != 0 {
+		t.Fatalf("a new explicit start must create a fresh task: %+v", state)
+	}
+	if allowed, _ := store.ParticipationPolicy("account", time.Now()); !allowed {
+		t.Fatal("historical task counts must not block the next start")
+	}
+}
+
+func TestParticipationStateExplainsStopAndDrawResultPersists(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetParticipationSettings(ParticipationSettings{StopAfterJoins: 2, StopAfterWins: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordParticipationStarted("account", "账号甲"); err != nil {
+		t.Fatal(err)
+	}
+	for index, eventID := range []string{"event-a", "event-b"} {
+		event := Event{
+			ID: eventID, RoomID: "room", WebRID: "123456", ActualRoomID: "700001",
+			JoinBoxID: "box-" + eventID, DrawAt: time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+		}
+		if reserved, reserveErr := store.ReserveParticipation(event, "account", "账号甲"); reserveErr != nil || !reserved {
+			t.Fatalf("reserve %d: reserved=%v err=%v", index, reserved, reserveErr)
+		}
+		if err := store.CompleteParticipation(event.ID, "account", "join", "joined", "已受理，等待开奖", 1, true, false, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state := store.GetParticipationState("account", time.Now())
+	if !state.Stopped || state.JoinCount != 2 || !strings.Contains(state.StopReason, "2 次") {
+		t.Fatalf("join stop state must be safe and explanatory: %+v", state)
+	}
+	pending := store.PendingDraws("account")
+	if len(pending) != 2 || pending[0].ActualRoomID == "" || pending[0].DrawAt == "" {
+		t.Fatalf("pending draw metadata was not retained: %+v", pending)
+	}
+	newWin, err := store.ResolveParticipationDraw("event-a", "account", "won", "已中8钻", "8钻", 1)
+	if err != nil || !newWin {
+		t.Fatalf("resolve win: new=%v err=%v", newWin, err)
+	}
+	if duplicateWin, err := store.ResolveParticipationDraw("event-a", "account", "won", "已中8钻", "8钻", 1); err != nil || duplicateWin {
+		t.Fatalf("draw resolution must be idempotent: new=%v err=%v", duplicateWin, err)
+	}
+	if _, err := store.ResolveParticipationDraw("event-b", "account", "not_won", "未中奖", "", 1); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := reloaded.ParticipationRecords()
+	if len(records) != 2 || records[0].Endpoint != "receive" || records[1].Endpoint != "receive" {
+		t.Fatalf("draw results did not persist: %+v", records)
+	}
+	foundWin, foundLoss := false, false
+	for _, record := range records {
+		foundWin = foundWin || record.Status == "won" && record.Award == "8钻" && record.Won
+		foundLoss = foundLoss || record.Status == "not_won" && !record.Won
+	}
+	if !foundWin || !foundLoss {
+		t.Fatalf("expected one real win and one loss: %+v", records)
+	}
+}
+
+func TestPendingDrawBackfillsLegacyNativeMetadata(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.participationTasks["account"] = &ParticipationTask{ID: "task-current", AccountID: "account", Active: true, StartedAt: time.Now().Format(time.RFC3339Nano)}
+	store.monitors["room_123456"] = &Monitor{ID: "room_123456", WebRID: "123456", ActualRoomID: "700001"}
+	store.events["room_123456:event"] = &Event{
+		ID: "room_123456:event", MonitorID: "room_123456", WebRID: "123456",
+		PacketID: "activity", ExpiresAt: "2026-08-01T23:30:00+08:00",
+	}
+	store.participations[participationRecordID("account", "room_123456:event")] = &ParticipationRecord{
+		ID: participationRecordID("account", "room_123456:event"), EventID: "room_123456:event",
+		AccountID: "account", TaskID: "task-current", PacketID: "7669063194534955828", Joined: true, Status: "joined",
+	}
+	store.mu.Unlock()
+	pending := store.PendingDraws("account")
+	if len(pending) != 1 || pending[0].ActualRoomID != "700001" || pending[0].JoinBoxID != "7669063194534955828" || pending[0].ExpiresAt == "" {
+		t.Fatalf("legacy accepted result cannot be resumed safely: %+v", pending)
 	}
 }
 
@@ -193,6 +363,31 @@ func TestAggregateLuckyboxItemsMatchesFubaoPrizeRule(t *testing.T) {
 	}
 }
 
+func TestExtractRedPacketKeepsActivityForGroupingButUsesNumericBoxForParticipation(t *testing.T) {
+	packet, ok := extractRedPacket(map[string]any{
+		"activity_id":   "AC202509231602294103473098",
+		"activity_kind": "red_packet",
+		"title":         "钻石红包",
+		"items": []any{
+			map[string]any{
+				"box_id_str": "7641414053302127375",
+				"box_type":   1,
+				"send_time":  1760000000,
+				"delay_time": 60,
+			},
+		},
+	})
+	if !ok {
+		t.Fatal("expected explicit red packet payload")
+	}
+	if packet.id != "AC202509231602294103473098" {
+		t.Fatalf("activity grouping id changed unexpectedly: %q", packet.id)
+	}
+	if packet.boxID != "7641414053302127375" {
+		t.Fatalf("participation must prefer numeric box_id_str, got %q", packet.boxID)
+	}
+}
+
 func TestAggregateLuckyboxItemsReadsShareCountFromBizExtraTags(t *testing.T) {
 	items := aggregateLuckyboxItems([]any{
 		map[string]any{
@@ -273,7 +468,7 @@ func TestPollOnceFetchesRedPacketsOnlyAfterPositiveLiveProbe(t *testing.T) {
 	source := &fakeMonitorSource{
 		probe: LiveProbe{Status: "live", RawStatus: "2", ActualRoomID: "7000000000000000002", Title: "正在直播", StreamerName: "主播甲", Source: "room_web_enter"},
 		snapshots: []poller.Snapshot{{Source: "luckybox_api", Data: map[string]any{
-			"activity_kind": "red_packet", "red_packet_id": "packet-2", "title": "直播红包",
+			"activity_kind": "red_packet", "red_packet_id": "7669047909329177395", "title": "直播红包",
 			"prize_name": "8钻红包", "expire_time": 1767225600,
 			"anchor_id": "anchor-2", "box_type": 1, "send_time": 1767225500, "delay_time": 100,
 		}}},
@@ -294,7 +489,7 @@ func TestPollOnceFetchesRedPacketsOnlyAfterPositiveLiveProbe(t *testing.T) {
 	}
 	select {
 	case event := <-handled:
-		if event.ActualRoomID != "7000000000000000002" || event.JoinBoxID != "packet-2" || event.AnchorID != "anchor-2" || event.BoxType != "1" || event.SendTime == "" || event.DelayTime != "100" {
+		if event.ActualRoomID != "7000000000000000002" || event.JoinBoxID != "7669047909329177395" || event.AnchorID != "anchor-2" || event.BoxType != "1" || event.SendTime == "" || event.DelayTime != "100" {
 			t.Fatalf("event handler did not receive private join metadata: %+v", event)
 		}
 	case <-time.After(time.Second):
