@@ -24,16 +24,16 @@ jobs:
             os: macos-15
             target: universal-apple-darwin
             rust_targets: aarch64-apple-darwin x86_64-apple-darwin
+            bundles: dmg
             artifact: fubao-macos-universal
             bundle_path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
           - label: Windows x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             rust_targets: x86_64-pc-windows-msvc
+            bundles: nsis
             artifact: fubao-windows-x64
-            bundle_path: |
-              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
-              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+            bundle_path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
 
     steps:
       - name: Checkout source
@@ -71,7 +71,7 @@ jobs:
       - name: Build desktop client
         env:
           TAURI_ENV_TARGET_TRIPLE: ${{ matrix.target }}
-        run: npm run tauri build -- --target ${{ matrix.target }}
+        run: npm run tauri build -- --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
