@@ -409,32 +409,50 @@ fn shell_quote(value: &str) -> String {
 
 #[cfg(target_os = "windows")]
 fn launch_installer(_app: &AppHandle, package: &DownloadedPackage) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let helper_dir = std::env::temp_dir().join("fubao-console-updater");
     std::fs::create_dir_all(&helper_dir).map_err(|error| format!("准备升级程序失败：{error}"))?;
     let script_path = helper_dir.join(format!("install-{}.ps1", std::process::id()));
-    let script = format!(
-        r#"$ErrorActionPreference = 'Stop'
-$installer = {installer}
-$pidToWait = {pid}
-try {{ Wait-Process -Id $pidToWait -Timeout 90 -ErrorAction SilentlyContinue }} catch {{}}
-Start-Process -FilePath $installer
-"#,
-        installer = powershell_quote(&package.path.to_string_lossy()),
-        pid = std::process::id(),
-    );
+    let script = windows_installer_script(&package.path, std::process::id());
     std::fs::write(&script_path, script).map_err(|error| format!("写入升级程序失败：{error}"))?;
-    Command::new("powershell")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+    let mut helper = Command::new("powershell");
+    helper
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+        ])
         .arg(script_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .map_err(|error| format!("启动升级程序失败：{error}"))?;
     Ok(())
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", test))]
+fn windows_installer_script(installer: &Path, pid: u32) -> String {
+    format!(
+        r#"$ErrorActionPreference = 'Stop'
+$installer = {installer}
+$pidToWait = {pid}
+try {{ Wait-Process -Id $pidToWait -Timeout 90 -ErrorAction SilentlyContinue }} catch {{}}
+$arguments = @('/P', '/R', '/UPDATE')
+$process = Start-Process -FilePath $installer -ArgumentList $arguments -PassThru -Wait
+exit $process.ExitCode
+"#,
+        installer = powershell_quote(&installer.to_string_lossy()),
+    )
+}
+
+#[cfg(any(target_os = "windows", test))]
 fn powershell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -464,5 +482,13 @@ mod tests {
             size: 1,
         };
         assert!(validate_package(&package).is_err());
+    }
+
+    #[test]
+    fn windows_update_uses_tauri_nsis_update_mode() {
+        let script = windows_installer_script(Path::new("C:\\Temp\\福宝 setup.exe"), 42);
+        assert!(script.contains("@('/P', '/R', '/UPDATE')"));
+        assert!(script.contains("Wait-Process -Id $pidToWait"));
+        assert!(script.contains("-PassThru -Wait"));
     }
 }
