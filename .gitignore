@@ -1,0 +1,8 @@
+node_modules/
+.cache/
+dist/
+src-tauri/target/
+src-tauri/binaries/fubao-engine-*
+.DS_Store
+design-qa-artifacts/
+.design-qa/

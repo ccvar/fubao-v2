@@ -1,0 +1,873 @@
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"runtime"
+	"strings"
+	"time"
+
+	"fubao.ccvar.com/engine/internal/accounts"
+	"fubao.ccvar.com/engine/internal/browsers"
+	"fubao.ccvar.com/engine/internal/license"
+	"fubao.ccvar.com/engine/internal/redpacket"
+	"fubao.ccvar.com/engine/internal/rooms"
+)
+
+const protocolVersion = 1
+
+type request struct {
+	Version int             `json:"v"`
+	ID      string          `json:"id"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+}
+
+type response struct {
+	Version int       `json:"v"`
+	ID      string    `json:"id,omitempty"`
+	OK      bool      `json:"ok"`
+	Result  any       `json:"result,omitempty"`
+	Error   *rpcError `json:"error,omitempty"`
+}
+
+type rpcError struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
+
+type event struct {
+	Version int    `json:"v"`
+	Event   string `json:"event"`
+	Seq     uint64 `json:"seq"`
+	Data    any    `json:"data"`
+}
+
+type engineStatus struct {
+	Name       string `json:"name"`
+	Version    string `json:"version"`
+	GoVersion  string `json:"go_version"`
+	Platform   string `json:"platform"`
+	StartedAt  string `json:"started_at"`
+	Protocol   int    `json:"protocol"`
+	MonitorRun int    `json:"monitor_running"`
+}
+
+func main() {
+	startedAt := time.Now()
+	encoder := json.NewEncoder(os.Stdout)
+	encoder.SetEscapeHTML(false)
+	accountStore, accountStoreErr := accounts.NewStore("")
+	dataDir, dataDirErr := accounts.DefaultDataDir()
+	var browserStore *browsers.Store
+	browserStoreErr := dataDirErr
+	if browserStoreErr == nil {
+		browserStore, browserStoreErr = browsers.NewStore(dataDir)
+	}
+	if browserStoreErr == nil && accountStoreErr == nil {
+		browserStore.SetCookieUpdater(func(accountID, rawCookie string) error {
+			if _, err := accountStore.ReplaceCookie(accountID, rawCookie); err != nil {
+				return err
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+			defer cancel()
+			_, err := accountStore.ValidateCookie(ctx, accountID, true)
+			return err
+		})
+	}
+	var roomStore *rooms.Store
+	roomStoreErr := dataDirErr
+	if roomStoreErr == nil {
+		roomStore, roomStoreErr = rooms.NewStore(dataDir)
+	}
+	var redPacketStore *redpacket.Store
+	redPacketStoreErr := dataDirErr
+	if redPacketStoreErr == nil {
+		redPacketStore, redPacketStoreErr = redpacket.NewStore(dataDir)
+	}
+	if redPacketStoreErr == nil && accountStoreErr == nil {
+		redPacketStore.SetRequestRecorder(accountStore.RecordMonitoringRequest)
+	}
+	var licenseManager *license.Manager
+	licenseManagerErr := dataDirErr
+	if licenseManagerErr == nil {
+		licenseManager, licenseManagerErr = license.New(dataDir, "0.1.0", license.Config{})
+	}
+
+	_ = encoder.Encode(event{
+		Version: protocolVersion,
+		Event:   "engine.ready",
+		Seq:     1,
+		Data: engineStatus{
+			Name:      "fubao-engine",
+			Version:   "0.1.0",
+			GoVersion: runtime.Version(),
+			Platform:  runtime.GOOS + "/" + runtime.GOARCH,
+			StartedAt: startedAt.Format(time.RFC3339),
+			Protocol:  protocolVersion,
+		},
+	})
+
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 64*1024), 2*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		var req request
+		if err := json.Unmarshal([]byte(line), &req); err != nil {
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				OK:      false,
+				Error:   &rpcError{Code: "invalid_json", Message: "请求不是有效 JSON"},
+			})
+			continue
+		}
+
+		if req.Version != protocolVersion {
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      false,
+				Error:   &rpcError{Code: "protocol_mismatch", Message: "IPC 协议版本不兼容"},
+			})
+			continue
+		}
+
+		switch req.Method {
+		case "system.ping":
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result:  map[string]any{"pong": true, "at": time.Now().Format(time.RFC3339Nano)},
+			})
+		case "engine.status":
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result: engineStatus{
+					Name:      "fubao-engine",
+					Version:   "0.1.0",
+					GoVersion: runtime.Version(),
+					Platform:  runtime.GOOS + "/" + runtime.GOARCH,
+					StartedAt: startedAt.Format(time.RFC3339),
+					Protocol:  protocolVersion,
+				},
+			})
+		case "license.status":
+			if licenseManagerErr != nil {
+				writeError(encoder, req.ID, "license_unavailable", licenseManagerErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: licenseManager.Status()})
+		case "license.activate":
+			if licenseManagerErr != nil {
+				writeError(encoder, req.ID, "license_unavailable", licenseManagerErr.Error())
+				continue
+			}
+			var params struct {
+				LicenseKey  string `json:"license_key"`
+				MachineName string `json:"machine_name"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "激活参数无效")
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			result := licenseManager.Activate(ctx, params.LicenseKey, params.MachineName)
+			cancel()
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
+		case "license.refresh":
+			if licenseManagerErr != nil {
+				writeError(encoder, req.ID, "license_unavailable", licenseManagerErr.Error())
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			result := licenseManager.Refresh(ctx)
+			cancel()
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
+		case "license.deactivate":
+			if licenseManagerErr != nil {
+				writeError(encoder, req.ID, "license_unavailable", licenseManagerErr.Error())
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			result := licenseManager.Deactivate(ctx)
+			cancel()
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
+		case "account.list":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			var params struct {
+				Role accounts.Role `json:"role"`
+			}
+			if len(req.Params) > 0 {
+				if err := json.Unmarshal(req.Params, &params); err != nil {
+					writeError(encoder, req.ID, "invalid_params", "账号列表参数无效")
+					continue
+				}
+			}
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result:  accountStore.List(params.Role),
+			})
+		case "account.migrate_legacy":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			var params struct {
+				LegacyDir string `json:"legacy_dir"`
+			}
+			if len(req.Params) > 0 {
+				if err := json.Unmarshal(req.Params, &params); err != nil {
+					writeError(encoder, req.ID, "invalid_params", "迁移参数无效")
+					continue
+				}
+			}
+			result, err := accountStore.MigrateLegacy(params.LegacyDir)
+			if err != nil {
+				writeError(encoder, req.ID, "legacy_migration_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result:  result,
+			})
+		case "account.add_role":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			var params struct {
+				AccountID string        `json:"account_id"`
+				Role      accounts.Role `json:"role"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "账号分类参数无效")
+				continue
+			}
+			result, err := accountStore.AddRole(params.AccountID, params.Role)
+			if err != nil {
+				writeError(encoder, req.ID, "account_role_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result:  result,
+			})
+		case "account.remove_role":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			var params struct {
+				AccountID string        `json:"account_id"`
+				Role      accounts.Role `json:"role"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "账号分类参数无效")
+				continue
+			}
+			result, err := accountStore.RemoveRole(params.AccountID, params.Role)
+			if err != nil {
+				writeError(encoder, req.ID, "account_role_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result:  result,
+			})
+		case "account.delete":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			var params struct {
+				AccountID string `json:"account_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "删除账号参数无效")
+				continue
+			}
+			if err := accountStore.Delete(params.AccountID); err != nil {
+				writeError(encoder, req.ID, "account_delete_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result:  map[string]bool{"deleted": true},
+			})
+		case "account.validate_cookie":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			var params struct {
+				AccountID string        `json:"account_id"`
+				Role      accounts.Role `json:"role"`
+				Force     bool          `json:"force"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.AccountID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "CK 校验参数无效")
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+			if params.Role == "" {
+				params.Role = accounts.RoleParticipation
+			}
+			result, err := accountStore.ValidateCookieForRole(ctx, params.AccountID, params.Role, params.Force)
+			cancel()
+			if err != nil {
+				writeError(encoder, req.ID, "cookie_validation_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
+		case "account.native_credential":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			var params struct {
+				AccountID string `json:"account_id"`
+				Secret    string `json:"secret"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.AccountID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "原生账号凭据参数无效")
+				continue
+			}
+			nativeSecret := strings.TrimSpace(os.Getenv("FUBAO_NATIVE_RPC_SECRET"))
+			if nativeSecret == "" || params.Secret != nativeSecret {
+				writeError(encoder, req.ID, "native_auth_failed", "原生账号凭据请求未授权")
+				continue
+			}
+			credential, err := accountStore.Credential(params.AccountID)
+			if err != nil {
+				writeError(encoder, req.ID, "account_credential_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]string{
+				"account_id": credential.AccountID, "account_name": credential.AccountName, "cookie": credential.Cookie,
+			}})
+		case "account.native_replace_cookie":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			var params struct {
+				AccountID string `json:"account_id"`
+				Cookie    string `json:"cookie"`
+				Secret    string `json:"secret"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.AccountID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "更新账号 CK 参数无效")
+				continue
+			}
+			nativeSecret := strings.TrimSpace(os.Getenv("FUBAO_NATIVE_RPC_SECRET"))
+			if nativeSecret == "" || params.Secret != nativeSecret {
+				writeError(encoder, req.ID, "native_auth_failed", "更新账号 CK 请求未授权")
+				continue
+			}
+			account, err := accountStore.ReplaceCookie(params.AccountID, params.Cookie)
+			if err != nil {
+				writeError(encoder, req.ID, "account_cookie_update_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: account})
+		case "account.native_set_browser_login_state":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			var params struct {
+				AccountID string `json:"account_id"`
+				LoggedIn  bool   `json:"logged_in"`
+				Secret    string `json:"secret"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.AccountID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "同步浏览器登录状态参数无效")
+				continue
+			}
+			nativeSecret := strings.TrimSpace(os.Getenv("FUBAO_NATIVE_RPC_SECRET"))
+			if nativeSecret == "" || params.Secret != nativeSecret {
+				writeError(encoder, req.ID, "native_auth_failed", "同步浏览器登录状态请求未授权")
+				continue
+			}
+			account, err := accountStore.SetBrowserLoginState(params.AccountID, params.LoggedIn)
+			if err != nil {
+				writeError(encoder, req.ID, "account_login_state_update_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: account})
+		case "account.native_create_from_cookie":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			var params struct {
+				Cookie string        `json:"cookie"`
+				Role   accounts.Role `json:"role"`
+				Secret string        `json:"secret"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.Cookie) == "" {
+				writeError(encoder, req.ID, "invalid_params", "新增扫码账号参数无效")
+				continue
+			}
+			nativeSecret := strings.TrimSpace(os.Getenv("FUBAO_NATIVE_RPC_SECRET"))
+			if nativeSecret == "" || params.Secret != nativeSecret {
+				writeError(encoder, req.ID, "native_auth_failed", "新增扫码账号请求未授权")
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			identity, err := accounts.ResolveDouyinIdentity(ctx, params.Cookie)
+			cancel()
+			if err != nil {
+				writeError(encoder, req.ID, "account_identity_failed", err.Error())
+				continue
+			}
+			account, created, err := accountStore.UpsertAuthenticatedCookie(params.Cookie, identity.Nickname, identity.UserID, identity.SecUID, params.Role)
+			if err != nil {
+				writeError(encoder, req.ID, "account_create_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{"account": account, "created": created}})
+		case "browser.list":
+			if browserStoreErr != nil {
+				writeError(encoder, req.ID, "browser_store_unavailable", browserStoreErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result:  browserStore.List(),
+			})
+		case "browser.capacity":
+			if browserStoreErr != nil {
+				writeError(encoder, req.ID, "browser_store_unavailable", browserStoreErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: browserStore.Capacity()})
+		case "browser.runtime.acquire":
+			if browserStoreErr != nil {
+				writeError(encoder, req.ID, "browser_store_unavailable", browserStoreErr.Error())
+				continue
+			}
+			var params struct {
+				InstanceID string `json:"instance_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "实例运行槽参数无效")
+				continue
+			}
+			admission, err := browserStore.AcquireEmbedded(params.InstanceID)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_runtime_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: admission})
+		case "browser.runtime.release":
+			if browserStoreErr != nil {
+				writeError(encoder, req.ID, "browser_store_unavailable", browserStoreErr.Error())
+				continue
+			}
+			var params struct {
+				InstanceID string `json:"instance_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "释放实例运行槽参数无效")
+				continue
+			}
+			capacity, err := browserStore.ReleaseEmbedded(params.InstanceID)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_runtime_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: capacity})
+		case "browser.create":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			if browserStoreErr != nil {
+				writeError(encoder, req.ID, "browser_store_unavailable", browserStoreErr.Error())
+				continue
+			}
+			var params struct {
+				AccountID string `json:"account_id"`
+				Name      string `json:"name"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "创建浏览器实例参数无效")
+				continue
+			}
+			credential, err := accountStore.ParticipationCredential(params.AccountID)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_account_invalid", err.Error())
+				continue
+			}
+			instance, err := browserStore.Create(credential.AccountID, credential.AccountName, params.Name)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_create_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result:  instance,
+			})
+		case "browser.open":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			if browserStoreErr != nil {
+				writeError(encoder, req.ID, "browser_store_unavailable", browserStoreErr.Error())
+				continue
+			}
+			var params struct {
+				InstanceID string `json:"instance_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "打开浏览器实例参数无效")
+				continue
+			}
+			accountID, err := browserStore.AccountID(params.InstanceID)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_open_failed", err.Error())
+				continue
+			}
+			credential, err := accountStore.ParticipationCredential(accountID)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_account_invalid", err.Error())
+				continue
+			}
+			instance, err := browserStore.Open(params.InstanceID, credential.Cookie)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_open_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result:  instance,
+			})
+		case "browser.close":
+			if browserStoreErr != nil {
+				writeError(encoder, req.ID, "browser_store_unavailable", browserStoreErr.Error())
+				continue
+			}
+			var params struct {
+				InstanceID string `json:"instance_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "关闭浏览器实例参数无效")
+				continue
+			}
+			instance, err := browserStore.Close(params.InstanceID)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_close_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: instance})
+		case "browser.native_credential":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			if browserStoreErr != nil {
+				writeError(encoder, req.ID, "browser_store_unavailable", browserStoreErr.Error())
+				continue
+			}
+			var params struct {
+				InstanceID string `json:"instance_id"`
+				Secret     string `json:"secret"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "原生浏览器凭据参数无效")
+				continue
+			}
+			nativeSecret := strings.TrimSpace(os.Getenv("FUBAO_NATIVE_RPC_SECRET"))
+			if nativeSecret == "" || params.Secret != nativeSecret {
+				writeError(encoder, req.ID, "native_auth_failed", "原生浏览器凭据请求未授权")
+				continue
+			}
+			accountID, err := browserStore.AccountID(params.InstanceID)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_credential_failed", err.Error())
+				continue
+			}
+			credential, err := accountStore.ParticipationCredential(accountID)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_account_invalid", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result: map[string]string{
+					"instance_id":   params.InstanceID,
+					"account_id":    credential.AccountID,
+					"account_name":  credential.AccountName,
+					"cookie":        credential.Cookie,
+					"cookie_status": credential.CookieStatus,
+				},
+			})
+		case "room.list":
+			if roomStoreErr != nil {
+				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result:  roomStore.List(),
+			})
+		case "room.migrate_legacy":
+			if roomStoreErr != nil {
+				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			var params struct {
+				LegacyDir string `json:"legacy_dir"`
+			}
+			if len(req.Params) > 0 {
+				if err := json.Unmarshal(req.Params, &params); err != nil {
+					writeError(encoder, req.ID, "invalid_params", "直播间迁移参数无效")
+					continue
+				}
+			}
+			result, err := roomStore.MigrateLegacy(params.LegacyDir)
+			if err != nil {
+				writeError(encoder, req.ID, "room_migration_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result:  result,
+			})
+		case "room.import_ids":
+			if roomStoreErr != nil {
+				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			var params struct {
+				IDs string `json:"ids"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.IDs) == "" {
+				writeError(encoder, req.ID, "invalid_params", "直播间导入内容为空")
+				continue
+			}
+			result, err := roomStore.ImportIDs(params.IDs)
+			if err != nil {
+				writeError(encoder, req.ID, "room_import_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
+		case "red_packet_monitor.list":
+			if roomStoreErr != nil {
+				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			if err := redPacketStore.SyncRooms(roomStore.List()); err != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.List()})
+		case "red_packet_monitor.events":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			var params struct {
+				MonitorID string `json:"monitor_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.MonitorID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "红包监测事件参数无效")
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.Events(params.MonitorID)})
+		case "red_packet_event.list":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.EventsAll()})
+		case "red_packet_monitor.start_all":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			if roomStoreErr != nil || redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", "红包监测存储不可用")
+				continue
+			}
+			if err := redPacketStore.SyncRooms(roomStore.List()); err != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", err.Error())
+				continue
+			}
+			monitoring := accountStore.List(accounts.RoleMonitoring)
+			if len(monitoring) == 0 {
+				writeError(encoder, req.ID, "monitor_account_missing", "请先导入或添加监测账号")
+				continue
+			}
+			credential, err := accountStore.MonitoringCredential(monitoring[0].ID)
+			if err != nil {
+				writeError(encoder, req.ID, "monitor_account_invalid", err.Error())
+				continue
+			}
+			started, err := redPacketStore.StartAll(credential.AccountID, credential.AccountName, credential.Cookie)
+			if err != nil {
+				writeError(encoder, req.ID, "red_packet_start_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{
+				"started":      started,
+				"account_id":   credential.AccountID,
+				"account_name": credential.AccountName,
+			}})
+		case "red_packet_monitor.stop_all":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			stopped, err := redPacketStore.StopAll()
+			if err != nil {
+				writeError(encoder, req.ID, "red_packet_stop_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]int{"stopped": stopped}})
+		case "red_packet_monitor.start":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			var params struct {
+				MonitorID string `json:"monitor_id"`
+				AccountID string `json:"account_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.MonitorID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "启动红包监测参数无效")
+				continue
+			}
+			if strings.TrimSpace(params.AccountID) == "" {
+				monitoring := accountStore.List(accounts.RoleMonitoring)
+				if len(monitoring) == 0 {
+					writeError(encoder, req.ID, "monitor_account_missing", "请先导入或添加监测账号")
+					continue
+				}
+				params.AccountID = monitoring[0].ID
+			}
+			credential, err := accountStore.MonitoringCredential(params.AccountID)
+			if err != nil {
+				writeError(encoder, req.ID, "monitor_account_invalid", err.Error())
+				continue
+			}
+			if err := redPacketStore.Start(params.MonitorID, credential.AccountID, credential.AccountName, credential.Cookie); err != nil {
+				writeError(encoder, req.ID, "red_packet_start_failed", err.Error())
+				continue
+			}
+			monitor, ok := redPacketStore.Get(params.MonitorID)
+			if !ok {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", "红包监测状态读取失败")
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{"started": true, "monitor": monitor}})
+		case "red_packet_monitor.stop":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			var params struct {
+				MonitorID string `json:"monitor_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.MonitorID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "停止红包监测参数无效")
+				continue
+			}
+			if err := redPacketStore.Stop(params.MonitorID); err != nil {
+				writeError(encoder, req.ID, "red_packet_stop_failed", err.Error())
+				continue
+			}
+			monitor, ok := redPacketStore.Get(params.MonitorID)
+			if !ok {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", "红包监测状态读取失败")
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{"stopped": true, "monitor": monitor}})
+		case "red_packet_monitor.delete":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			var params struct {
+				MonitorID string `json:"monitor_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.MonitorID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "删除红包监测参数无效")
+				continue
+			}
+			if err := redPacketStore.Delete(params.MonitorID); err != nil {
+				writeError(encoder, req.ID, "red_packet_delete_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]bool{"deleted": true}})
+		default:
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      false,
+				Error: &rpcError{
+					Code:    "method_not_found",
+					Message: fmt.Sprintf("尚未实现方法：%s", req.Method),
+				},
+			})
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "ipc scanner stopped: %v\n", err)
+	}
+}
+
+func writeError(encoder *json.Encoder, id, code, message string) {
+	_ = encoder.Encode(response{
+		Version: protocolVersion,
+		ID:      id,
+		OK:      false,
+		Error:   &rpcError{Code: code, Message: message},
+	})
+}

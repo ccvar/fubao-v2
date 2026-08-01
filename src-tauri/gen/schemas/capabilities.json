@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"福宝桌面客户端默认权限","local":true,"windows":["main","monitor-log"],"permissions":["core:default","core:window:allow-start-dragging","core:event:allow-listen","core:event:allow-emit"]}}
