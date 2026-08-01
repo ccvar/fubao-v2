@@ -15,6 +15,7 @@
     ClockCountdownIcon as ClockCountdown,
     ClipboardTextIcon as ClipboardText,
     DotsThreeIcon as DotsThree,
+    DownloadSimpleIcon as DownloadSimple,
     FileArrowUpIcon as FileArrowUp,
     FolderOpenIcon as FolderOpen,
     GearSixIcon as GearSix,
@@ -59,6 +60,22 @@
   };
 
   type LicenseOperation = { success: boolean; message: string; status: LicenseStatus };
+
+  type UpdateStatus = {
+    current_version: string;
+    latest_version: string;
+    available: boolean;
+    notes: string;
+    force: boolean;
+    filename: string;
+    size: number;
+  };
+
+  type UpdateProgress = {
+    downloaded: number;
+    total: number;
+    percent: number;
+  };
 
   type AccountProfile = {
     enabled: boolean;
@@ -245,7 +262,15 @@
   };
 
   let activeView: NavKey = "overview";
-  let clientVersion = "0.1.0";
+  let clientVersion = __APP_VERSION__;
+  let updateStatus: UpdateStatus | null = null;
+  let updateChecking = false;
+  let updateModalOpen = false;
+  let updateDownloading = false;
+  let updateDownloaded = false;
+  let updateInstalling = false;
+  let updateProgress: UpdateProgress = { downloaded: 0, total: 0, percent: 0 };
+  let updateError = "";
   let licenseStatus: LicenseStatus = {
     state: "inactive",
     edition: "免费版",
@@ -561,6 +586,87 @@
       licenseError = error instanceof Error ? error.message : String(error);
     } finally {
       licenseBusy = false;
+    }
+  }
+
+  function formatFileSize(size: number) {
+    let value = Math.max(0, Number(size) || 0);
+    for (const unit of ["B", "KB", "MB", "GB"]) {
+      if (value < 1024 || unit === "GB") {
+        return unit === "B" ? `${Math.round(value)} ${unit}` : `${value.toFixed(1)} ${unit}`;
+      }
+      value /= 1024;
+    }
+    return `${value.toFixed(1)} GB`;
+  }
+
+  async function checkForAppUpdate(silent = false, openWhenAvailable = false) {
+    if (!isTauriDesktop() || updateChecking) return;
+    updateChecking = true;
+    if (!silent) updateError = "";
+    try {
+      updateStatus = await invoke<UpdateStatus>("check_app_update");
+      if (updateStatus.available) {
+        if (openWhenAvailable) await openUpdateModal();
+      } else if (!silent) {
+        showToast(`当前 v${clientVersion} 已是最新版本`);
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!silent) {
+        updateError = message;
+        showToast(message);
+      }
+    } finally {
+      updateChecking = false;
+    }
+  }
+
+  async function openUpdateModal() {
+    if (!updateStatus?.available) {
+      await checkForAppUpdate(false, true);
+      return;
+    }
+    await hideEmbeddedBrowsers();
+    updateError = "";
+    updateModalOpen = true;
+  }
+
+  function closeUpdateModal() {
+    if (updateDownloading || updateInstalling) return;
+    updateModalOpen = false;
+    scheduleEmbeddedBrowserSync();
+  }
+
+  async function downloadAppUpdate() {
+    if (updateDownloading || updateDownloaded) return;
+    updateDownloading = true;
+    updateError = "";
+    updateProgress = { downloaded: 0, total: updateStatus?.size || 0, percent: 0 };
+    try {
+      await invoke("download_app_update");
+      updateDownloaded = true;
+      updateProgress = {
+        downloaded: updateStatus?.size || updateProgress.downloaded,
+        total: updateStatus?.size || updateProgress.total,
+        percent: 100,
+      };
+    } catch (error) {
+      updateError = error instanceof Error ? error.message : String(error);
+    } finally {
+      updateDownloading = false;
+    }
+  }
+
+  async function installAppUpdate() {
+    if (!updateDownloaded || updateInstalling) return;
+    updateInstalling = true;
+    updateError = "";
+    try {
+      await invoke("install_app_update");
+    } catch (error) {
+      updateInstalling = false;
+      updateError = error instanceof Error ? error.message : String(error);
     }
   }
 
@@ -2048,6 +2154,7 @@
     if (isTauriDesktop()) {
       void getVersion().then((version) => {
         if (version.trim()) clientVersion = version.trim();
+        window.setTimeout(() => void checkForAppUpdate(true), 1200);
       });
     }
     const savedWidth = Number(localStorage.getItem("fubao.sidebarWidth"));
@@ -2062,6 +2169,7 @@
     let unlistenEngine: (() => void) | undefined;
     let unlistenMonitorLogReady: (() => void) | undefined;
     let unlistenMonitorLogClear: (() => void) | undefined;
+    let unlistenUpdateProgress: (() => void) | undefined;
     if ("__TAURI_INTERNALS__" in window) {
       void listen<string>("engine://message", (event) => handleEngineMessage(event.payload))
         .then((unlisten) => {
@@ -2091,6 +2199,11 @@
         void emitMonitorLogState();
       }).then((unlisten) => {
         unlistenMonitorLogClear = unlisten;
+      });
+      void listen<UpdateProgress>("update://progress", (event) => {
+        updateProgress = event.payload;
+      }).then((unlisten) => {
+        unlistenUpdateProgress = unlisten;
       });
     }
 
@@ -2142,6 +2255,7 @@
       unlistenEngine?.();
       unlistenMonitorLogReady?.();
       unlistenMonitorLogClear?.();
+      unlistenUpdateProgress?.();
       for (const pending of pendingRequests.values()) {
         window.clearTimeout(pending.timer);
         pending.reject(new Error("页面已关闭"));
@@ -2215,7 +2329,24 @@
       <span class="brand-copy">
         <strong>福宝控制台</strong>
         <span class="brand-meta">
-          <small>v{clientVersion}</small>
+          <button
+            class:update-available={Boolean(updateStatus?.available)}
+            class="client-version-button"
+            aria-label={updateStatus?.available ? `发现新版本 ${updateStatus.latest_version}` : "检查客户端更新"}
+            data-tooltip={updateChecking ? "正在检查更新…" : updateStatus?.available ? `发现新版本 v${updateStatus.latest_version}` : "点击检查更新"}
+            data-tooltip-placement="top"
+            disabled={updateChecking}
+            onclick={() => void openUpdateModal()}
+          >v{clientVersion}</button>
+          {#if updateStatus?.available}
+            <button
+              class="update-available-badge"
+              aria-label={`升级到 v${updateStatus.latest_version}`}
+              data-tooltip={`升级到 v${updateStatus.latest_version}`}
+              data-tooltip-placement="top"
+              onclick={() => void openUpdateModal()}
+            >可升级</button>
+          {/if}
           <button
             class:professional={licenseStatus.state === "active"}
             class="edition-badge"
@@ -2939,6 +3070,66 @@
     </section>
   </main>
 </div>
+
+{#if updateModalOpen && updateStatus}
+  <div
+    class="modal-backdrop"
+    role="presentation"
+    onclick={(event) => event.currentTarget === event.target && closeUpdateModal()}
+  >
+    <dialog class="modal update-modal" open aria-labelledby="update-modal-title">
+      <div class="modal-head">
+        <div>
+          <span class="modal-icon update-modal-icon"><DownloadSimple size={18} weight="bold" /></span>
+          <h2 id="update-modal-title">软件更新</h2>
+        </div>
+        <button class="icon-button" aria-label="关闭" disabled={updateDownloading || updateInstalling} onclick={closeUpdateModal}><X size={17} /></button>
+      </div>
+
+      <div class="update-version-summary">
+        <span><small>当前版本</small><strong>v{clientVersion}</strong></span>
+        <ArrowClockwise size={15} />
+        <span class="latest"><small>最新版本</small><strong>v{updateStatus.latest_version}</strong></span>
+      </div>
+
+      <div class="update-notes">
+        <small>更新说明</small>
+        <p>{updateStatus.notes || "新版本已准备好，建议升级后继续使用。"}</p>
+      </div>
+
+      {#if updateDownloading || updateDownloaded}
+        <div class="update-progress-block">
+          <div>
+            <span>{updateDownloaded ? "下载完成，安装包校验通过" : "正在下载并校验安装包…"}</span>
+            <strong>{updateProgress.percent}%</strong>
+          </div>
+          <progress max="100" value={updateProgress.percent}></progress>
+          <small>
+            {formatFileSize(updateProgress.downloaded)}
+            {#if updateProgress.total > 0} / {formatFileSize(updateProgress.total)}{/if}
+          </small>
+        </div>
+      {:else}
+        <p class="update-package-meta">安装包 {formatFileSize(updateStatus.size)} · 下载后自动校验完整性</p>
+      {/if}
+
+      {#if updateError}<div class="license-error"><WarningCircle size={14} />{updateError}</div>{/if}
+      <div class="modal-actions">
+        <button class="secondary-button" disabled={updateDownloading || updateInstalling} onclick={closeUpdateModal}>稍后更新</button>
+        {#if updateDownloaded}
+          <button class="primary-action" disabled={updateInstalling} onclick={installAppUpdate}>
+            <ArrowClockwise class={updateInstalling ? "spinning" : undefined} size={14} />
+            {updateInstalling ? "正在启动…" : "安装并重启"}
+          </button>
+        {:else}
+          <button class="primary-action" disabled={updateDownloading} onclick={downloadAppUpdate}>
+            <DownloadSimple size={14} />{updateDownloading ? `下载中 ${updateProgress.percent}%` : "立即升级"}
+          </button>
+        {/if}
+      </div>
+    </dialog>
+  </div>
+{/if}
 
 {#if licenseModalOpen}
   <div

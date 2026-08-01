@@ -21,6 +21,9 @@ use tauri_plugin_shell::{
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
+mod updater;
+use updater::{check_app_update, download_app_update, install_app_update, UpdaterRuntime};
+
 struct EngineRuntime {
     child: Mutex<Option<CommandChild>>,
     online: AtomicBool,
@@ -1091,6 +1094,7 @@ pub fn run() {
         .setup(|app| {
             let runtime = Arc::new(EngineRuntime::default());
             app.manage(runtime.clone());
+            app.manage(Arc::new(UpdaterRuntime::default()));
             if let Err(error) = start_engine(app.handle().clone(), runtime) {
                 eprintln!("{error}");
             }
@@ -1113,6 +1117,9 @@ pub fn run() {
             open_monitor_log,
             open_live_room,
             close_monitor_log,
+            check_app_update,
+            download_app_update,
+            install_app_update,
             mount_browser_webview,
             sync_browser_webview,
             hide_browser_webview,

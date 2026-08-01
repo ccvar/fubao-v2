@@ -1,7 +1,11 @@
 import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
+import packageInfo from "./package.json" with { type: "json" };
 
 export default defineConfig({
+  define: {
+    __APP_VERSION__: JSON.stringify(packageInfo.version),
+  },
   build: {
     outDir: "dist/client",
   },

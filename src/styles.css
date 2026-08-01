@@ -242,6 +242,44 @@ button {
   gap: 5px;
 }
 
+.client-version-button,
+.update-available-badge {
+  height: 16px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #88847d;
+  font-size: 9.5px;
+  line-height: 16px;
+  cursor: pointer;
+}
+
+.client-version-button:hover,
+.client-version-button:focus-visible,
+.client-version-button.update-available {
+  color: #4d4943;
+}
+
+.client-version-button:disabled {
+  cursor: wait;
+  opacity: .65;
+}
+
+.update-available-badge {
+  padding: 0 5px;
+  border-radius: 5px;
+  background: #f7ead3;
+  color: #a56813;
+  font-size: 8.5px;
+  font-weight: 650;
+}
+
+.update-available-badge:hover,
+.update-available-badge:focus-visible {
+  background: #f0dcb9;
+  color: #82500c;
+}
+
 .edition-badge {
   height: 16px;
   padding: 0 5px;
@@ -2537,6 +2575,117 @@ label.browser-column-control[data-tooltip]:focus-within {
 .license-modal {
   width: min(420px, 100%);
   padding: 18px;
+}
+
+.update-modal {
+  width: min(470px, 100%);
+  padding: 18px;
+}
+
+.update-modal-icon {
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  background: #e8f3ed;
+  color: #338263;
+}
+
+.update-version-summary {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.update-version-summary > span {
+  display: grid;
+  gap: 3px;
+  padding: 10px 11px;
+  border-radius: 10px;
+  background: #f6f5f2;
+}
+
+.update-version-summary > span.latest {
+  background: #edf7f1;
+}
+
+.update-version-summary small,
+.update-notes small,
+.update-progress-block small {
+  color: #918c84;
+  font-size: 9.5px;
+}
+
+.update-version-summary strong {
+  color: #44403a;
+  font-size: 13px;
+}
+
+.update-version-summary .latest strong {
+  color: #28795c;
+}
+
+.update-version-summary > svg {
+  color: #98938b;
+}
+
+.update-notes {
+  margin-top: 12px;
+  padding: 0 2px;
+}
+
+.update-notes p {
+  margin: 4px 0 0;
+  color: #5f5a53;
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-line;
+}
+
+.update-package-meta {
+  margin: 11px 2px 0;
+  color: #8c877f;
+  font-size: 10px;
+}
+
+.update-progress-block {
+  display: grid;
+  gap: 5px;
+  margin-top: 12px;
+}
+
+.update-progress-block > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: #5f5a53;
+  font-size: 10.5px;
+}
+
+.update-progress-block > div strong {
+  color: #317f62;
+  font-size: 10px;
+}
+
+.update-progress-block progress {
+  width: 100%;
+  height: 5px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  appearance: none;
+}
+
+.update-progress-block progress::-webkit-progress-bar {
+  border-radius: 999px;
+  background: #e9e6e0;
+}
+
+.update-progress-block progress::-webkit-progress-value {
+  border-radius: 999px;
+  background: #3d9270;
+  transition: width 120ms ease;
 }
 
 .license-modal-icon {
