@@ -467,13 +467,29 @@
   let participationScheduleModalElement: HTMLDialogElement;
   let participationScheduleModalX = 0;
   let participationScheduleModalY = 0;
+  let participationScheduleModalWidth = 600;
+  let participationScheduleModalHeight = 440;
   let participationScheduleDragPointer = -1;
   let participationScheduleDragStartX = 0;
   let participationScheduleDragStartY = 0;
   let participationScheduleDragOriginX = 0;
   let participationScheduleDragOriginY = 0;
+  let participationScheduleResizePointer = -1;
+  let participationScheduleResizeStartX = 0;
+  let participationScheduleResizeStartY = 0;
+  let participationScheduleResizeStartWidth = 600;
+  let participationScheduleResizeStartHeight = 440;
+  let participationScheduleResizeTarget: HTMLElement | null = null;
   let sidebarActivities: SidebarActivity[] = [];
-  let expandedSidebarActivityID = "";
+  let recentActivityScroller: HTMLDivElement | null = null;
+  let recentActivityScrollTop = 0;
+  let recentActivityClientHeight = 0;
+  let recentActivityScrollHeight = 0;
+  let recentActivityScrollbarDragPointer = -1;
+  let recentActivityScrollbarDragStartY = 0;
+  let recentActivityScrollbarDragStartTop = 0;
+  let recentActivityScrollbarTrack: HTMLDivElement | null = null;
+  let sidebarActivityDetailID = "";
   let stoppingSidebarActivityID = "";
   $: licenseDaysRemaining = getLicenseDaysRemaining(licenseStatus.expires_at);
   let query = "";
@@ -487,6 +503,7 @@
   let browserLoading = false;
   let browserStatusPolling = false;
   let browserCookieSyncing = false;
+  let browserCookieCheckingIds: string[] = [];
   let browserError = "";
   let browserCreating = false;
   let browserOpeningId = "";
@@ -637,18 +654,20 @@
   $: monitoringAccounts = accounts.filter((account) => account.roles.includes("monitoring"));
   $: participationAccounts = accounts.filter((account) => account.roles.includes("participation"));
 
-  $: recentActivityItems = sidebarActivities.slice(0, 4).map((activity) => ({
+  $: recentActivityItems = sidebarActivities.map((activity) => ({
 		id: activity.id,
 		kind: activity.kind,
 		label: activity.label,
 		accountIDs: activity.account_ids ?? [],
 		active: Boolean(activity.active),
 		stoppedAt: activity.stopped_at,
+		createdAt: activity.created_at,
 		time: formatMonitorTime(activity.created_at, redPacketClock),
 		icon: activity.kind.startsWith("participation_") ? (activity.kind.includes("schedule") ? ClockCountdown : Gift) : Radio,
 		tone: activity.kind.startsWith("participation_") ? "live" : "neutral",
 		view: activity.kind.startsWith("participation_") ? ("browsers" as NavKey) : ("accounts" as NavKey),
 	}));
+  $: sidebarActivityDetail = recentActivityItems.find((activity) => activity.id === sidebarActivityDetailID);
   $: filteredRooms = rooms.filter((room) => {
     const followAccounts = (room.follow_sources ?? []).map((source) => source.account_name).join(" ");
     const haystack = `${room.name ?? ""} ${room.streamer_name ?? ""} ${room.web_rid ?? ""} ${room.actual_room_id ?? ""} ${room.id} ${followAccounts}`.toLowerCase();
@@ -722,7 +741,7 @@
     const haystack = `${item.name} ${item.account_name} ${item.browser}`.toLowerCase();
     return haystack.includes(query.trim().toLowerCase());
   });
-  $: browserWebviewLayoutKey = `${activeView}:${browserViewSettled}:${instanceModalOpen}:${licenseModalOpen}:${participationSettingsModalOpen}:${participationScheduleModalOpen}:${participationTaskMenuOpen}:${sidebarCollapsed}:${query}:${visibleBrowserInstances
+  $: browserWebviewLayoutKey = `${activeView}:${browserViewSettled}:${instanceModalOpen}:${licenseModalOpen}:${participationSettingsModalOpen}:${participationScheduleModalOpen}:${sidebarActivityDetailID}:${participationTaskMenuOpen}:${sidebarCollapsed}:${query}:${visibleBrowserInstances
     .map((instance) => instance.id)
     .join(",")}`;
   $: if (browserWebviewLayoutKey) scheduleEmbeddedBrowserSync();
@@ -831,6 +850,70 @@
 	}
   }
 
+  function syncRecentActivityScrollbar() {
+	if (!recentActivityScroller) return;
+	recentActivityScrollTop = recentActivityScroller.scrollTop;
+	recentActivityClientHeight = recentActivityScroller.clientHeight;
+	recentActivityScrollHeight = recentActivityScroller.scrollHeight;
+  }
+
+  function observeRecentActivityScroller(node: HTMLDivElement) {
+	recentActivityScroller = node;
+	const resizeObserver = new ResizeObserver(syncRecentActivityScrollbar);
+	const mutationObserver = new MutationObserver(syncRecentActivityScrollbar);
+	resizeObserver.observe(node);
+	mutationObserver.observe(node, { childList: true, subtree: true, characterData: true });
+	window.requestAnimationFrame(syncRecentActivityScrollbar);
+	return {
+		destroy() {
+			resizeObserver.disconnect();
+			mutationObserver.disconnect();
+			if (recentActivityScroller === node) recentActivityScroller = null;
+		},
+	};
+  }
+
+  function scrollRecentActivityFromTrack(event: MouseEvent) {
+	if (!recentActivityScroller || !recentActivityScrollbarTrack || event.target !== event.currentTarget) return;
+	const bounds = recentActivityScrollbarTrack.getBoundingClientRect();
+	const maxScroll = recentActivityScrollHeight - recentActivityClientHeight;
+	if (bounds.height <= 0 || maxScroll <= 0) return;
+	const thumbHeight = Math.max(42, bounds.height * recentActivityClientHeight / recentActivityScrollHeight);
+	const available = Math.max(1, bounds.height - thumbHeight);
+	const target = Math.max(0, Math.min(available, event.clientY - bounds.top - thumbHeight / 2));
+	recentActivityScroller.scrollTop = target / available * maxScroll;
+  }
+
+  function startRecentActivityScrollbarDrag(event: PointerEvent) {
+	if (event.button !== 0 || !recentActivityScroller) return;
+	event.preventDefault();
+	event.stopPropagation();
+	recentActivityScrollbarDragPointer = event.pointerId;
+	recentActivityScrollbarDragStartY = event.clientY;
+	recentActivityScrollbarDragStartTop = recentActivityScroller.scrollTop;
+	window.addEventListener("pointermove", moveRecentActivityScrollbarDrag);
+	window.addEventListener("pointerup", endRecentActivityScrollbarDrag);
+	window.addEventListener("pointercancel", endRecentActivityScrollbarDrag);
+  }
+
+  function moveRecentActivityScrollbarDrag(event: PointerEvent) {
+	if (event.pointerId !== recentActivityScrollbarDragPointer || !recentActivityScroller || !recentActivityScrollbarTrack) return;
+	const trackHeight = recentActivityScrollbarTrack.clientHeight;
+	const thumbHeight = Math.max(42, trackHeight * recentActivityClientHeight / recentActivityScrollHeight);
+	const available = Math.max(1, trackHeight - thumbHeight);
+	const maxScroll = Math.max(0, recentActivityScrollHeight - recentActivityClientHeight);
+	recentActivityScroller.scrollTop = Math.max(0, Math.min(maxScroll,
+		recentActivityScrollbarDragStartTop + (event.clientY - recentActivityScrollbarDragStartY) / available * maxScroll));
+  }
+
+  function endRecentActivityScrollbarDrag(event: PointerEvent) {
+	if (event.pointerId !== recentActivityScrollbarDragPointer) return;
+	recentActivityScrollbarDragPointer = -1;
+	window.removeEventListener("pointermove", moveRecentActivityScrollbarDrag);
+	window.removeEventListener("pointerup", endRecentActivityScrollbarDrag);
+	window.removeEventListener("pointercancel", endRecentActivityScrollbarDrag);
+  }
+
   function sidebarActivityAccountName(accountID: string) {
 	const account = accounts.find((item) => item.id === accountID);
 	return account?.nickname || account?.name || account?.user_id || `账号 ${accountID.slice(0, 8)}`;
@@ -846,8 +929,19 @@
 	return activityActive ? "等待红包" : "已结束";
   }
 
-  function openSidebarActivity(activityID: string) {
-	expandedSidebarActivityID = expandedSidebarActivityID === activityID ? "" : activityID;
+  async function openSidebarActivity(activityID: string) {
+	browserLayoutRevision += 1;
+	await queueBrowserNativeLayout(hideEmbeddedBrowsers);
+	sidebarActivityDetailID = activityID;
+  }
+
+  async function closeSidebarActivity() {
+	sidebarActivityDetailID = "";
+	browserLayoutRevision += 1;
+	const revision = browserLayoutRevision;
+	await tick();
+	await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+	await queueBrowserNativeLayout(() => syncEmbeddedBrowsers(revision));
   }
 
   async function stopSidebarParticipationBatch(activityID: string, accountIDs: string[]) {
@@ -971,6 +1065,8 @@
 	participationScheduleUnitMenuOpen = false;
 	participationScheduleModalX = 0;
 	participationScheduleModalY = 0;
+	participationScheduleModalWidth = Math.min(600, window.innerWidth - 44);
+	participationScheduleModalHeight = Math.min(440, window.innerHeight - 44);
 	await hideEmbeddedBrowsers();
 	participationScheduleModalOpen = true;
 	void loadParticipationSchedules();
@@ -983,6 +1079,8 @@
 	participationScheduleUnitMenuOpen = false;
 	participationScheduleModalX = 0;
 	participationScheduleModalY = 0;
+	participationScheduleModalWidth = Math.min(600, window.innerWidth - 44);
+	participationScheduleModalHeight = Math.min(440, window.innerHeight - 44);
 	await hideEmbeddedBrowsers();
 	participationScheduleModalOpen = true;
 	void loadParticipationSchedules();
@@ -1022,6 +1120,40 @@
 	participationScheduleDragPointer = -1;
 	const target = event.currentTarget as HTMLElement;
 	if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId);
+  }
+
+  function startParticipationScheduleResize(event: PointerEvent) {
+	if (event.button !== 0) return;
+	event.preventDefault();
+	event.stopPropagation();
+	participationScheduleResizePointer = event.pointerId;
+	participationScheduleResizeStartX = event.clientX;
+	participationScheduleResizeStartY = event.clientY;
+	participationScheduleResizeStartWidth = participationScheduleModalWidth;
+	participationScheduleResizeStartHeight = participationScheduleModalHeight;
+	participationScheduleResizeTarget = event.currentTarget as HTMLElement;
+	window.addEventListener("pointermove", moveParticipationScheduleResize);
+	window.addEventListener("pointerup", endParticipationScheduleResize);
+	window.addEventListener("pointercancel", endParticipationScheduleResize);
+  }
+
+  function moveParticipationScheduleResize(event: PointerEvent) {
+	if (event.pointerId !== participationScheduleResizePointer) return;
+	const minWidth = Math.min(420, window.innerWidth - 44);
+	const minHeight = Math.min(300, window.innerHeight - 44);
+	const maxWidth = Math.max(minWidth, window.innerWidth - 44 - Math.abs(participationScheduleModalX) * 2);
+	const maxHeight = Math.max(minHeight, window.innerHeight - 44 - Math.abs(participationScheduleModalY) * 2);
+	participationScheduleModalWidth = Math.max(minWidth, Math.min(maxWidth, participationScheduleResizeStartWidth + event.clientX - participationScheduleResizeStartX));
+	participationScheduleModalHeight = Math.max(minHeight, Math.min(maxHeight, participationScheduleResizeStartHeight + event.clientY - participationScheduleResizeStartY));
+  }
+
+  function endParticipationScheduleResize(event: PointerEvent) {
+	if (event.pointerId !== participationScheduleResizePointer) return;
+	participationScheduleResizePointer = -1;
+	participationScheduleResizeTarget = null;
+	window.removeEventListener("pointermove", moveParticipationScheduleResize);
+	window.removeEventListener("pointerup", endParticipationScheduleResize);
+	window.removeEventListener("pointercancel", endParticipationScheduleResize);
   }
 
   function participationScheduleModeLabel(mode: ParticipationScheduleMode) {
@@ -1091,6 +1223,11 @@
 	if (isDetachedPageWindow || !engineListenerReady || !isTauriDesktop() || participationScheduleClaiming || participationBatchRunning) return;
 	participationScheduleClaiming = true;
 	try {
+		// The browser page may never have been opened in this frontend session.
+		// Populate the native instance inventory before atomically claiming a
+		// due occurrence so an empty UI array cannot consume a scheduled run.
+		if (browserInstances.length === 0) await loadBrowserInstances();
+		if (browserInstances.length === 0) return;
 		const executions = await engineRequest<ParticipationScheduleExecution[]>("red_packet_participation.schedule.claim_due");
 		for (const execution of executions) {
 			await executeParticipationBatch(execution);
@@ -1895,6 +2032,7 @@
       licenseModalOpen ||
 	  participationSettingsModalOpen ||
 	  participationScheduleModalOpen ||
+	  Boolean(sidebarActivityDetailID) ||
       !browserMountIsVisible(element)
     ) {
       return;
@@ -1924,7 +2062,7 @@
       // Keep that native instance alive but hidden so returning still resumes
       // the exact in-memory page. Filters and viewport exits continue to
       // release it below because they are resource-management boundaries.
-      if (activeView !== "browsers" || instanceModalOpen || licenseModalOpen || participationSettingsModalOpen || participationScheduleModalOpen) {
+      if (activeView !== "browsers" || instanceModalOpen || licenseModalOpen || participationSettingsModalOpen || participationScheduleModalOpen || sidebarActivityDetailID) {
         if (!browserWebviewMountedIds.includes(instance.id)) {
           browserWebviewMountedIds = [...browserWebviewMountedIds, instance.id];
         }
@@ -1978,6 +2116,7 @@
       !isTauriDesktop() ||
       browserLayoutChanging ||
       followingLiveModalInstance ||
+      sidebarActivityDetailID ||
       browserPendingClose ||
       expectedRevision !== browserLayoutRevision
     ) return;
@@ -1985,6 +2124,7 @@
     if (
       browserLayoutChanging ||
       followingLiveModalInstance ||
+      sidebarActivityDetailID ||
       browserPendingClose ||
       expectedRevision !== browserLayoutRevision
     ) return;
@@ -1999,6 +2139,7 @@
           licenseModalOpen
 		  || participationSettingsModalOpen
 		  || participationScheduleModalOpen
+		  || sidebarActivityDetailID
         ) {
           if (
             browserWebviewMountedIds.includes(instance.id) ||
@@ -3212,16 +3353,40 @@
     ) return;
     browserCookieSyncing = true;
     try {
-      const results = await Promise.all(
-        visibleBrowserInstances.map((instance) =>
-          invoke<boolean>("sync_browser_account_cookie", { instanceId: instance.id }).catch(() => false),
-        ),
+      const queue = visibleBrowserInstances.filter((instance) =>
+        browserWebviewMountedIds.includes(instance.id) &&
+        !browserWebviewReleasingIds.includes(instance.id)
       );
-      if (results.some(Boolean)) {
+      let accountUpdated = false;
+      await Promise.all(
+        Array.from({ length: Math.min(3, queue.length) }, async () => {
+          while (queue.length > 0) {
+            const instance = queue.shift();
+            if (!instance) return;
+            if (!browserCookieCheckingIds.includes(instance.id)) {
+              browserCookieCheckingIds = [...browserCookieCheckingIds, instance.id];
+            }
+            const startedAt = performance.now();
+            try {
+              const updated = await invoke<boolean>("sync_browser_account_cookie", {
+                instanceId: instance.id,
+              }).catch(() => false);
+              accountUpdated ||= updated;
+            } finally {
+              const remaining = 320 - (performance.now() - startedAt);
+              if (remaining > 0) {
+                await new Promise<void>((resolve) => window.setTimeout(resolve, remaining));
+              }
+              browserCookieCheckingIds = browserCookieCheckingIds.filter((id) => id !== instance.id);
+            }
+          }
+        }),
+      );
+      if (accountUpdated) {
         accounts = await engineRequest<AccountItem[]>("account.list");
-        showToast("已将浏览器实例的新登录状态同步到账号 CK");
       }
     } finally {
+      browserCookieCheckingIds = [];
       browserCookieSyncing = false;
     }
   }
@@ -3288,6 +3453,7 @@
       browserWebviewMountingIds = browserWebviewMountingIds.filter((id) => id !== instance.id);
       browserWebviewLoadingIds = browserWebviewLoadingIds.filter((id) => id !== instance.id);
       browserWebviewReadyIds = browserWebviewReadyIds.filter((id) => id !== instance.id);
+      browserCookieCheckingIds = browserCookieCheckingIds.filter((id) => id !== instance.id);
       browserFollowingLivePendingNativeIds = browserFollowingLivePendingNativeIds.filter((id) => id !== instance.id);
       browserRedPacketContextIds = browserRedPacketContextIds.filter((id) => id !== instance.id);
       browserPendingClose = null;
@@ -3379,6 +3545,7 @@
 
   async function toggleBrowserRedPacketContext(instance: BrowserInstance) {
     if (browserRedPacketPreparingIds.includes(instance.id)) return;
+	if (browserCookieExpired(instance)) return;
 	const participationContext = browserParticipationContexts[instance.id];
 	const canResumePendingResult = Boolean(
 		participationContext?.active && !participationContext.prepared && participationContext.pending_draw_count &&
@@ -3451,8 +3618,16 @@
 	const target = browserRedPacketLiveTarget(instance);
 	if (!target || browserRedPacketPreparingIds.includes(instance.id)) return false;
 	const apiWasEnabled = Boolean(account.participation?.red_packet_api_enabled);
+	let runtimeAcquired = false;
 	browserRedPacketPreparingIds = [...browserRedPacketPreparingIds, instance.id];
 	try {
+		const admission = await engineRequest<BrowserAdmission>("browser.runtime.acquire", {
+			instance_id: instance.id,
+		});
+		browserCapacity = admission.capacity;
+		updateBrowserRuntimeState(instance.id, admission.state, admission.queue_position ?? 0);
+		if (!admission.granted) return false;
+		runtimeAcquired = true;
 		if (!apiWasEnabled) {
 			const updated = await engineRequest<AccountItem>("account.set_red_packet_api_enabled", {
 				account_id: account.id,
@@ -3470,6 +3645,12 @@
 		}
 		return true;
 	} catch {
+		if (runtimeAcquired) {
+			browserCapacity = await engineRequest<BrowserCapacity>("browser.runtime.release", {
+				instance_id: instance.id,
+			}).catch(() => browserCapacity);
+			updateBrowserRuntimeState(instance.id, "stopped");
+		}
 		if (!apiWasEnabled) {
 			const restored = await engineRequest<AccountItem>("account.set_red_packet_api_enabled", {
 				account_id: account.id,
@@ -3542,6 +3723,7 @@
 
 	async function toggleAccountRedPacketAPI(account: AccountItem) {
 		if (redPacketAPITogglingAccountIds.includes(account.id)) return;
+		if (accountCookieStatus(account, "participation") === "expired") return;
 		const previous = Boolean(account.participation?.red_packet_api_enabled);
 		const enabled = !previous;
 		redPacketAPITogglingAccountIds = [...redPacketAPITogglingAccountIds, account.id];
@@ -3902,68 +4084,71 @@
       </button>
     </div>
 
-    <div class="quick-list sidebar-recent-activity">
-      <p class="section-label">最近活动</p>
-      {#if recentActivityItems.length === 0}
-        <p class="recent-activity-empty">暂无活动</p>
-      {:else}
-        {#each recentActivityItems as activity (activity.id)}
-          <div class:expanded={expandedSidebarActivityID === activity.id} class="recent-activity-item">
-            <div class="recent-activity-head">
-              {#if activity.kind === "participation_batch_executed" && activity.accountIDs.length > 0}
-                <button
-                  class="quick-row recent-activity-row"
-                  aria-expanded={expandedSidebarActivityID === activity.id}
-                  onclick={() => openSidebarActivity(activity.id)}
-                >
-                  <span class:live={activity.tone === "live"} class="quick-status">
-                    <svelte:component this={activity.icon} size={14} weight={activity.tone === "live" ? "fill" : "regular"} />
-                  </span>
-                  <span class="recent-activity-copy">
-                    <span>{activity.label}</span>
-                    <small>{activity.time}</small>
-                  </span>
-                  <span class="recent-activity-disclosure">
-                    {#if expandedSidebarActivityID === activity.id}<CaretDown size={11} />{:else}<CaretRight size={11} />{/if}
-                  </span>
-                </button>
-              {:else}
+    <div class="sidebar-recent-activity-shell">
+      <p class="section-label sidebar-recent-activity-title">最近活动</p>
+      <div class="sidebar-recent-activity-body">
+      <div class="quick-list sidebar-recent-activity" role="region" aria-label="最近活动记录" use:observeRecentActivityScroller onscroll={syncRecentActivityScrollbar}>
+        {#if recentActivityItems.length === 0}
+          <p class="recent-activity-empty">暂无活动</p>
+        {:else}
+          {#each recentActivityItems as activity (activity.id)}
+            <div class="recent-activity-item">
+              <div class="recent-activity-head">
                 <div class="quick-row recent-activity-row static">
                   <span class:live={activity.tone === "live"} class="quick-status">
                     <svelte:component this={activity.icon} size={14} weight={activity.tone === "live" ? "fill" : "regular"} />
                   </span>
                   <span class="recent-activity-copy">
                     <span>{activity.label}</span>
-                    <small>{activity.time}</small>
+                    <span class="recent-activity-meta">
+                      <small>{activity.time}</small>
+                      {#if activity.kind === "participation_batch_executed" && activity.active}
+                        <button
+                          class="recent-activity-inline-action"
+                          aria-label="停止本批次"
+                          data-tooltip="停止本批次"
+                          data-tooltip-placement="bottom"
+                          disabled={Boolean(stoppingSidebarActivityID)}
+                          onclick={() => void stopSidebarParticipationBatch(activity.id, activity.accountIDs)}
+                        >
+                          {#if stoppingSidebarActivityID === activity.id}<ArrowClockwise class="spinning" size={11} />{:else}<Pause size={11} weight="fill" />{/if}
+                        </button>
+                      {/if}
+                      {#if activity.kind === "participation_batch_executed" && activity.accountIDs.length > 0}
+                        <button
+                          class="recent-activity-inline-action"
+                          aria-label="查看本批次详情"
+                          data-tooltip="查看详情"
+                          data-tooltip-placement="bottom"
+                          onclick={() => void openSidebarActivity(activity.id)}
+                        ><ClipboardText size={11} /></button>
+                      {/if}
+                    </span>
                   </span>
                 </div>
-              {/if}
-              {#if activity.kind === "participation_batch_executed" && activity.active}
-                <button
-                  class="recent-activity-stop"
-                  aria-label="停止本批次"
-                  data-tooltip="停止本批次"
-                  data-tooltip-placement="right"
-                  disabled={Boolean(stoppingSidebarActivityID)}
-                  onclick={() => void stopSidebarParticipationBatch(activity.id, activity.accountIDs)}
-                >
-                  {#if stoppingSidebarActivityID === activity.id}<ArrowClockwise class="spinning" size={12} />{:else}<Pause size={12} weight="fill" />{/if}
-                </button>
-              {/if}
-            </div>
-            {#if expandedSidebarActivityID === activity.id}
-              <div class="recent-activity-detail">
-                {#each activity.accountIDs as accountID}
-                  <div class="recent-activity-account">
-                    <span>{sidebarActivityAccountName(accountID)}</span>
-                    <small class:active={sidebarActivityAccountState(accountID, activity.active, activity.stoppedAt) === "参与中"}>{sidebarActivityAccountState(accountID, activity.active, activity.stoppedAt)}</small>
-                  </div>
-                {/each}
               </div>
-            {/if}
-          </div>
-        {/each}
+            </div>
+          {/each}
+        {/if}
+      </div>
+      {#if recentActivityScrollHeight > recentActivityClientHeight + 1}
+        {@const thumbPercent = Math.max(0, Math.min(1, recentActivityClientHeight / recentActivityScrollHeight))}
+        {@const scrollPercent = Math.max(0, Math.min(1, recentActivityScrollTop / Math.max(1, recentActivityScrollHeight - recentActivityClientHeight)))}
+        <div
+          bind:this={recentActivityScrollbarTrack}
+          class="recent-activity-scrollbar"
+          aria-hidden="true"
+          onclick={scrollRecentActivityFromTrack}
+        >
+          <span
+            role="presentation"
+            class:dragging={recentActivityScrollbarDragPointer >= 0}
+            style={`height:max(42px, ${thumbPercent * 100}%);top:${scrollPercent * 100}%;transform:translateY(-${scrollPercent * 100}%)`}
+            onpointerdown={startRecentActivityScrollbarDrag}
+          ></span>
+        </div>
       {/if}
+      </div>
     </div>
 
     <div class="sidebar-footer">
@@ -4219,6 +4404,9 @@
 			  {@const participationContext = browserParticipationContexts[item.id]}
 			  {@const participationStopped = Boolean(participationContext?.stopped)}
 			  {@const participationEnabled = browserRedPacketContextIds.includes(item.id)}
+			  {@const cookieExpired = browserCookieExpired(item)}
+			  {@const followedLive = followingLiveSnapshot(item)}
+			  {@const followedLiveLoading = browserFollowingLiveLoadingIds.includes(item.id)}
 			  {@const pendingResultCanResume = Boolean(participationContext?.active && !participationContext?.prepared && participationContext?.pending_draw_count && /^\d{6,20}$/.test(participationContext?.pending_result_web_rid || ""))}
 			  {@const participationTip = participationStopped
 				? `${participationContext?.stop_reason || "已达到红包参与停止条件"}${pendingResultCanResume ? "；点击仅恢复待开奖记录查询" : ""}`
@@ -4274,7 +4462,7 @@
                     <h2>
                       <span use:truncatedTooltip={item.account_name}>{item.account_name}</span>
                       <small use:truncatedTooltip={browserAccountDouyinId(item)}>{browserAccountDouyinId(item)}</small>
-                      {#if browserCookieExpired(item)}
+                      {#if cookieExpired}
                         <em
                           class="browser-cookie-expired"
                           use:portalTooltip={"CK 已失效"}
@@ -4285,40 +4473,50 @@
                     </h2>
                   </div>
                   <div class="browser-card-actions">
-                    <button
-                      class="browser-following-live-button"
-                      class:has-live={Boolean(followingLiveSnapshot(item)?.total)}
-                      use:portalTooltip={followingLiveTooltip(item)}
-                      aria-label={followingLiveSnapshot(item)
-                        ? `查看 ${followingLiveSnapshot(item).total} 个正在直播的关注账号`
-                        : "读取正在直播的关注账号"}
-                      data-tooltip={followingLiveTooltip(item)}
-                      data-tooltip-placement="bottom"
-                      onclick={() => openFollowingLive(item)}
-                    >
-                      {#if browserFollowingLiveLoadingIds.includes(item.id)}
-                        <ArrowClockwise class="spinning" size={10} />
-                      {:else}
-                        <Radio size={10} weight="fill" />
-                      {/if}
-                      <span>{followingLiveSnapshot(item) ? followingLiveSnapshot(item).total : browserFollowingLiveErrors[item.id] ? "未知" : "读取"}</span>
-                    </button>
-                    <button
-                      class="secondary-button browser-red-packet-button"
-                      class:enabled={participationEnabled}
-                      class:limit-reached={participationStopped}
-                      aria-label={participationTip}
-                      data-tooltip={participationTip}
-                      data-tooltip-placement="left"
-                      disabled={browserRedPacketPreparingIds.includes(item.id) || browserClosingId === item.id}
-                      onclick={() => toggleBrowserRedPacketContext(item)}
-                    >
-                      {#if browserRedPacketPreparingIds.includes(item.id)}
-                        <ArrowClockwise class="spinning" size={13} />
-                      {:else}
-                        <Gift size={13} weight={participationEnabled ? "fill" : "regular"} />
-                      {/if}
-                    </button>
+                    {#if browserCookieCheckingIds.includes(item.id)}
+                      <span class="browser-cookie-checking" role="status" aria-label="正在检测账号登录状态">
+                        <ArrowClockwise class="spinning" size={11} />
+                      </span>
+                    {/if}
+                    {#if followedLive || followedLiveLoading}
+                      <button
+                        class="browser-following-live-button"
+                        class:has-live={Boolean(followedLive?.total)}
+                        use:portalTooltip={followingLiveTooltip(item)}
+                        aria-label={followedLive
+                          ? `查看 ${followedLive.total} 个正在直播的关注账号`
+                          : "正在读取直播中的关注账号"}
+                        data-tooltip={followingLiveTooltip(item)}
+                        data-tooltip-placement="bottom"
+                        disabled={!followedLive}
+                        onclick={() => openFollowingLive(item)}
+                      >
+                        {#if followedLiveLoading}
+                          <ArrowClockwise class="spinning" size={10} />
+                        {:else}
+                          <Radio size={10} weight="fill" />
+                        {/if}
+                        {#if followedLive}<span>{followedLive.total}</span>{/if}
+                      </button>
+                    {/if}
+                    {#if !cookieExpired}
+                      <button
+                        class="secondary-button browser-red-packet-button"
+                        class:enabled={participationEnabled}
+                        class:limit-reached={participationStopped}
+                        aria-label={participationTip}
+                        data-tooltip={participationTip}
+                        data-tooltip-placement="left"
+                        disabled={browserRedPacketPreparingIds.includes(item.id) || browserClosingId === item.id}
+                        onclick={() => toggleBrowserRedPacketContext(item)}
+                      >
+                        {#if browserRedPacketPreparingIds.includes(item.id)}
+                          <ArrowClockwise class="spinning" size={13} />
+                        {:else}
+                          <Gift size={13} weight={participationEnabled ? "fill" : "regular"} />
+                        {/if}
+                      </button>
+                    {/if}
                     <button
                       class="secondary-button browser-close-button"
                       aria-label="关闭实例"
@@ -4888,7 +5086,7 @@
                       data-tooltip-placement="left"
                       onclick={() => (accountPendingDelete = account)}
                     ><Trash size={15} /></button>
-					{#if accountRole === "participation"}
+					{#if accountRole === "participation" && accountCookieStatus(account, "participation") !== "expired"}
 						<button
 							class:enabled={Boolean(account.participation?.red_packet_api_enabled)}
 							class="account-red-packet-api-button"
@@ -4922,6 +5120,57 @@
       <ArrowSquareOut size={14} />
       <span>在新窗口打开</span>
     </button>
+  </div>
+{/if}
+
+{#if sidebarActivityDetail}
+  <div
+    class="modal-backdrop"
+    role="presentation"
+    onclick={(event) => event.currentTarget === event.target && void closeSidebarActivity()}
+  >
+    <dialog class="modal sidebar-activity-modal" open aria-labelledby="sidebar-activity-modal-title">
+      <div class="modal-head">
+        <div>
+          <span class="modal-icon sidebar-activity-modal-icon"><ClipboardText size={17} /></span>
+          <h2 id="sidebar-activity-modal-title">活动详情</h2>
+        </div>
+        <button class="icon-button" aria-label="关闭" onclick={() => void closeSidebarActivity()}><X size={17} /></button>
+      </div>
+
+      <div class="sidebar-activity-summary">
+        <div>
+          <small>活动内容</small>
+          <strong>{sidebarActivityDetail.label}</strong>
+        </div>
+        <span class:active={sidebarActivityDetail.active} class="sidebar-activity-status">
+          {sidebarActivityDetail.active ? "进行中" : sidebarActivityDetail.stoppedAt ? "已停止" : "已结束"}
+        </span>
+      </div>
+
+      <dl class="sidebar-activity-timestamps">
+        <div><dt>启动时间</dt><dd>{formatLicenseDate(sidebarActivityDetail.createdAt, "未知")}</dd></div>
+        {#if sidebarActivityDetail.stoppedAt}
+          <div><dt>停止时间</dt><dd>{formatLicenseDate(sidebarActivityDetail.stoppedAt, "未知")}</dd></div>
+        {/if}
+      </dl>
+
+      <div class="sidebar-activity-account-list">
+        <p>参与账号 <span>{sidebarActivityDetail.accountIDs.length}</span></p>
+        {#each sidebarActivityDetail.accountIDs as accountID}
+          <div class="sidebar-activity-account-row">
+            <span><UserCircle size={15} />{sidebarActivityAccountName(accountID)}</span>
+            <small class:active={sidebarActivityAccountState(accountID, sidebarActivityDetail.active, sidebarActivityDetail.stoppedAt) === "参与中"}>
+              {sidebarActivityAccountState(accountID, sidebarActivityDetail.active, sidebarActivityDetail.stoppedAt)}
+            </small>
+          </div>
+        {/each}
+      </div>
+
+      <div class="modal-actions">
+        <button class="secondary-button" onclick={() => void closeSidebarActivity()}>关闭</button>
+      </div>
+    </dialog>
   </div>
 {/if}
 
@@ -5045,12 +5294,14 @@
     <dialog
       bind:this={participationScheduleModalElement}
       class="modal participation-schedule-modal"
-      style={`transform: translate(${participationScheduleModalX}px, ${participationScheduleModalY}px)`}
+      style={`width:${participationScheduleModalWidth}px;height:${participationScheduleModalHeight}px;transform:translate(${participationScheduleModalX}px, ${participationScheduleModalY}px)`}
       open
       aria-labelledby="participation-schedule-title"
     >
       <div
         class="modal-head participation-schedule-modal-head"
+        role="group"
+        aria-label="执行计划窗口标题，可拖动"
         onpointerdown={startParticipationScheduleDrag}
         onpointermove={moveParticipationScheduleDrag}
         onpointerup={endParticipationScheduleDrag}
@@ -5170,6 +5421,13 @@
           </button>
         {/if}
       </div>
+      <span
+        class="participation-schedule-resize-handle"
+        role="separator"
+        aria-orientation="horizontal"
+        aria-label="调整计划窗口大小"
+        onpointerdown={startParticipationScheduleResize}
+      ></span>
     </dialog>
   </div>
 {/if}

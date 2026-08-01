@@ -117,6 +117,7 @@ button {
 
 .windows-platform .sidebar {
   background: var(--sidebar);
+  border-right-color: transparent;
 }
 
 .windows-platform .topbar {
@@ -350,12 +351,98 @@ button {
   overflow: visible;
 }
 
-.sidebar-recent-activity {
+.sidebar-recent-activity-shell {
+  display: flex;
+  min-height: 0;
   flex: 1 1 auto;
-  padding-top: 16px;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.sidebar-recent-activity-title {
+  flex: 0 0 auto;
+  margin: 16px 22px 8px;
+}
+
+.sidebar-recent-activity-body {
+  position: relative;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+}
+
+.sidebar-recent-activity {
+  height: 100%;
+  padding-top: 0;
+  padding-right: 14px;
   padding-bottom: 10px;
-  scrollbar-color: #d5d1c9 transparent;
-  scrollbar-width: thin;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+
+.sidebar-recent-activity::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.recent-activity-scrollbar {
+  position: absolute;
+  z-index: 3;
+  top: 0;
+  right: 0;
+  bottom: 10px;
+  width: 9px;
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+}
+
+.recent-activity-scrollbar::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 5px;
+  width: 3px;
+  border-radius: 999px;
+  background: #efede9;
+  content: "";
+}
+
+.recent-activity-scrollbar > span {
+  position: absolute;
+  right: 0;
+  left: 0;
+  background: transparent;
+  cursor: grab;
+  touch-action: none;
+}
+
+.recent-activity-scrollbar > span::before {
+  position: absolute;
+  inset-block: 0;
+  left: 5px;
+  width: 3px;
+  border-radius: 999px;
+  background: #c2beb7;
+  content: "";
+  transition: background 120ms ease;
+}
+
+.recent-activity-scrollbar > span:hover,
+.recent-activity-scrollbar > span.dragging {
+  background: transparent;
+}
+
+.recent-activity-scrollbar > span:hover::before,
+.recent-activity-scrollbar > span.dragging::before {
+  background: #aaa69f;
+}
+
+.recent-activity-scrollbar > span.dragging {
+  cursor: grabbing;
 }
 
 .quick-row {
@@ -421,10 +508,6 @@ button {
   border-radius: 9px;
 }
 
-.recent-activity-item.expanded {
-  background: #f7f5f1;
-}
-
 .recent-activity-head {
   display: flex;
   align-items: center;
@@ -449,73 +532,43 @@ button {
   gap: 1px;
 }
 
-.recent-activity-disclosure {
-  display: grid;
-  width: 14px;
-  flex: 0 0 14px;
-  align-self: center;
-  color: #aaa69e;
-  place-items: center;
+.recent-activity-copy > span:first-child {
+  font-size: 11px;
+  line-height: 15px;
 }
 
-.recent-activity-stop {
-  display: grid;
-  width: 22px;
-  height: 22px;
-  flex: 0 0 22px;
-  margin-right: 5px;
+.recent-activity-meta {
+  display: flex;
+  min-width: 0;
+  height: 15px;
+  align-items: center;
+  gap: 3px;
+}
+
+.recent-activity-inline-action {
+  display: inline-grid;
+  width: 15px;
+  height: 15px;
+  flex: 0 0 15px;
   padding: 0;
   border: 0;
-  border-radius: 6px;
+  border-radius: 4px;
   background: transparent;
-  color: #aaa69e;
+  color: #8e8a82;
   cursor: pointer;
   place-items: center;
 }
 
-.recent-activity-stop:hover,
-.recent-activity-stop:focus-visible {
+.recent-activity-inline-action:hover,
+.recent-activity-inline-action:focus-visible {
   outline: 0;
   background: #ebe8e2;
   color: #5f5a52;
 }
 
-.recent-activity-stop:disabled {
+.recent-activity-inline-action:disabled {
   cursor: wait;
   opacity: .65;
-}
-
-.recent-activity-detail {
-  display: grid;
-  gap: 3px;
-  padding: 0 10px 7px 32px;
-}
-
-.recent-activity-account {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  color: #706c65;
-  font-size: 10px;
-  line-height: 17px;
-}
-
-.recent-activity-account > span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.recent-activity-account small {
-  flex: 0 0 auto;
-  color: #aaa69e;
-  font-size: 9px;
-}
-
-.recent-activity-account small.active {
-  color: #31896e;
 }
 
 .recent-activity-copy > span,
@@ -529,6 +582,151 @@ button {
   color: #aaa69e;
   font-size: 9.5px;
   line-height: 13px;
+}
+
+.modal.sidebar-activity-modal {
+  width: min(460px, 100%);
+  padding: 18px;
+}
+
+.modal-icon.sidebar-activity-modal-icon {
+  background: #e8f4ee;
+  color: #31896e;
+}
+
+.sidebar-activity-summary {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 17px;
+  padding: 12px;
+  border-radius: 10px;
+  background: #f7f5f1;
+}
+
+.sidebar-activity-summary > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.sidebar-activity-summary small,
+.sidebar-activity-timestamps dt,
+.sidebar-activity-account-list > p {
+  color: #99958d;
+  font-size: 10px;
+}
+
+.sidebar-activity-summary strong {
+  overflow: hidden;
+  color: #4f4b45;
+  font-size: 12.5px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-activity-status {
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  border-radius: 999px;
+  background: #ece9e4;
+  color: #89847c;
+  font-size: 9.5px;
+}
+
+.sidebar-activity-status.active {
+  background: #e3f3eb;
+  color: #287d60;
+}
+
+.sidebar-activity-timestamps {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 10px 0 0;
+}
+
+.sidebar-activity-timestamps > div {
+  display: grid;
+  gap: 2px;
+  padding: 8px 10px;
+  border: 1px solid #ece9e3;
+  border-radius: 9px;
+}
+
+.sidebar-activity-timestamps dd {
+  margin: 0;
+  color: #5f5a53;
+  font-size: 10.5px;
+}
+
+.sidebar-activity-account-list {
+  display: grid;
+  gap: 4px;
+  max-height: min(250px, 38vh);
+  margin-top: 12px;
+  overflow-y: auto;
+}
+
+.sidebar-activity-account-list > p {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0 0 2px;
+}
+
+.sidebar-activity-account-list > p span {
+  display: inline-grid;
+  min-width: 17px;
+  height: 15px;
+  padding-inline: 4px;
+  border-radius: 999px;
+  background: #ece9e4;
+  color: #77726a;
+  font-size: 8.5px;
+  place-items: center;
+}
+
+.sidebar-activity-account-row {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 31px;
+  padding: 5px 8px;
+  border-radius: 8px;
+  background: #faf9f7;
+}
+
+.sidebar-activity-account-row > span {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  color: #615d56;
+  font-size: 10.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-activity-account-row > span svg {
+  flex: 0 0 auto;
+  color: #539b80;
+}
+
+.sidebar-activity-account-row small {
+  flex: 0 0 auto;
+  color: #99958d;
+  font-size: 9.5px;
+}
+
+.sidebar-activity-account-row small.active {
+  color: #31896e;
 }
 
 .sidebar-footer {
@@ -732,7 +930,7 @@ button {
   border: 0;
   border-radius: 5px;
   background: transparent;
-  color: #77726a;
+  color: #a66f22;
   font: inherit;
   font-size: 9.5px;
   cursor: pointer;
@@ -741,8 +939,8 @@ button {
 .participation-schedule-manage-trigger:hover,
 .participation-schedule-manage-trigger:focus-visible {
   outline: 0;
-  background: #f0eeea;
-  color: #45413b;
+  background: transparent;
+  color: #865714;
 }
 
 .title-group p .participation-schedule-manage-trigger span {
@@ -751,12 +949,11 @@ button {
 
 .participation-schedule-manage-trigger small {
   display: grid;
-  min-width: 16px;
+  min-width: 0;
   height: 14px;
-  padding-inline: 4px;
-  border-radius: 999px;
-  background: #eeece7;
-  color: #817c74;
+  padding-inline: 1px;
+  background: transparent;
+  color: #8c5d1c;
   font-size: 8.5px;
   line-height: 14px;
   place-items: center;
@@ -1738,6 +1935,16 @@ label.browser-column-control[data-tooltip]:focus-within {
   min-width: 0;
   align-items: center;
   gap: 1px;
+}
+
+.browser-cookie-checking {
+  display: inline-flex;
+  width: 16px;
+  height: 20px;
+  flex: 0 0 16px;
+  align-items: center;
+  justify-content: center;
+  color: #7f9f92;
 }
 
 .browser-following-live-button {
@@ -3698,7 +3905,7 @@ label.browser-column-control[data-tooltip]:focus-within {
   flex-direction: column;
   overflow: hidden;
   padding: 18px;
-  resize: both;
+  resize: none;
 }
 
 .participation-schedule-modal-head {
@@ -3725,6 +3932,25 @@ label.browser-column-control[data-tooltip]:focus-within {
 
 .participation-schedule-modal > .modal-actions {
   flex: 0 0 auto;
+}
+
+.participation-schedule-resize-handle {
+  position: absolute;
+  z-index: 3;
+  right: 3px;
+  bottom: 3px;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  background: linear-gradient(135deg, transparent 0 48%, #d4d0c8 49% 56%, transparent 57% 66%, #bdb8af 67% 74%, transparent 75%);
+  cursor: nwse-resize;
+  touch-action: none;
+}
+
+.participation-schedule-resize-handle:focus-visible {
+  outline: 1px solid #8fb6a5;
+  outline-offset: 1px;
 }
 
 .participation-schedule-icon {
@@ -3912,13 +4138,22 @@ label.browser-column-control[data-tooltip]:focus-within {
 }
 
 .participation-schedule-row .icon-button {
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
   color: #aaa49b;
 }
 
 .participation-schedule-row .icon-button:hover,
 .participation-schedule-row .icon-button:focus-visible {
-  background: #f8ece9;
+  background: #faefec;
   color: #cc5d4b;
+}
+
+.participation-schedule-row .icon-button[data-tooltip-placement="left"]::after {
+  right: calc(100% + 11px);
+  padding: 4px 7px;
+  font-size: 9.5px;
 }
 
 .participation-settings-icon {

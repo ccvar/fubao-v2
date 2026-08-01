@@ -5,7 +5,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -38,6 +38,7 @@ struct EngineRuntime {
     // restores its page instead of always jumping back to the home page.
     browser_locations: Mutex<HashMap<String, String>>,
     browser_red_packet_contexts: Mutex<HashSet<String>>,
+    browser_cookie_synced_at: Mutex<HashMap<String, Instant>>,
 }
 
 impl Default for EngineRuntime {
@@ -49,6 +50,7 @@ impl Default for EngineRuntime {
             pending: Mutex::new(HashMap::new()),
             browser_locations: Mutex::new(HashMap::new()),
             browser_red_packet_contexts: Mutex::new(HashSet::new()),
+            browser_cookie_synced_at: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -350,6 +352,17 @@ impl NativePageParticipationResult {
 }
 
 const DOUYIN_CHROME_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const DOUYIN_LOGIN_COOKIE_NAMES: [&str; 9] = [
+    "sessionid_ss",
+    "sessionid",
+    "sid_guard",
+    "sid_tt",
+    "sid_ucp_v1",
+    "ssid_ucp_v1",
+    "uid_tt",
+    "uid_tt_ss",
+    "passport_assist_user",
+];
 
 fn safe_window_label_part(value: &str) -> String {
     value.replace(|character: char| !character.is_ascii_alphanumeric(), "-")
@@ -477,18 +490,7 @@ fn read_douyin_cookie(webview: &tauri::Webview) -> Result<String, String> {
     // Douyin does not use one stable login-cookie name across all desktop
     // rollouts. The current web client commonly persists the authenticated
     // session under the sid/uid UCP variants instead of sessionid_ss.
-    let login_names = [
-        "sessionid_ss",
-        "sessionid",
-        "sid_guard",
-        "sid_tt",
-        "sid_ucp_v1",
-        "ssid_ucp_v1",
-        "uid_tt",
-        "uid_tt_ss",
-        "passport_assist_user",
-    ];
-    let logged_in = login_names.iter().any(|name| {
+    let logged_in = DOUYIN_LOGIN_COOKIE_NAMES.iter().any(|name| {
         values
             .get(*name)
             .is_some_and(|(_, value)| !value.trim().is_empty())
@@ -533,9 +535,16 @@ fn canonical_cookie_values(raw_cookie: &str) -> HashMap<String, String> {
         .collect()
 }
 
+fn login_cookie_values(raw_cookie: &str) -> HashMap<String, String> {
+    canonical_cookie_values(raw_cookie)
+        .into_iter()
+        .filter(|(name, _)| DOUYIN_LOGIN_COOKIE_NAMES.contains(&name.as_str()))
+        .collect()
+}
+
 #[cfg(test)]
 mod cookie_tests {
-    use super::canonical_cookie_values;
+    use super::{canonical_cookie_values, login_cookie_values};
 
     #[test]
     fn complete_cookie_comparison_ignores_order_but_detects_auxiliary_changes() {
@@ -549,6 +558,10 @@ mod cookie_tests {
         assert_eq!(stored, reordered);
         assert_eq!(stored, with_native_probe);
         assert_ne!(stored, rotated);
+        assert_eq!(
+            login_cookie_values("sessionid_ss=session; ttwid=old"),
+            login_cookie_values("sessionid_ss=session; ttwid=new")
+        );
     }
 }
 
@@ -1556,21 +1569,22 @@ fn browser_restore_location(runtime: &EngineRuntime, instance_id: &str) -> Url {
         })
 }
 
-#[tauri::command]
-async fn mount_browser_webview(
-    app: tauri::AppHandle,
-    window: tauri::Window,
-    runtime: tauri::State<'_, Arc<EngineRuntime>>,
-    instance_id: String,
-    bounds: BrowserBounds,
-) -> Result<String, String> {
+async fn ensure_browser_webview(
+    app: &tauri::AppHandle,
+    window: &tauri::Window,
+    runtime: Arc<EngineRuntime>,
+    instance_id: &str,
+    bounds: &BrowserBounds,
+    reveal_when_ready: bool,
+) -> Result<tauri::Webview, String> {
     let label = browser_webview_label(&instance_id, window.label());
     if let Some(webview) = app.get_webview(&label) {
-        apply_browser_bounds(&webview, &bounds)?;
-        return Ok(label);
+        if reveal_when_ready {
+            apply_browser_bounds(&webview, bounds)?;
+        }
+        return Ok(webview);
     }
 
-    let runtime = runtime.inner().clone();
     let result = native_engine_request(
         runtime.clone(),
         "browser.native_credential",
@@ -1590,13 +1604,13 @@ async fn mount_browser_webview(
         .parse()
         .map_err(|error| format!("初始化浏览器地址失败：{error}"))?;
     let ready_app = app.clone();
-    let ready_instance_id = instance_id.clone();
+    let ready_instance_id = instance_id.to_string();
     let ready_once = Arc::new(AtomicBool::new(false));
     let ready_once_for_page = ready_once.clone();
     let navigation_runtime = runtime.clone();
-    let navigation_instance_id = instance_id.clone();
+    let navigation_instance_id = instance_id.to_string();
     let page_runtime = runtime.clone();
-    let page_instance_id = instance_id.clone();
+    let page_instance_id = instance_id.to_string();
     let restore_url = browser_restore_location(&runtime, &instance_id);
     let mut builder = WebviewBuilder::new(label.clone(), WebviewUrl::External(blank_url))
         .focused(false)
@@ -1621,7 +1635,7 @@ async fn mount_browser_webview(
             if is_douyin {
                 remember_browser_location(&page_runtime, &page_instance_id, payload.url());
             }
-            if payload.event() == PageLoadEvent::Finished && is_douyin {
+            if reveal_when_ready && payload.event() == PageLoadEvent::Finished && is_douyin {
                 // WKWebView can report navigation completion before the
                 // remote SPA has committed its first meaningful frame. Keep
                 // the native surface hidden for a short paint-stabilization
@@ -1678,25 +1692,64 @@ async fn mount_browser_webview(
     // WKWebView postpones its Finished callback even though the first screen
     // is already painted. Avoid an endless loading state while still giving
     // the page enough time to replace its initial native white surface.
-    schedule_browser_webview_reveal(
-        webview.clone(),
-        app.clone(),
-        instance_id.clone(),
-        ready_once,
-        std::time::Duration::from_millis(5_000),
-    );
+    if reveal_when_ready {
+        schedule_browser_webview_reveal(
+            webview.clone(),
+            app.clone(),
+            instance_id.to_string(),
+            ready_once,
+            std::time::Duration::from_millis(5_000),
+        );
+    }
     if cfg!(debug_assertions) {
         let current_url = webview
             .url()
             .map(|url| url.to_string())
             .unwrap_or_else(|error| format!("读取地址失败：{error}"));
         eprintln!(
-            "[embedded-browser] mounted label={label} account={} url={current_url}",
-            credential.account_id
+            "[embedded-browser] mounted label={label} account={} visibility={} url={current_url}",
+            credential.account_id,
+            if reveal_when_ready {
+                "card"
+            } else {
+                "background"
+            }
         );
     }
     let _ = credential.account_name;
-    Ok(label)
+    Ok(webview)
+}
+
+#[tauri::command]
+async fn mount_browser_webview(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    runtime: tauri::State<'_, Arc<EngineRuntime>>,
+    instance_id: String,
+    bounds: BrowserBounds,
+) -> Result<String, String> {
+    let existed = app
+        .get_webview(&browser_webview_label(&instance_id, window.label()))
+        .is_some();
+    let webview = ensure_browser_webview(
+        &app,
+        &window,
+        runtime.inner().clone(),
+        &instance_id,
+        &bounds,
+        true,
+    )
+    .await?;
+    if existed {
+        // An off-screen WebView may have been created earlier by a scheduled
+        // task. It is already loaded and has no pending first-paint callback,
+        // so tell the card to leave its HTML loading placeholder immediately.
+        let _ = app.emit(
+            "browser-webview://ready",
+            json!({ "instance_id": instance_id }),
+        );
+    }
+    Ok(webview.label().to_string())
 }
 
 #[tauri::command]
@@ -1788,12 +1841,50 @@ async fn prepare_browser_red_packet_context(
 ) -> Result<String, String> {
     let instance_id = instance_id.trim().to_string();
     let web_rid = web_rid.trim().to_string();
-    let label = browser_webview_label(&instance_id, window.label());
-    let webview = app
-        .get_webview(&label)
-        .ok_or("浏览器实例页面尚未就绪，请等待卡片加载完成后重试")?;
+    // Scheduled participation must not depend on whether the browser page is
+    // currently visible or whether its card has ever intersected the viewport.
+    // Reuse any account WebView already alive in another app page/window; when
+    // none exists, create an off-screen native WebView backed by the exact same
+    // account-keyed data store and Cookie injection path as a visible card.
+    let webview = if let Some(webview) = browser_webview_for_instance(&app, &instance_id) {
+        if cfg!(debug_assertions) {
+            eprintln!("[redpacket-schedule] reused page context instance={instance_id}");
+        }
+        webview
+    } else {
+        let webview = ensure_browser_webview(
+            &app,
+            &window,
+            runtime.inner().clone(),
+            &instance_id,
+            &BrowserBounds {
+                x: -10_000.0,
+                y: -10_000.0,
+                width: 1280.0,
+                height: 720.0,
+            },
+            false,
+        )
+        .await?;
+        if cfg!(debug_assertions) {
+            eprintln!(
+                "[redpacket-schedule] created background page context instance={instance_id}"
+            );
+        }
+        webview
+    };
     navigate_browser_to_live_room(&webview, &web_rid).await?;
-    let snapshot = inspect_douyin_login(&webview).await?;
+    let mut snapshot = inspect_douyin_login(&webview).await?;
+    // A freshly-created hidden WebView may have committed the live-room URL
+    // before Douyin's SPA has exposed its login state. Give it a bounded native
+    // readiness window instead of incorrectly consuming the scheduled run.
+    for _ in 0..8 {
+        if snapshot.state != BrowserLoginState::Unknown {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        snapshot = inspect_douyin_login(&webview).await?;
+    }
     match snapshot.state {
         BrowserLoginState::LoggedIn => {}
         BrowserLoginState::LoggedOut => return Err("当前实例尚未登录，请先重新绑定 CK".into()),
@@ -1891,12 +1982,13 @@ async fn sync_browser_account_cookie(
     instance_id: String,
     require_logged_in: Option<bool>,
 ) -> Result<bool, String> {
+    let require_logged_in = require_logged_in.unwrap_or(false);
     let label = browser_webview_label(&instance_id, window.label());
     let Some(webview) = app
         .get_webview(&label)
         .or_else(|| browser_webview_for_instance(&app, &instance_id))
     else {
-        if require_logged_in.unwrap_or(false) {
+        if require_logged_in {
             return Err("当前卡片登录页面尚未就绪，请等待卡片加载完成后重试".into());
         }
         if cfg!(debug_assertions) {
@@ -1919,16 +2011,26 @@ async fn sync_browser_account_cookie(
     .await?;
     let credential: NativeBrowserCredential =
         serde_json::from_value(result).map_err(|error| format!("解析浏览器凭据失败：{error}"))?;
-    let mut cookie_changed = false;
+    let mut cookie_persisted = false;
     if snapshot.state == BrowserLoginState::LoggedIn {
         if let Some(raw_cookie) = snapshot.raw_cookie.as_deref() {
-            // Compare the complete Cookie map, not only the login markers.
-            // Auxiliary session cookies can rotate while sessionid stays the
-            // same, but an unchanged set must not cause a storage write or a
-            // repeated frontend "CK synced" notification every poll cycle.
-            cookie_changed =
+            let cookie_changed =
                 canonical_cookie_values(raw_cookie) != canonical_cookie_values(&credential.cookie);
-            if cookie_changed {
+            let login_cookie_changed =
+                login_cookie_values(raw_cookie) != login_cookie_values(&credential.cookie);
+            let auxiliary_sync_due = runtime
+                .browser_cookie_synced_at
+                .lock()
+                .ok()
+                .and_then(|synced| synced.get(&instance_id).copied())
+                .map_or(true, |last_sync| {
+                    last_sync.elapsed() >= Duration::from_secs(60)
+                });
+            // Login-cookie changes are persisted immediately. Douyin rotates
+            // auxiliary browser cookies frequently, so complete snapshots are
+            // rate-limited to once per minute unless an explicit open action
+            // needs the freshest possible account state.
+            if cookie_changed && (require_logged_in || login_cookie_changed || auxiliary_sync_due) {
                 native_engine_request(
                     runtime.clone(),
                     "account.native_replace_cookie",
@@ -1939,6 +2041,10 @@ async fn sync_browser_account_cookie(
                     }),
                 )
                 .await?;
+                cookie_persisted = true;
+                if let Ok(mut synced) = runtime.browser_cookie_synced_at.lock() {
+                    synced.insert(instance_id.clone(), Instant::now());
+                }
             }
         }
     }
@@ -1948,7 +2054,7 @@ async fn sync_browser_account_cookie(
         }
         return Ok(false);
     }
-    if require_logged_in.unwrap_or(false) && snapshot.state != BrowserLoginState::LoggedIn {
+    if require_logged_in && snapshot.state != BrowserLoginState::LoggedIn {
         native_engine_request(
             runtime.clone(),
             "account.native_set_browser_login_state",
@@ -1966,7 +2072,7 @@ async fn sync_browser_account_cookie(
     } else {
         "expired"
     };
-    if !cookie_changed && credential.cookie_status == desired_status {
+    if !cookie_persisted && credential.cookie_status == desired_status {
         if cfg!(debug_assertions) {
             eprintln!(
                 "[embedded-browser] login-state unchanged instance={instance_id} state={:?}",

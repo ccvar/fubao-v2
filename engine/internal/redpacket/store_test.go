@@ -315,6 +315,39 @@ func TestLegacyBatchActivityMigrationRestoresCurrentAccounts(t *testing.T) {
 	}
 }
 
+func TestActivitiesReturnsFullPersistedSidebarHistory(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().Add(-time.Hour)
+	store.mu.Lock()
+	for index := 0; index < 105; index++ {
+		store.addActivityLocked(
+			"participation_schedule_created",
+			"",
+			"历史活动",
+			base.Add(time.Duration(index)*time.Minute),
+		)
+	}
+	err = store.saveLocked()
+	store.mu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activities := store.Activities(); len(activities) != 100 {
+		t.Fatalf("sidebar history length=%d, want persisted limit 100", len(activities))
+	}
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activities := reloaded.Activities(); len(activities) != 100 {
+		t.Fatalf("reloaded sidebar history length=%d, want 100", len(activities))
+	}
+}
+
 func TestReloadMigratesOverduePendingDrawToError(t *testing.T) {
 	dataDir := t.TempDir()
 	store, err := NewStore(dataDir)

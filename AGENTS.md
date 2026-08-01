@@ -52,7 +52,15 @@ The recent-activity section must never render demo or sample events. A fresh loc
 
 The sidebar names its live counters section “数据概览”. A separate “最近活动” section sits below it, reuses the same compact icon-and-copy row language, and owns the remaining scrollable space above the fixed footer.
 
+The sidebar recent-activity list displays the complete persisted history returned by the Go store (currently up to 100 newest entries) in its own scrollable region; never impose a smaller frontend-only item cap such as four rows.
+
+The recent-activity region uses a permanently reserved, thin Pilot-style internal scrollbar with a quiet light-gray track and rounded thumb. Keep its visible rail close to the sidebar divider with only a minimal inset while retaining a wider invisible hit area for dragging. Scrolling remains contained within recent activity so the data overview and fixed workspace footer do not move.
+
+Keep the “最近活动” section title fixed above its internal scroll viewport; only activity rows participate in scrolling, and the custom track begins below the title.
+
 The DY-KIRO-derived application icon uses a flat pure-white interior tile while preserving transparent outer corners and the original colored artwork. Background replacement must not redraw, resize, move, or simplify the heart line, circular arcs, dots, envelope, coin, highlights, or shadows.
+
+The Tauri bundle must explicitly list the PNG, macOS `.icns`, and Windows `.ico` application icons. Never rely on implicit icon discovery, because Universal macOS CI builds can otherwise emit an `.app` without `CFBundleIconFile` or `Contents/Resources`.
 
 The sidebar footer always shows the current application version followed by the current license edition. A fresh installation defaults to “免费版”; successful Keygen activation changes it to “专业版”. Reuse the legacy 福宝/DY-KIRO product, device fingerprint, machine activation, refresh, unbind, and offline-grace semantics in the Go engine. License keys remain only in the permission-restricted Go store and the frontend receives only safe status and masked metadata. Free and professional editions currently have no feature-level restrictions. The active-license panel shows its absolute expiry or “永久有效” when Keygen provides no expiry, and exposes an icon-only “更换授权码” action; replacing a key must validate the new key before overwriting the current working authorization. When a professional license has a finite expiry, the sidebar footer shows a compact “剩余 N 天” reminder immediately after the edition badge and uses the shared dark in-app Tooltip to reveal the exact expiry; permanent licenses omit this reminder.
 
@@ -118,9 +126,9 @@ One participation account may have only one unresolved accepted red packet at a 
 
 The personal draw-result query has a configurable post-draw timeout in the participation settings, defaulting to 10 seconds. If no definitive matching result is available when that window expires, persist the record as “开奖异常”, release the unresolved-result gate, and continue the current participation task according to its cooldown and stop limits. The participation-record tab exposes a native utility-window log entry matching the room-monitor log affordance. Participation logs may show only safe business request parameters and recursively redacted response JSON; Cookies, tokens, signatures, signed URLs, headers, device fingerprints, and other native credentials must never be persisted in or sent to that log window.
 
-Browser-instance refinements: the identity-row instance tile is 20px. Account names and Douyin IDs expose the shared dark in-app Tooltip only when the rendered text is actually truncated. Cards expose compact icon-only “打开实例” and “关闭实例” actions with shared in-app tooltips; closing always requires the compact confirmation dialog, then destroys the mounted child WebView and removes the card while preserving the account-keyed profile for later reuse. The CK-expired badge keeps its coral surface unchanged on hover and does not add a gray hover fill. The “新建实例” dialog supports multi-select batch creation for eligible participation accounts, while accounts that already own an instance remain excluded.
+Browser-instance refinements: the identity-row instance tile is 20px. Account names and Douyin IDs expose the shared dark in-app Tooltip only when the rendered text is actually truncated. Cards expose compact icon-only “打开实例” and “关闭实例” actions with shared in-app tooltips; closing always requires the compact confirmation dialog, then destroys the mounted child WebView and removes the card while preserving the account-keyed profile for later reuse. The CK-expired badge keeps its coral surface unchanged on hover and does not add a gray hover fill. When participation CK is expired, hide the red-packet participation icon in both the instance card and participation-account row instead of leaving an unusable control visible. The “新建实例” dialog supports multi-select batch creation for eligible participation accounts, while accounts that already own an instance remain excluded.
 
-Each browser-instance identity row may show the number of accounts currently live among that instance account's Douyin follows. Read it through the Go engine with the instance's canonical participation credential, never through frontend Cookie access. Clicking the count opens safe room metadata only: avatar, account name, live title, room number, room identifier, viewer count, and an external room action. Legacy 福宝 discovery/seed-room code and `similar_room_by_anchor` are references for signing and resilient parsing only; similar-room expansion must never be presented as the current account's followed-live list.
+Each browser-instance identity row may show the number of accounts currently live among that instance account's Douyin follows. Read it through the Go engine with the instance's canonical participation credential, never through frontend Cookie access. Show `0` only after a successful snapshot confirms zero live follows; while loading show only the compact spinner, and when no successful result exists render neither “未知” nor a failed-result placeholder. Clicking a successful count opens safe room metadata only: avatar, account name, live title, room number, room identifier, viewer count, and an external room action. Legacy 福宝 discovery/seed-room code and `similar_room_by_anchor` are references for signing and resilient parsing only; similar-room expansion must never be presented as the current account's followed-live list.
 
 The followed-live detail dialog is resizable within the desktop viewport like a lightweight Pilot utility panel. Its list owns vertical scrolling with a thin quiet scrollbar, never exposes horizontal scrolling, and reflows each live-room row when the dialog is narrowed instead of forcing fixed-width columns beyond the panel edge.
 
@@ -148,7 +156,7 @@ Windows in-app upgrades follow Pilot/Tauri Updater behavior: launch the NSIS pac
 
 Keep the native Windows title bar and system minimize/maximize/close controls. On Windows, remove the macOS-only web title strip entirely so primary navigation starts directly below the native title bar, and disable sidebar collapsing rather than placing a toggle in the content topbar. Preserve the normal page icon before the content title and keep the Windows topbar slightly more vertically relaxed than the macOS chrome. Preserve the existing macOS title strip, collapsible behavior, traffic-light alignment, page-title icon, and right-opening toggle Tooltip.
 
-On Windows, retain the native caption and system window controls but use DWM caption, text, and border colors that match the warm `--sidebar`/topbar palette. The Windows sidebar and main topbar share that same opaque surface so the native title bar and both web chrome regions read as one continuous Pilot-like frame; do not switch to a custom-drawn Windows title bar merely for this blend.
+On Windows, retain the native caption and system window controls. Keep the sidebar warm gray while the main topbar and content remain opaque pure white, and remove the sidebar's visible right divider because the background contrast already separates the regions. Preserve the transparent resize hit area without revealing or changing a divider on hover or drag; do not switch to a custom-drawn Windows title bar merely for this blend.
 
 参与账号拥有持久化的红包接口参与开关，默认关闭；灰色表示关闭、红色表示开启。只有开关开启、CK 有效且不在冷却期的参与账号才能被 Go 引擎分配红包参与任务。参与请求按账号和红包事件幂等去重；关闭开关仅阻止未来分配，不中断已发出的请求。原始 CK 和签名请求始终留在 Go/Rust 原生层。
 
@@ -156,17 +164,21 @@ On Windows, retain the native caption and system window controls but use DWM cap
 
 浏览器实例页提供全局“启动任务”入口，支持立即执行、指定日期、每天固定时间和间隔执行。计划定义、下次执行时间和原子到期领取必须持久化在 Go redpacket store；间隔计划保存后立即执行第一轮。每次触发只批量准备真实已登录浏览器实例的红包页面上下文并开启对应参与账号的红包接口参与池，已激活任务不得重复并发启动；失败实例回滚本次自动开启的参与池开关。计划创建、触发、批量成功数和跳过数必须写入安全的最近活动，原始 CK、签名和接口响应仍不得进入前端。
 
-顶部批量红包参与每次执行在最近活动中只保留一条批次摘要，不重复显示逐账号启动活动。摘要文案包含执行方式、参与实例数和跳过数；可在侧栏原地展开查看本批次账号及安全状态，并可停止整个批次。停止批次应先在 Go 层阻止这些账号的未来分配并关闭参与池，再清理对应原生页面上下文；已经发出的单次请求允许完成。
+顶部批量红包参与每次执行在最近活动中只保留一条批次摘要，不重复显示逐账号启动活动。摘要文案包含执行方式、参与实例数和跳过数；活动标题比数据概览小一号，第二行按“相对时间、停止、详情”的顺序显示紧凑控件，不显示向右展开箭头。详情图标打开紧凑弹窗展示本批次账号及安全状态，弹窗打开期间必须持续隐藏原生实例 WebView，停止图标则停止整个批次。停止批次应先在 Go 层阻止这些账号的未来分配并关闭参与池，再清理对应原生页面上下文；已经发出的单次请求允许完成。
 
-最近活动中的普通历史消息只读展示，不得复用页面切换或刷新行为制造虚假的可点击反馈；只有具备账号明细的红包参与批次摘要可以点击展开，运行中的批次另提供明确的停止操作。
+最近活动中的普通历史消息只读展示，不得复用页面切换或刷新行为制造虚假的可点击反馈；只有具备账号明细的红包参与批次摘要提供详情弹窗入口，运行中的批次另提供明确的停止操作。
 
 “启动任务”入口放在浏览器实例标题第一行并利用标题右侧空白做内联收缩展开；关闭时箭头向右提示展开，展开后箭头向左提示收回。操作项不得使用独立浮层、外框或阴影，第二行只保留实例、容量和资源信息。展开内容必须留在紧凑标题栏自身的几何范围内，不得撑高标题栏、下推实例卡片或隐藏真实浏览器子 WebView；操作区与下方原生 WebView 不得发生几何相交，CSS 层级不能作为覆盖原生 WebView 的解决方案。
 
 “管理计划”不放在启动方式展开组中；当存在已启用计划时，在浏览器实例标题第二行的 CPU/内存后显示紧凑入口和数量。管理面板只展示计划管理内容，支持拖动标题移动、拖动右下角调整大小，所有尺寸下都禁止横向滚动；新增计划仍由各启动方式入口打开。
 
+浏览器实例标题中的“启动任务”使用紧凑绿色语义；“管理计划”不使用任何按钮或数量徽标背景，只通过棕金色图标、文字和数字区分启动操作与计划管理，hover 也只加深文字颜色。
+
 执行计划中的间隔单位使用与应用一致的自定义紧凑下拉菜单，不使用浏览器或系统原生 `select` 外观。
 
 红包接口参与必须使用参与账号专属浏览器实例的真实直播页面上下文。实例卡片提供紧凑的红包图标；点击后先将该账号的原生子 WebView 切换到已确认开播的直播间并验证登录，再允许 Go 调度红包参与。`join/rush` 必须由直播页面中的 `bdms.js`/`window.fetch` 生成动态签名，禁止回退到脱离页面上下文的 Go HTTP 直连。页面上下文未准备好时不要创建误导性的参与失败记录；原始 Cookie、签名 URL 和原始接口响应不得进入前端 JavaScript。
+
+计划调度不得依赖浏览器实例页面是否处于当前视图，也不得依赖实例卡片是否已经渲染。调度到点后，原生层必须复用现有账号 WebView，或使用同一账号隔离数据目录与原生 Cookie 注入链路按需创建不可见 WebView，等待直播页面和登录状态就绪后再启用红包参与；原始 Cookie 和页面请求结果仍不得进入前端 JavaScript。
 
 浏览器实例卡片的红包图标必须是真实的双向开关：启用后再次点击应通过原生通道注销该账号的页面参与上下文并取消所有尚未发出的任务，不能只改变前端样式；已经发出的单次请求允许结束。自动页面参与对每个红包事件只允许发送一次 `join`，禁止在未捕获真实页面交互请求模板时猜测式追加 `rush` 回退，因为同一次事件的 `join → rush` 双请求会触发 `rush_spam` 风控。
 

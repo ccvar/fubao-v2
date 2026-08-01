@@ -424,8 +424,8 @@ func (s *Store) saveLocked() error {
 		participationTraces = participationTraces[:500]
 	}
 	sort.Slice(activities, func(i, j int) bool { return activities[i].CreatedAt > activities[j].CreatedAt })
-	if len(activities) > 50 {
-		activities = activities[:50]
+	if len(activities) > 100 {
+		activities = activities[:100]
 	}
 	payload, err := json.MarshalIndent(file{
 		Version: storeVersion, Monitors: monitors, Events: events, ParticipationRecords: participations,
@@ -767,8 +767,8 @@ func (s *Store) Activities() []Activity {
 		items = append(items, copy)
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt > items[j].CreatedAt })
-	if len(items) > 20 {
-		items = items[:20]
+	if len(items) > 100 {
+		items = items[:100]
 	}
 	return items
 }
