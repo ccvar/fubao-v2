@@ -559,10 +559,6 @@ button {
   color: #5f5b54;
 }
 
-.windows-platform.sidebar-collapsed .topbar .icon-button.collapsed-sidebar-toggle {
-  left: 16px;
-}
-
 .windows-platform:not(.detached-page-window) .topbar {
   padding-left: 34px;
 }
@@ -574,6 +570,11 @@ button {
   left: 8px;
   width: 22px;
   height: 22px;
+  border-radius: 6px;
+}
+
+.windows-platform:not(.detached-page-window) .title-group p {
+  margin-left: 0;
 }
 
 .collapsed-sidebar-toggle svg {

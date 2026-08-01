@@ -3537,10 +3537,12 @@
       {/if}
       <div class="title-group" data-tauri-drag-region>
         <div class="title-line" data-tauri-drag-region>
-          <span class="title-icon" data-tauri-drag-region>
-            {#if activeView === "browsers"}<Browser size={18} />
-            {:else}<UserFocus size={18} />{/if}
-          </span>
+          {#if !isWindowsPlatform || isDetachedPageWindow}
+            <span class="title-icon" data-tauri-drag-region>
+              {#if activeView === "browsers"}<Browser size={18} />
+              {:else}<UserFocus size={18} />{/if}
+            </span>
+          {/if}
           <h1 data-tauri-drag-region>{viewMeta[activeView].title}</h1>
         </div>
         <p data-tauri-drag-region>
