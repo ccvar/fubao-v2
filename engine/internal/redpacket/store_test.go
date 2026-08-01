@@ -245,16 +245,73 @@ func TestParticipationDailyScheduleAndBatchActivity(t *testing.T) {
 	if err != nil || next.Day() != 3 || next.Hour() != 20 || next.Minute() != 0 {
 		t.Fatalf("daily schedule must roll to tomorrow: %+v parsed=%v err=%v", schedule, next, err)
 	}
-	if err := store.RecordParticipationBatchResult(schedule.ID, schedule.Mode, 3, 1); err != nil {
+	if err := store.RecordParticipationBatchResult(schedule.ID, schedule.Mode, 3, 1, nil); err != nil {
 		t.Fatal(err)
 	}
 	activities := store.Activities()
 	foundBatch := false
 	for _, activity := range activities {
-		foundBatch = foundBatch || strings.Contains(activity.Label, "成功启动 3 个实例，跳过 1 个")
+		foundBatch = foundBatch || strings.Contains(activity.Label, "已执行“每天固定时间”：3 个实例参与，1 个实例跳过")
 	}
 	if len(activities) < 2 || !foundBatch {
 		t.Fatalf("batch activity was not recorded safely: %+v", activities)
+	}
+}
+
+func TestParticipationBatchActivityConsolidatesAccountStarts(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct{ id, name string }{{"account-1", "账号甲"}, {"account-2", "账号乙"}} {
+		if err := store.RecordParticipationStarted(item.id, item.name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.RecordParticipationBatchResult("", "immediate", 2, 1, []string{"account-1", "account-2"}); err != nil {
+		t.Fatal(err)
+	}
+	activities := store.Activities()
+	if len(activities) != 1 || activities[0].Kind != "participation_batch_executed" || activities[0].Label != "已启动“立即执行”：2 个实例参与，1 个实例跳过" {
+		t.Fatalf("account start activities were not consolidated: %+v", activities)
+	}
+	for _, accountID := range []string{"account-1", "account-2"} {
+		if task := store.participationTasks[accountID]; task == nil || !task.Active {
+			t.Fatalf("consolidating sidebar activity must preserve task %q: %+v", accountID, task)
+		}
+	}
+	stopped, err := store.StopParticipationBatch(activities[0].ID)
+	if err != nil || len(stopped) != 2 {
+		t.Fatalf("batch stop failed: accounts=%+v err=%v", stopped, err)
+	}
+	for _, accountID := range stopped {
+		if task := store.participationTasks[accountID]; task == nil || task.Active || task.EndReason != "批次手动停止" {
+			t.Fatalf("batch stop did not close task %q: %+v", accountID, task)
+		}
+	}
+	stoppedActivities := store.Activities()
+	if len(stoppedActivities) != 1 || stoppedActivities[0].Active || stoppedActivities[0].StoppedAt == "" {
+		t.Fatalf("batch activity did not persist stopped state: %+v", stoppedActivities)
+	}
+}
+
+func TestLegacyBatchActivityMigrationRestoresCurrentAccounts(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordParticipationStarted("legacy-account", "旧批次账号"); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	batch := store.addActivityLocked("participation_batch_executed", "", "立即执行红包参与：成功启动 1 个实例", time.Now())
+	migrated := store.migrateLegacyBatchActivitiesLocked()
+	store.mu.Unlock()
+	if !migrated || len(batch.AccountIDs) != 1 || batch.AccountIDs[0] != "legacy-account" || !batch.Active {
+		t.Fatalf("legacy batch account membership was not restored: %+v", batch)
+	}
+	if activities := store.Activities(); len(activities) != 1 || activities[0].ID != batch.ID {
+		t.Fatalf("legacy per-account activity was not consolidated: %+v", activities)
 	}
 }
 

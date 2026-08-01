@@ -12,6 +12,8 @@
     ArrowSquareOutIcon as ArrowSquareOut,
     BrowserIcon as Browser,
     CaretDownIcon as CaretDown,
+    CaretLeftIcon as CaretLeft,
+    CaretRightIcon as CaretRight,
     CheckCircleIcon as CheckCircle,
     ClockCountdownIcon as ClockCountdown,
     ClipboardTextIcon as ClipboardText,
@@ -354,8 +356,11 @@
 	id: string;
 	kind: "participation_started" | string;
 	account_id?: string;
+	account_ids?: string[];
 	label: string;
+	active?: boolean;
 	created_at: string;
+	stopped_at?: string;
   };
 
   type MonitorRuntimeLog = {
@@ -447,6 +452,7 @@
   };
   let participationTaskMenuOpen = false;
   let participationScheduleModalOpen = false;
+  let participationScheduleManaging = false;
   let participationScheduleBusy = false;
   let participationScheduleError = "";
   let participationScheduleMode: ParticipationScheduleMode = "once";
@@ -458,7 +464,17 @@
   let participationSchedules: ParticipationSchedule[] = [];
   let participationBatchRunning = false;
   let participationScheduleClaiming = false;
+  let participationScheduleModalElement: HTMLDialogElement;
+  let participationScheduleModalX = 0;
+  let participationScheduleModalY = 0;
+  let participationScheduleDragPointer = -1;
+  let participationScheduleDragStartX = 0;
+  let participationScheduleDragStartY = 0;
+  let participationScheduleDragOriginX = 0;
+  let participationScheduleDragOriginY = 0;
   let sidebarActivities: SidebarActivity[] = [];
+  let expandedSidebarActivityID = "";
+  let stoppingSidebarActivityID = "";
   $: licenseDaysRemaining = getLicenseDaysRemaining(licenseStatus.expires_at);
   let query = "";
   let searchOpen = false;
@@ -623,7 +639,11 @@
 
   $: recentActivityItems = sidebarActivities.slice(0, 4).map((activity) => ({
 		id: activity.id,
+		kind: activity.kind,
 		label: activity.label,
+		accountIDs: activity.account_ids ?? [],
+		active: Boolean(activity.active),
+		stoppedAt: activity.stopped_at,
 		time: formatMonitorTime(activity.created_at, redPacketClock),
 		icon: activity.kind.startsWith("participation_") ? (activity.kind.includes("schedule") ? ClockCountdown : Gift) : Radio,
 		tone: activity.kind.startsWith("participation_") ? "live" : "neutral",
@@ -811,6 +831,46 @@
 	}
   }
 
+  function sidebarActivityAccountName(accountID: string) {
+	const account = accounts.find((item) => item.id === accountID);
+	return account?.nickname || account?.name || account?.user_id || `账号 ${accountID.slice(0, 8)}`;
+  }
+
+  function sidebarActivityAccountState(accountID: string, activityActive: boolean, stoppedAt?: string) {
+	if (stoppedAt) return "已停止";
+	const instance = browserInstances.find((item) => item.account_id === accountID);
+	const context = instance ? browserParticipationContexts[instance.id] : undefined;
+	if (activityActive && instance && (context?.active || context?.accepting || browserRedPacketContextIds.includes(instance.id))) {
+		return "参与中";
+	}
+	return activityActive ? "等待红包" : "已结束";
+  }
+
+  function openSidebarActivity(activityID: string) {
+	expandedSidebarActivityID = expandedSidebarActivityID === activityID ? "" : activityID;
+  }
+
+  async function stopSidebarParticipationBatch(activityID: string, accountIDs: string[]) {
+	if (!isTauriDesktop() || stoppingSidebarActivityID) return;
+	stoppingSidebarActivityID = activityID;
+	try {
+		await engineRequest<{ account_ids: string[] }>("activity.stop_participation_batch", { activity_id: activityID });
+		const instanceIDs = browserInstances
+			.filter((instance) => accountIDs.includes(instance.account_id))
+			.map((instance) => instance.id);
+		await Promise.all(instanceIDs.map((instanceId) =>
+			invoke<void>("stop_browser_red_packet_context", { instanceId }).catch(() => undefined),
+		));
+		browserRedPacketContextIds = browserRedPacketContextIds.filter((instanceID) => !instanceIDs.includes(instanceID));
+		await Promise.all([loadAccounts(false), loadBrowserParticipationContexts(), loadSidebarActivities()]);
+		showToast(`已停止本批次 ${accountIDs.length} 个账号的后续红包参与`);
+	} catch (error) {
+		showToast(error instanceof Error ? error.message : String(error));
+	} finally {
+		stoppingSidebarActivityID = "";
+	}
+  }
+
   async function openParticipationSettings() {
 	await hideEmbeddedBrowsers();
 	participationSettingsError = "";
@@ -901,6 +961,7 @@
 
   async function openParticipationSchedule(mode: ParticipationScheduleMode) {
 	closeParticipationTaskMenu();
+	participationScheduleManaging = false;
 	participationScheduleMode = mode;
 	participationScheduleError = "";
 	participationScheduleRunAt = localDateTimeInput(new Date(Date.now() + 60 * 60_000));
@@ -908,6 +969,20 @@
 	participationScheduleInterval = 10;
 	participationScheduleIntervalUnit = "minutes";
 	participationScheduleUnitMenuOpen = false;
+	participationScheduleModalX = 0;
+	participationScheduleModalY = 0;
+	await hideEmbeddedBrowsers();
+	participationScheduleModalOpen = true;
+	void loadParticipationSchedules();
+  }
+
+  async function openParticipationScheduleManager() {
+	closeParticipationTaskMenu();
+	participationScheduleManaging = true;
+	participationScheduleError = "";
+	participationScheduleUnitMenuOpen = false;
+	participationScheduleModalX = 0;
+	participationScheduleModalY = 0;
 	await hideEmbeddedBrowsers();
 	participationScheduleModalOpen = true;
 	void loadParticipationSchedules();
@@ -916,9 +991,37 @@
   function closeParticipationSchedule() {
 	if (participationScheduleBusy) return;
 	participationScheduleUnitMenuOpen = false;
+	participationScheduleManaging = false;
 	participationScheduleModalOpen = false;
 	participationScheduleError = "";
 	scheduleEmbeddedBrowserSync();
+  }
+
+  function startParticipationScheduleDrag(event: PointerEvent) {
+	if (event.button !== 0 || (event.target as HTMLElement).closest("button, input, select, textarea, [role='button']")) return;
+	participationScheduleDragPointer = event.pointerId;
+	participationScheduleDragStartX = event.clientX;
+	participationScheduleDragStartY = event.clientY;
+	participationScheduleDragOriginX = participationScheduleModalX;
+	participationScheduleDragOriginY = participationScheduleModalY;
+	(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+  }
+
+  function moveParticipationScheduleDrag(event: PointerEvent) {
+	if (event.pointerId !== participationScheduleDragPointer || !participationScheduleModalElement) return;
+	const rect = participationScheduleModalElement.getBoundingClientRect();
+	const inset = 10;
+	const maxX = Math.max(0, (window.innerWidth - rect.width) / 2 - inset);
+	const maxY = Math.max(0, (window.innerHeight - rect.height) / 2 - inset);
+	participationScheduleModalX = Math.max(-maxX, Math.min(maxX, participationScheduleDragOriginX + event.clientX - participationScheduleDragStartX));
+	participationScheduleModalY = Math.max(-maxY, Math.min(maxY, participationScheduleDragOriginY + event.clientY - participationScheduleDragStartY));
+  }
+
+  function endParticipationScheduleDrag(event: PointerEvent) {
+	if (event.pointerId !== participationScheduleDragPointer) return;
+	participationScheduleDragPointer = -1;
+	const target = event.currentTarget as HTMLElement;
+	if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId);
   }
 
   function participationScheduleModeLabel(mode: ParticipationScheduleMode) {
@@ -3392,17 +3495,21 @@
 	browserError = "";
 	let started = 0;
 	let skipped = 0;
+	const startedAccountIDs: string[] = [];
 	try {
 		await Promise.all([loadAccounts(false), loadBrowserParticipationContexts()]);
 		for (const instance of browserInstances) {
-			if (await startBrowserRedPacketFromBatch(instance)) started += 1;
-			else skipped += 1;
+			if (await startBrowserRedPacketFromBatch(instance)) {
+				started += 1;
+				startedAccountIDs.push(instance.account_id);
+			} else skipped += 1;
 		}
 		await engineRequest("red_packet_participation.batch_result", {
 			schedule_id: execution?.schedule_id || "",
 			mode: execution?.mode || "immediate",
 			started,
 			skipped,
+			account_ids: startedAccountIDs,
 		});
 		await Promise.all([loadBrowserParticipationContexts(), loadSidebarActivities(), loadAccounts(false)]);
 		const prefix = execution ? `${participationScheduleModeLabel(execution.mode)}计划已执行` : "红包参与任务已启动";
@@ -3801,15 +3908,60 @@
         <p class="recent-activity-empty">暂无活动</p>
       {:else}
         {#each recentActivityItems as activity (activity.id)}
-          <button class="quick-row recent-activity-row" onclick={() => switchView(activity.view)}>
-            <span class:live={activity.tone === "live"} class="quick-status">
-              <svelte:component this={activity.icon} size={14} weight={activity.tone === "live" ? "fill" : "regular"} />
-            </span>
-            <span class="recent-activity-copy">
-              <span>{activity.label}</span>
-              <small>{activity.time}</small>
-            </span>
-          </button>
+          <div class:expanded={expandedSidebarActivityID === activity.id} class="recent-activity-item">
+            <div class="recent-activity-head">
+              {#if activity.kind === "participation_batch_executed" && activity.accountIDs.length > 0}
+                <button
+                  class="quick-row recent-activity-row"
+                  aria-expanded={expandedSidebarActivityID === activity.id}
+                  onclick={() => openSidebarActivity(activity.id)}
+                >
+                  <span class:live={activity.tone === "live"} class="quick-status">
+                    <svelte:component this={activity.icon} size={14} weight={activity.tone === "live" ? "fill" : "regular"} />
+                  </span>
+                  <span class="recent-activity-copy">
+                    <span>{activity.label}</span>
+                    <small>{activity.time}</small>
+                  </span>
+                  <span class="recent-activity-disclosure">
+                    {#if expandedSidebarActivityID === activity.id}<CaretDown size={11} />{:else}<CaretRight size={11} />{/if}
+                  </span>
+                </button>
+              {:else}
+                <div class="quick-row recent-activity-row static">
+                  <span class:live={activity.tone === "live"} class="quick-status">
+                    <svelte:component this={activity.icon} size={14} weight={activity.tone === "live" ? "fill" : "regular"} />
+                  </span>
+                  <span class="recent-activity-copy">
+                    <span>{activity.label}</span>
+                    <small>{activity.time}</small>
+                  </span>
+                </div>
+              {/if}
+              {#if activity.kind === "participation_batch_executed" && activity.active}
+                <button
+                  class="recent-activity-stop"
+                  aria-label="停止本批次"
+                  data-tooltip="停止本批次"
+                  data-tooltip-placement="right"
+                  disabled={Boolean(stoppingSidebarActivityID)}
+                  onclick={() => void stopSidebarParticipationBatch(activity.id, activity.accountIDs)}
+                >
+                  {#if stoppingSidebarActivityID === activity.id}<ArrowClockwise class="spinning" size={12} />{:else}<Pause size={12} weight="fill" />{/if}
+                </button>
+              {/if}
+            </div>
+            {#if expandedSidebarActivityID === activity.id}
+              <div class="recent-activity-detail">
+                {#each activity.accountIDs as accountID}
+                  <div class="recent-activity-account">
+                    <span>{sidebarActivityAccountName(accountID)}</span>
+                    <small class:active={sidebarActivityAccountState(accountID, activity.active, activity.stoppedAt) === "参与中"}>{sidebarActivityAccountState(accountID, activity.active, activity.stoppedAt)}</small>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </div>
         {/each}
       {/if}
     </div>
@@ -3911,10 +4063,15 @@
               >
                 {#if participationBatchRunning}<ArrowClockwise class="spinning" size={11} />{:else}<Play size={10} weight="fill" />{/if}
                 <span>{participationBatchRunning ? "启动中…" : "启动任务"}</span>
-                <CaretDown size={9} />
+                {#if participationTaskMenuOpen}<CaretLeft size={9} />{:else}<CaretRight size={9} />{/if}
               </button>
-              {#if participationTaskMenuOpen}
-                <span class="floating-menu participation-task-menu" role="menu">
+              <span
+                class:open={participationTaskMenuOpen}
+                class="participation-task-expand"
+                aria-hidden={!participationTaskMenuOpen}
+                inert={!participationTaskMenuOpen}
+              >
+                <span class="participation-task-menu" role="menu">
                   <button role="menuitem" onclick={() => void executeParticipationBatch()}>
                     <Play size={15} weight="fill" /><span>立即执行</span>
                   </button>
@@ -3927,14 +4084,8 @@
                   <button role="menuitem" onclick={() => openParticipationSchedule("interval")}>
                     <ArrowClockwise size={15} /><span>间隔执行</span>
                   </button>
-                  {#if participationSchedules.length > 0}
-                    <span class="menu-divider"></span>
-                    <button role="menuitem" onclick={() => openParticipationSchedule("once")}>
-                      <ClockCountdown size={15} /><span>管理计划</span><small>{participationSchedules.length}</small>
-                    </button>
-                  {/if}
                 </span>
-              {/if}
+              </span>
             </span>
           {/if}
         </div>
@@ -3948,6 +4099,13 @@
               data-tooltip={browserCapacity ? browserResourceUsageTooltip(browserCapacity) : "正在读取本机资源占用"}
               data-tooltip-placement="bottom"
             >CPU {browserCapacity ? browserCPUUsagePercent(browserCapacity) : "--"}% · 内存 {browserCapacity ? browserMemoryUsagePercent(browserCapacity) : "--"}%</span>
+            {#if participationSchedules.length > 0}
+              <button class="participation-schedule-manage-trigger" onclick={openParticipationScheduleManager}>
+                <ClockCountdown size={11} />
+                <span>管理计划</span>
+                <small>{participationSchedules.length}</small>
+              </button>
+            {/if}
           {/if}
         </p>
       </div>
@@ -4884,31 +5042,45 @@
     role="presentation"
     onclick={(event) => event.currentTarget === event.target && closeParticipationSchedule()}
   >
-    <dialog class="modal participation-schedule-modal" open aria-labelledby="participation-schedule-title">
-      <div class="modal-head">
+    <dialog
+      bind:this={participationScheduleModalElement}
+      class="modal participation-schedule-modal"
+      style={`transform: translate(${participationScheduleModalX}px, ${participationScheduleModalY}px)`}
+      open
+      aria-labelledby="participation-schedule-title"
+    >
+      <div
+        class="modal-head participation-schedule-modal-head"
+        onpointerdown={startParticipationScheduleDrag}
+        onpointermove={moveParticipationScheduleDrag}
+        onpointerup={endParticipationScheduleDrag}
+        onpointercancel={endParticipationScheduleDrag}
+      >
         <div>
           <span class="modal-icon participation-schedule-icon"><ClockCountdown size={18} /></span>
-          <h2 id="participation-schedule-title">新增执行计划</h2>
+          <h2 id="participation-schedule-title">{participationScheduleManaging ? "管理执行计划" : "新增执行计划"}</h2>
         </div>
         <button class="icon-button" aria-label="关闭" disabled={participationScheduleBusy} onclick={closeParticipationSchedule}><X size={17} /></button>
       </div>
 
-      <p class="participation-settings-intro">计划由 Go 引擎持久化；触发时批量启动已登录实例的真实红包页面参与。</p>
-      <div class="participation-schedule-modes" role="tablist" aria-label="调度方式">
-        {#each ["once", "daily", "interval"] as mode}
-          <button
-            class:active={participationScheduleMode === mode}
-            role="tab"
-            aria-selected={participationScheduleMode === mode}
-            onclick={() => {
-              participationScheduleMode = mode as ParticipationScheduleMode;
-              participationScheduleUnitMenuOpen = false;
-            }}
-          >{participationScheduleModeLabel(mode as ParticipationScheduleMode)}</button>
-        {/each}
-      </div>
+      <div class="participation-schedule-modal-body">
+        <p class="participation-settings-intro">{participationScheduleManaging ? "查看和删除已持久化的执行计划。拖动标题可移动面板，拖动右下角可调整大小。" : "计划由 Go 引擎持久化；触发时批量启动已登录实例的真实红包页面参与。"}</p>
+        {#if !participationScheduleManaging}
+          <div class="participation-schedule-modes" role="tablist" aria-label="调度方式">
+            {#each ["once", "daily", "interval"] as mode}
+              <button
+                class:active={participationScheduleMode === mode}
+                role="tab"
+                aria-selected={participationScheduleMode === mode}
+                onclick={() => {
+                  participationScheduleMode = mode as ParticipationScheduleMode;
+                  participationScheduleUnitMenuOpen = false;
+                }}
+              >{participationScheduleModeLabel(mode as ParticipationScheduleMode)}</button>
+            {/each}
+          </div>
 
-      <div class="participation-schedule-fields">
+          <div class="participation-schedule-fields">
         {#if participationScheduleMode === "once"}
           <label>
             <span><strong>执行日期</strong><small>到达指定日期和时间后执行一次</small></span>
@@ -4959,34 +5131,44 @@
             </span>
           </label>
         {/if}
-      </div>
+          </div>
+        {/if}
 
-      {#if participationSchedules.length > 0}
-        <div class="participation-schedule-existing">
-          <span class="schedule-section-title">已启用计划</span>
-          {#each participationSchedules as schedule (schedule.id)}
-            <div class="participation-schedule-row">
-              <span><strong>{participationScheduleModeLabel(schedule.mode)}</strong><small>{participationScheduleDescription(schedule)}</small></span>
-              <button
-                class="icon-button"
-                aria-label="删除执行计划"
-                data-tooltip="删除执行计划"
-                data-tooltip-placement="left"
-                disabled={participationScheduleBusy}
-                onclick={() => deleteParticipationSchedule(schedule)}
-              ><Trash size={14} /></button>
+        {#if participationScheduleManaging}
+          {#if participationSchedules.length > 0}
+            <div class="participation-schedule-existing">
+              <span class="schedule-section-title">已启用计划</span>
+              {#each participationSchedules as schedule (schedule.id)}
+                <div class="participation-schedule-row">
+                  <span><strong>{participationScheduleModeLabel(schedule.mode)}</strong><small>{participationScheduleDescription(schedule)}</small></span>
+                  <button
+                    class="icon-button"
+                    aria-label="删除执行计划"
+                    data-tooltip="删除执行计划"
+                    data-tooltip-placement="left"
+                    disabled={participationScheduleBusy}
+                    onclick={() => deleteParticipationSchedule(schedule)}
+                  ><Trash size={14} /></button>
+                </div>
+              {/each}
             </div>
-          {/each}
-        </div>
-      {/if}
+          {:else}
+            <div class="participation-schedule-empty">暂无已启用的执行计划</div>
+          {/if}
+        {/if}
 
-      {#if participationScheduleError}<div class="license-error"><WarningCircle size={14} />{participationScheduleError}</div>{/if}
+        {#if participationScheduleError}<div class="license-error"><WarningCircle size={14} />{participationScheduleError}</div>{/if}
+      </div>
       <div class="modal-actions">
-        <button class="secondary-button" disabled={participationScheduleBusy} onclick={closeParticipationSchedule}>取消</button>
-        <button class="primary-action" disabled={participationScheduleBusy} onclick={saveParticipationSchedule}>
-          {#if participationScheduleBusy}<ArrowClockwise class="spinning" size={14} />{/if}
-          {participationScheduleBusy ? "保存中…" : "保存计划"}
-        </button>
+        {#if participationScheduleManaging}
+          <button class="secondary-button" disabled={participationScheduleBusy} onclick={closeParticipationSchedule}>关闭</button>
+        {:else}
+          <button class="secondary-button" disabled={participationScheduleBusy} onclick={closeParticipationSchedule}>取消</button>
+          <button class="primary-action" disabled={participationScheduleBusy} onclick={saveParticipationSchedule}>
+            {#if participationScheduleBusy}<ArrowClockwise class="spinning" size={14} />{/if}
+            {participationScheduleBusy ? "保存中…" : "保存计划"}
+          </button>
+        {/if}
       </div>
     </dialog>
   </div>

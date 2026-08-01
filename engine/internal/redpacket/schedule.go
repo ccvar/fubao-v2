@@ -136,7 +136,7 @@ func (s *Store) ClaimDueParticipationSchedules(now time.Time) ([]ParticipationSc
 		case ParticipationScheduleInterval:
 			schedule.NextRunAt = now.Add(time.Duration(schedule.IntervalSeconds) * time.Second).Format(time.RFC3339Nano)
 		}
-		s.addActivityLocked("participation_schedule_dispatched", "", participationScheduleLabel(*schedule)+"已触发", now)
+		s.addActivityLocked("participation_schedule_dispatched", schedule.ID, participationScheduleLabel(*schedule)+"已触发", now)
 	}
 	if len(executions) == 0 {
 		return executions, nil
@@ -150,33 +150,133 @@ func (s *Store) ClaimDueParticipationSchedules(now time.Time) ([]ParticipationSc
 
 // RecordParticipationBatchResult adds one compact, safe dispatch summary to
 // recent activity after native browser preparation has completed.
-func (s *Store) RecordParticipationBatchResult(scheduleID, mode string, started, skipped int) error {
+func (s *Store) RecordParticipationBatchResult(scheduleID, mode string, started, skipped int, accountIDs []string) error {
 	mode = strings.TrimSpace(mode)
-	label := "立即执行红包参与"
+	label := "立即执行"
 	if strings.TrimSpace(scheduleID) != "" {
-		label = "红包参与计划执行"
+		label = "红包参与计划"
 		if mode == ParticipationScheduleDaily {
-			label = "每天固定时间计划执行"
+			label = "每天固定时间"
 		} else if mode == ParticipationScheduleInterval {
-			label = "间隔计划执行"
+			label = "间隔执行"
 		} else if mode == ParticipationScheduleOnce {
-			label = "指定日期计划执行"
+			label = "指定日期"
 		}
 	}
-	message := fmt.Sprintf("%s：成功启动 %d 个实例", label, maxInt(started, 0))
+	verb := "已启动"
+	if strings.TrimSpace(scheduleID) != "" {
+		verb = "已执行"
+	}
+	message := fmt.Sprintf("%s“%s”：%d 个实例参与", verb, label, maxInt(started, 0))
 	if skipped > 0 {
-		message += fmt.Sprintf("，跳过 %d 个", skipped)
+		message += fmt.Sprintf("，%d 个实例跳过", skipped)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.addActivityLocked("participation_batch_executed", "", message, time.Now())
+	// The batch summary replaces only the per-account start activities created
+	// by this exact batch. Participation tasks and detailed request records stay
+	// intact; only the noisy sidebar entries are consolidated.
+	for _, accountID := range accountIDs {
+		task := s.participationTasks[strings.TrimSpace(accountID)]
+		if task == nil || strings.TrimSpace(task.ID) == "" {
+			continue
+		}
+		if activity := s.activities[task.ID]; activity != nil && activity.Kind == "participation_started" {
+			delete(s.activities, task.ID)
+		}
+	}
+	if scheduleID = strings.TrimSpace(scheduleID); scheduleID != "" {
+		for id, activity := range s.activities {
+			if activity.Kind == "participation_schedule_dispatched" && activity.AccountID == scheduleID {
+				delete(s.activities, id)
+			}
+		}
+	}
+	activity := s.addActivityLocked("participation_batch_executed", "", message, time.Now())
+	seen := make(map[string]struct{}, len(accountIDs))
+	for _, accountID := range accountIDs {
+		accountID = strings.TrimSpace(accountID)
+		if accountID == "" {
+			continue
+		}
+		if _, exists := seen[accountID]; exists {
+			continue
+		}
+		seen[accountID] = struct{}{}
+		activity.AccountIDs = append(activity.AccountIDs, accountID)
+	}
+	activity.Active = len(activity.AccountIDs) > 0
 	return s.saveLocked()
 }
 
-func (s *Store) addActivityLocked(kind, accountID, label string, now time.Time) {
+// StopParticipationBatch prevents future assignments for every account in the
+// batch. Already-issued native requests are intentionally not interrupted.
+func (s *Store) StopParticipationBatch(activityID string) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	activity := s.activities[strings.TrimSpace(activityID)]
+	if activity == nil || activity.Kind != "participation_batch_executed" {
+		return nil, errors.New("红包参与批次不存在")
+	}
+	now := time.Now().Format(time.RFC3339Nano)
+	for _, accountID := range activity.AccountIDs {
+		if task := s.participationTasks[accountID]; task != nil && task.Active {
+			task.Active = false
+			task.EndedAt = now
+			task.EndReason = "批次手动停止"
+		}
+	}
+	activity.Active = false
+	activity.StoppedAt = now
+	if err := s.saveLocked(); err != nil {
+		return nil, err
+	}
+	return append([]string(nil), activity.AccountIDs...), nil
+}
+
+// migrateLegacyBatchActivitiesLocked upgrades batches written before account
+// membership was persisted. Only the exact currently-active task activity for
+// each account can be folded in, bounded to the batch's preparation window.
+func (s *Store) migrateLegacyBatchActivitiesLocked() bool {
+	migrated := false
+	for _, batch := range s.activities {
+		if batch.Kind != "participation_batch_executed" || len(batch.AccountIDs) > 0 {
+			continue
+		}
+		batchAt, err := time.Parse(time.RFC3339Nano, batch.CreatedAt)
+		if err != nil {
+			continue
+		}
+		for accountID, task := range s.participationTasks {
+			if task == nil || !task.Active {
+				continue
+			}
+			started := s.activities[task.ID]
+			if started == nil || started.Kind != "participation_started" {
+				continue
+			}
+			startedAt, parseErr := time.Parse(time.RFC3339Nano, started.CreatedAt)
+			if parseErr != nil || startedAt.After(batchAt) || batchAt.Sub(startedAt) > 5*time.Minute {
+				continue
+			}
+			batch.AccountIDs = append(batch.AccountIDs, accountID)
+			delete(s.activities, task.ID)
+			migrated = true
+		}
+		if len(batch.AccountIDs) > 0 {
+			sort.Strings(batch.AccountIDs)
+			batch.Active = true
+		}
+	}
+	return migrated
+}
+
+func (s *Store) addActivityLocked(kind, accountID, label string, now time.Time) *Activity {
 	sum := sha256.Sum256([]byte(kind + "\x00" + accountID + "\x00" + label + "\x00" + now.Format(time.RFC3339Nano)))
 	id := hex.EncodeToString(sum[:12])
-	s.activities[id] = &Activity{ID: id, Kind: kind, AccountID: accountID, Label: label, CreatedAt: now.Format(time.RFC3339Nano)}
+	activity := &Activity{ID: id, Kind: kind, AccountID: accountID, Label: label, CreatedAt: now.Format(time.RFC3339Nano)}
+	s.activities[id] = activity
+	return activity
 }
 
 func participationScheduleLabel(schedule ParticipationSchedule) string {

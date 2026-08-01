@@ -945,16 +945,17 @@ func main() {
 				continue
 			}
 			var params struct {
-				ScheduleID string `json:"schedule_id"`
-				Mode       string `json:"mode"`
-				Started    int    `json:"started"`
-				Skipped    int    `json:"skipped"`
+				ScheduleID string   `json:"schedule_id"`
+				Mode       string   `json:"mode"`
+				Started    int      `json:"started"`
+				Skipped    int      `json:"skipped"`
+				AccountIDs []string `json:"account_ids"`
 			}
 			if err := json.Unmarshal(req.Params, &params); err != nil || params.Started < 0 || params.Skipped < 0 {
 				writeError(encoder, req.ID, "invalid_params", "红包参与批量执行结果无效")
 				continue
 			}
-			if err := redPacketStore.RecordParticipationBatchResult(params.ScheduleID, params.Mode, params.Started, params.Skipped); err != nil {
+			if err := redPacketStore.RecordParticipationBatchResult(params.ScheduleID, params.Mode, params.Started, params.Skipped, params.AccountIDs); err != nil {
 				writeError(encoder, req.ID, "participation_batch_result_failed", err.Error())
 				continue
 			}
@@ -994,6 +995,34 @@ func main() {
 				continue
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.Activities()})
+		case "activity.stop_participation_batch":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			var params struct {
+				ActivityID string `json:"activity_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.ActivityID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "红包参与批次参数无效")
+				continue
+			}
+			accountIDs, err := redPacketStore.StopParticipationBatch(params.ActivityID)
+			if err != nil {
+				writeError(encoder, req.ID, "participation_batch_stop_failed", err.Error())
+				continue
+			}
+			if pageParticipation != nil {
+				for _, accountID := range accountIDs {
+					pageParticipation.StopAccount(accountID)
+				}
+			}
+			if accountStoreErr == nil {
+				for _, accountID := range accountIDs {
+					_, _ = accountStore.SetRedPacketAPIEnabled(accountID, false)
+				}
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{"account_ids": accountIDs}})
 		case "red_packet_participation.native_context":
 			var params struct {
 				InstanceID string `json:"instance_id"`

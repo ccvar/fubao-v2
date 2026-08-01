@@ -177,11 +177,14 @@ type ParticipationSettings struct {
 // Activity is safe sidebar history. It never contains credentials, request
 // URLs, signatures, headers, or raw interface responses.
 type Activity struct {
-	ID        string `json:"id"`
-	Kind      string `json:"kind"`
-	AccountID string `json:"account_id,omitempty"`
-	Label     string `json:"label"`
-	CreatedAt string `json:"created_at"`
+	ID         string   `json:"id"`
+	Kind       string   `json:"kind"`
+	AccountID  string   `json:"account_id,omitempty"`
+	AccountIDs []string `json:"account_ids,omitempty"`
+	Label      string   `json:"label"`
+	Active     bool     `json:"active,omitempty"`
+	CreatedAt  string   `json:"created_at"`
+	StoppedAt  string   `json:"stopped_at,omitempty"`
 }
 
 // ParticipationSchedule is a credential-free persisted trigger definition.
@@ -365,6 +368,9 @@ func (s *Store) load() error {
 			s.activities[activity.ID] = activity
 		}
 	}
+	if s.migrateLegacyBatchActivitiesLocked() {
+		migrated = true
+	}
 	if migrated {
 		return s.saveLocked()
 	}
@@ -406,6 +412,7 @@ func (s *Store) saveLocked() error {
 	activities := make([]*Activity, 0, len(s.activities))
 	for _, item := range s.activities {
 		copy := *item
+		copy.AccountIDs = append([]string(nil), item.AccountIDs...)
 		activities = append(activities, &copy)
 	}
 	sort.Slice(monitors, func(i, j int) bool { return monitors[i].Name < monitors[j].Name })
@@ -746,7 +753,18 @@ func (s *Store) Activities() []Activity {
 	defer s.mu.Unlock()
 	items := make([]Activity, 0, len(s.activities))
 	for _, activity := range s.activities {
-		items = append(items, *activity)
+		copy := *activity
+		copy.AccountIDs = append([]string(nil), activity.AccountIDs...)
+		if copy.Kind == "participation_batch_executed" && copy.Active {
+			copy.Active = false
+			for _, accountID := range copy.AccountIDs {
+				if task := s.participationTasks[accountID]; task != nil && task.Active {
+					copy.Active = true
+					break
+				}
+			}
+		}
+		items = append(items, copy)
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt > items[j].CreatedAt })
 	if len(items) > 20 {
