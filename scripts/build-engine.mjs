@@ -30,9 +30,18 @@ mkdirSync(binaryDir, { recursive: true });
 
 function buildGo(output, buildPlatform) {
   rmSync(output, { force: true });
+  const linkerFlags =
+    buildPlatform.goos === "windows" ? "-s -w -H=windowsgui" : "-s -w";
   execFileSync(
     "go",
-    ["build", "-trimpath", "-ldflags=-s -w", "-o", output, "./cmd/fubao-engine"],
+    [
+      "build",
+      "-trimpath",
+      `-ldflags=${linkerFlags}`,
+      "-o",
+      output,
+      "./cmd/fubao-engine",
+    ],
     {
       cwd: join(root, "engine"),
       env: {

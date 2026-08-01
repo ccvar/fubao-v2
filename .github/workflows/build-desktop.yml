@@ -91,6 +91,28 @@ jobs:
           TAURI_ENV_TARGET_TRIPLE: ${{ matrix.target }}
         run: npm run tauri build -- --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
+      - name: Verify Windows executables do not open a console
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          function Assert-GuiSubsystem([string] $Path) {
+            if (-not (Test-Path $Path)) {
+              throw "Windows executable not found: $Path"
+            }
+
+            $bytes = [System.IO.File]::ReadAllBytes($Path)
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+            $optionalHeaderOffset = $peOffset + 24
+            $subsystem = [BitConverter]::ToUInt16($bytes, $optionalHeaderOffset + 68)
+            if ($subsystem -ne 2) {
+              throw "Expected Windows GUI subsystem (2), got $subsystem for $Path"
+            }
+            Write-Host "Verified GUI subsystem: $Path"
+          }
+
+          Assert-GuiSubsystem "src-tauri/target/x86_64-pc-windows-msvc/release/fubao-desktop.exe"
+          Assert-GuiSubsystem "src-tauri/binaries/fubao-engine-x86_64-pc-windows-msvc.exe"
+
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
