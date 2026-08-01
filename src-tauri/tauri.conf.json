@@ -32,7 +32,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
+    "targets": "all",
     "category": "Productivity",
     "shortDescription": "本地红包监测与参与控制台",
     "externalBin": ["binaries/fubao-engine"]

@@ -4,9 +4,13 @@ import { join, resolve } from "node:path";
 
 const root = resolve(import.meta.dirname, "..");
 const binaryDir = join(root, "src-tauri", "binaries");
-const target = execFileSync("rustc", ["--print", "host-tuple"], {
+const hostTarget = execFileSync("rustc", ["--print", "host-tuple"], {
   encoding: "utf8",
 }).trim();
+const target =
+  process.env.TAURI_ENV_TARGET_TRIPLE ||
+  process.env.CARGO_BUILD_TARGET ||
+  hostTarget;
 
 const mappings = {
   "aarch64-apple-darwin": { goos: "darwin", goarch: "arm64", suffix: "" },
@@ -18,31 +22,58 @@ const mappings = {
 };
 
 const platform = mappings[target];
-if (!platform) {
+if (!platform && target !== "universal-apple-darwin") {
   throw new Error(`Unsupported Rust target tuple: ${target}`);
 }
 
 mkdirSync(binaryDir, { recursive: true });
-const tempOutput = join(binaryDir, `fubao-engine-build${platform.suffix}`);
-const finalOutput = join(binaryDir, `fubao-engine-${target}${platform.suffix}`);
-rmSync(tempOutput, { force: true });
 
-execFileSync(
-  "go",
-  ["build", "-trimpath", "-ldflags=-s -w", "-o", tempOutput, "./cmd/fubao-engine"],
-  {
-    cwd: join(root, "engine"),
-    env: {
-      ...process.env,
-      GOOS: platform.goos,
-      GOARCH: platform.goarch,
-      CGO_ENABLED: "0",
-      GOCACHE: join(root, ".cache", "go-build"),
+function buildGo(output, buildPlatform) {
+  rmSync(output, { force: true });
+  execFileSync(
+    "go",
+    ["build", "-trimpath", "-ldflags=-s -w", "-o", output, "./cmd/fubao-engine"],
+    {
+      cwd: join(root, "engine"),
+      env: {
+        ...process.env,
+        GOOS: buildPlatform.goos,
+        GOARCH: buildPlatform.goarch,
+        CGO_ENABLED: "0",
+        GOCACHE: join(root, ".cache", "go-build"),
+      },
+      stdio: "inherit",
     },
-    stdio: "inherit",
-  },
-);
+  );
+}
 
-rmSync(finalOutput, { force: true });
-renameSync(tempOutput, finalOutput);
-console.log(`Go sidecar ready: ${finalOutput}`);
+if (target === "universal-apple-darwin") {
+  const amd64Output = join(
+    binaryDir,
+    "fubao-engine-x86_64-apple-darwin",
+  );
+  const arm64Output = join(
+    binaryDir,
+    "fubao-engine-aarch64-apple-darwin",
+  );
+  const finalOutput = join(binaryDir, `fubao-engine-${target}`);
+
+  buildGo(amd64Output, mappings["x86_64-apple-darwin"]);
+  buildGo(arm64Output, mappings["aarch64-apple-darwin"]);
+  rmSync(finalOutput, { force: true });
+  execFileSync(
+    "lipo",
+    ["-create", "-output", finalOutput, amd64Output, arm64Output],
+    { stdio: "inherit" },
+  );
+  console.log(
+    `Universal Go sidecars ready: ${amd64Output}, ${arm64Output}, ${finalOutput}`,
+  );
+} else {
+  const tempOutput = join(binaryDir, `fubao-engine-build${platform.suffix}`);
+  const finalOutput = join(binaryDir, `fubao-engine-${target}${platform.suffix}`);
+  buildGo(tempOutput, platform);
+  rmSync(finalOutput, { force: true });
+  renameSync(tempOutput, finalOutput);
+  console.log(`Go sidecar ready: ${finalOutput}`);
+}
