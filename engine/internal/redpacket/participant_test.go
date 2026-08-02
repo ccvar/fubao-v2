@@ -28,6 +28,24 @@ type fakeParticipationStore struct {
 	notify      chan struct{}
 }
 
+type fakeParticipationFollowMatcher struct {
+	known   map[string]bool
+	matches map[string]map[string]bool
+}
+
+func (m *fakeParticipationFollowMatcher) MatchRoom(accountID, webRID, actualRoomID, anchorID string) (bool, bool) {
+	known := m.known[accountID]
+	if !known {
+		return false, false
+	}
+	for _, value := range []string{webRID, actualRoomID, anchorID} {
+		if m.matches[accountID][value] {
+			return true, true
+		}
+	}
+	return false, true
+}
+
 func (s *fakeParticipationStore) RedPacketParticipationCredentials(time.Time) []accounts.RedPacketParticipationCredential {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -323,6 +341,162 @@ func TestParticipantFiltersConfiguredPacketTypeBeforeDispatch(t *testing.T) {
 	defer poster.mu.Unlock()
 	if poster.calls != 1 {
 		t.Fatalf("matching gift packet should dispatch exactly once, calls=%d", poster.calls)
+	}
+}
+
+func TestParticipantFollowOnlyDispatchesMatchingAccount(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{
+		PacketType: ParticipationPacketTypeDiamond, FollowPolicy: ParticipationFollowPolicyOnly,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, accountID := range []string{"account-followed", "account-other"} {
+		if err := recordStore.RecordParticipationStarted(accountID, accountID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store := &fakeParticipationStore{
+		credentials: []accounts.RedPacketParticipationCredential{
+			{AccountID: "account-followed", Cookie: "sessionid_ss=one"},
+			{AccountID: "account-other", Cookie: "sessionid_ss=two"},
+		},
+		notify: make(chan struct{}, 2),
+	}
+	poster := &fakePoster{responses: []*http.Response{jsonResponse(200, `{"status_code":0,"data":{"succeed":true}}`)}}
+	participant := newParticipant(store, 1, func(Event, accounts.RedPacketParticipationCredential) signedPoster { return poster }, recordStore)
+	participant.SetFollowMatcher(&fakeParticipationFollowMatcher{
+		known: map[string]bool{"account-followed": true, "account-other": true},
+		matches: map[string]map[string]bool{
+			"account-followed": {"7654321": true},
+			"account-other":    {},
+		},
+	})
+
+	participant.HandleEvent(Event{
+		ID: "event-follow-only", WebRID: "7654321", ActualRoomID: "700001",
+		JoinBoxID: "box-follow-only", Title: "钻石红包",
+	})
+	select {
+	case <-store.notify:
+	case <-time.After(time.Second):
+		t.Fatal("matching followed account was not dispatched")
+	}
+	time.Sleep(30 * time.Millisecond)
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.records) != 1 || store.records[0].accountID != "account-followed" {
+		t.Fatalf("follow-only policy dispatched unexpected accounts: %+v", store.records)
+	}
+}
+
+func TestParticipantFollowPriorityLetsFollowedPacketWinAccountSlot(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{
+		PacketType: ParticipationPacketTypeDiamond, FollowPolicy: ParticipationFollowPolicyPriority,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationStarted("account-priority", "优先账号"); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeParticipationStore{
+		credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-priority", Cookie: "sessionid_ss=ok"}},
+		notify:      make(chan struct{}, 2),
+	}
+	nonFollowedPoster := &fakePoster{responses: []*http.Response{jsonResponse(200, `{"status_code":0,"data":{"succeed":true}}`)}}
+	followedPoster := &fakePoster{responses: []*http.Response{jsonResponse(200, `{"status_code":0,"data":{"succeed":true}}`)}}
+	participant := newParticipant(store, 1, func(event Event, _ accounts.RedPacketParticipationCredential) signedPoster {
+		if event.WebRID == "followed-room" {
+			return followedPoster
+		}
+		return nonFollowedPoster
+	}, recordStore)
+	participant.followPriorityDelay = 60 * time.Millisecond
+	participant.SetFollowMatcher(&fakeParticipationFollowMatcher{
+		known:   map[string]bool{"account-priority": true},
+		matches: map[string]map[string]bool{"account-priority": {"followed-room": true}},
+	})
+
+	participant.HandleEvent(Event{
+		ID: "event-other", WebRID: "other-room", ActualRoomID: "700001",
+		JoinBoxID: "box-other", Title: "钻石红包",
+	})
+	participant.HandleEvent(Event{
+		ID: "event-followed", WebRID: "followed-room", ActualRoomID: "700002",
+		JoinBoxID: "box-followed", Title: "钻石红包",
+	})
+	select {
+	case <-store.notify:
+	case <-time.After(time.Second):
+		t.Fatal("followed packet was not dispatched")
+	}
+	time.Sleep(100 * time.Millisecond)
+	followedPoster.mu.Lock()
+	followedCalls := followedPoster.calls
+	followedPoster.mu.Unlock()
+	nonFollowedPoster.mu.Lock()
+	nonFollowedCalls := nonFollowedPoster.calls
+	nonFollowedPoster.mu.Unlock()
+	if followedCalls != 1 || nonFollowedCalls != 0 {
+		t.Fatalf("priority policy did not preserve the account slot: followed=%d other=%d", followedCalls, nonFollowedCalls)
+	}
+}
+
+func TestParticipantFollowPriorityFailsOpenButFollowOnlyFailsClosedWithoutSnapshot(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		policy    string
+		wantCalls int
+	}{
+		{name: "priority", policy: ParticipationFollowPolicyPriority, wantCalls: 1},
+		{name: "only", policy: ParticipationFollowPolicyOnly, wantCalls: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			recordStore, err := NewStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := recordStore.SetParticipationSettings(ParticipationSettings{
+				PacketType: ParticipationPacketTypeDiamond, FollowPolicy: test.policy,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := recordStore.RecordParticipationStarted("account-unknown", "快照账号"); err != nil {
+				t.Fatal(err)
+			}
+			store := &fakeParticipationStore{
+				credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-unknown", Cookie: "sessionid_ss=ok"}},
+				notify:      make(chan struct{}, 1),
+			}
+			poster := &fakePoster{responses: []*http.Response{jsonResponse(200, `{"status_code":0,"data":{"succeed":true}}`)}}
+			participant := newParticipant(store, 1, func(Event, accounts.RedPacketParticipationCredential) signedPoster { return poster }, recordStore)
+			participant.SetFollowMatcher(&fakeParticipationFollowMatcher{known: map[string]bool{}, matches: map[string]map[string]bool{}})
+			participant.HandleEvent(Event{
+				ID: "event-unknown-follow", WebRID: "7654321", ActualRoomID: "700001",
+				JoinBoxID: "box-unknown-follow", Title: "钻石红包",
+			})
+			if test.wantCalls == 1 {
+				select {
+				case <-store.notify:
+				case <-time.After(time.Second):
+					t.Fatal("priority mode must fail open when no follow snapshot is available")
+				}
+			} else {
+				time.Sleep(40 * time.Millisecond)
+			}
+			poster.mu.Lock()
+			defer poster.mu.Unlock()
+			if poster.calls != test.wantCalls {
+				t.Fatalf("policy %s calls=%d want=%d", test.policy, poster.calls, test.wantCalls)
+			}
+		})
 	}
 }
 

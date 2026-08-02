@@ -105,6 +105,7 @@ func TestParticipationSettingsPolicyAndActivityPersist(t *testing.T) {
 	}
 	settings, err := store.SetParticipationSettings(ParticipationSettings{
 		StopAfterJoins: 2, CooldownSeconds: 30, StopAfterWins: 1, PacketType: ParticipationPacketTypeGift,
+		FollowPolicy: ParticipationFollowPolicyOnly,
 	})
 	if err != nil || settings.CooldownSeconds != 30 {
 		t.Fatalf("unexpected saved settings: %+v err=%v", settings, err)
@@ -162,12 +163,16 @@ func TestParticipationSettingsDefaultDrawTimeoutAndSafeTrace(t *testing.T) {
 	if got := store.GetParticipationSettings().PacketType; got != ParticipationPacketTypeDiamond {
 		t.Fatalf("default packet type=%q, want %q", got, ParticipationPacketTypeDiamond)
 	}
+	if got := store.GetParticipationSettings().FollowPolicy; got != ParticipationFollowPolicyPriority {
+		t.Fatalf("default follow policy=%q, want %q", got, ParticipationFollowPolicyPriority)
+	}
 	if err := store.RecordParticipationStarted("account-log", "日志账号"); err != nil {
 		t.Fatal(err)
 	}
 	task := PageParticipationTask{
 		Action: "join", EventID: "event-log", AccountID: "account-log", AccountName: "日志账号",
 		WebRID: "123456", ActualRoomID: "700001", BoxID: "7669063194534955828", AnchorID: "anchor",
+		FollowPolicy: ParticipationFollowPolicyPriority, Followed: true, FollowMatchKnown: true,
 	}
 	response := PageParticipationResponse{
 		Endpoint: "join", HTTPStatus: 200,
@@ -179,6 +184,9 @@ func TestParticipationSettingsDefaultDrawTimeoutAndSafeTrace(t *testing.T) {
 	traces := store.ParticipationTraces()
 	if len(traces) != 1 || traces[0].RequestParams["room_id"] != "700001" || traces[0].RequestParams["box_id"] == "" {
 		t.Fatalf("safe request trace missing business params: %+v", traces)
+	}
+	if traces[0].FollowPolicy != ParticipationFollowPolicyPriority || !traces[0].FollowMatchKnown || !traces[0].Followed {
+		t.Fatalf("safe follow decision missing from trace: %+v", traces[0])
 	}
 	encoded, err := json.Marshal(traces)
 	if err != nil {

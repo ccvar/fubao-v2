@@ -57,4 +57,16 @@ func TestStoreNativeNormalizesAndCachesSafeSnapshot(t *testing.T) {
 	if cached.Total != 2 || cached.RefreshedAt != result.RefreshedAt {
 		t.Fatalf("expected native snapshot from cache, got %#v", cached)
 	}
+	if matched, known := service.MatchRoom("account-1", "778899", "", ""); !known || !matched {
+		t.Fatalf("expected web room to match the account snapshot: matched=%v known=%v", matched, known)
+	}
+	if matched, known := service.MatchRoom("account-1", "", "123", ""); !known || !matched {
+		t.Fatalf("expected actual room to match the account snapshot: matched=%v known=%v", matched, known)
+	}
+	if matched, known := service.MatchRoom("account-1", "not-followed", "", ""); !known || matched {
+		t.Fatalf("expected authoritative non-match: matched=%v known=%v", matched, known)
+	}
+	if matched, known := service.MatchRoom("missing-account", "778899", "", ""); known || matched {
+		t.Fatalf("missing snapshots must remain unknown: matched=%v known=%v", matched, known)
+	}
 }

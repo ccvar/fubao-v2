@@ -172,6 +172,8 @@ The followed-live detail dialog is resizable within the desktop viewport like a 
 
 Browser instance cards keep a compact loading indicator visible until the native child WebView reports its first completed Douyin page load. Initial child WebViews remain hidden and off-card until ready; never let an unpainted white native surface cover the HTML loading state.
 
+Opening any settings surface from the browser-instance page must publish its modal-open guard before hiding native child WebViews. In-flight mounts must re-check that guard and remain hidden so a late native surface can never paint above the settings dialog.
+
 In the “新建浏览器实例” dialog, keep the participation-account refresh action fixed at the far left of the modal footer. Refreshing rotates that fixed icon and preserves the existing account-list surface and modal dimensions; never replace a populated list with a loading frame that makes the dialog jump.
 
 Red-packet prize parsing follows 福宝's luckybox grouping rule: group every box row belonging to the same activity, ignore zero placeholder amounts, sum positive diamond values, and display the activity total plus share count (for example `总99钻，24份红包`). The luckybox share count may be encoded in `biz_extra.tags[business_type]` and must be decoded before falling back to grouped-row count. If no authoritative positive prize is available, show a pending state instead of a fabricated `0钻`. Event expiry is a live countdown plus absolute time in the compact form `00:32 · 8/1 13:55:19`; visually emphasize the countdown over the absolute timestamp. Red-packet room titles open the corresponding `https://live.douyin.com/{web_rid}` page in the system browser, stay left-aligned on one line, and truncate with an ellipsis inside their grid column instead of overlapping prize data. Keep the external-link icon immediately beside the visible title text rather than pushing it to the far edge of the column.
@@ -199,6 +201,8 @@ Keep the native Windows title bar and system minimize/maximize/close controls. O
 On Windows, retain the native caption and system window controls. Keep the sidebar warm gray while the main topbar and content remain opaque pure white, and remove the sidebar's visible right divider because the background contrast already separates the regions. Preserve the transparent resize hit area without revealing or changing a divider on hover or drag; do not switch to a custom-drawn Windows title bar merely for this blend.
 
 参与账号拥有持久化的红包接口参与开关，默认关闭；灰色表示关闭、红色表示开启。只有开关开启、CK 有效且不在冷却期的参与账号才能被 Go 引擎分配红包参与任务。参与请求按账号和红包事件幂等去重；关闭开关仅阻止未来分配，不中断已发出的请求。原始 CK 和签名请求始终留在 Go/Rust 原生层。
+
+红包参与设置包含持久化的关注范围策略：“不限 / 关注列表优先 / 只参加关注主播”，默认“关注列表优先”。关注关系必须按每个参与账号自己的原生关注直播快照独立判断；优先模式先为关注主播红包保留账号的单一未开奖参与名额，关注快照暂不可用时按不限处理；“只参加关注主播”在无法确认匹配时不发送请求。该策略必须由 Go 调度器在原生请求前和积压事件重试时再次执行，并在安全参与日志中记录策略与匹配结果；关注关系、CK 与请求凭证不得返回前端 JavaScript。
 
 红包参与设置包含持久化的“最低钻石”门槛，默认 1 钻。只有在红包数据能够可靠给出总钻石数与份数或明确的每份钻石数时，Go 引擎才在原生请求前按每份金额执行门槛；金额未知或信息不完整时不得猜测，也不得因此拦截参与。
 

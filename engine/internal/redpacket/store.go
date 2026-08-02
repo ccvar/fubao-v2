@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	storeVersion         = 9
+	storeVersion         = 10
 	unknownProbeInterval = 10 * time.Second
 	offlineProbeInterval = 60 * time.Second
 	livePacketInterval   = 15 * time.Second
@@ -32,6 +32,10 @@ const (
 	ParticipationPacketTypeAll     = "all"
 	ParticipationPacketTypeGift    = "gift"
 	ParticipationPacketTypeDiamond = "diamond"
+
+	ParticipationFollowPolicyAll      = "all"
+	ParticipationFollowPolicyPriority = "follow_priority"
+	ParticipationFollowPolicyOnly     = "follow_only"
 )
 
 // Monitor is safe metadata returned to the frontend. Cookie values are never
@@ -171,18 +175,21 @@ type ParticipationTask struct {
 // signatures, URLs, headers, Cookies and raw unfiltered responses are never
 // stored or exposed through this type.
 type ParticipationTrace struct {
-	ID             string            `json:"id"`
-	TaskID         string            `json:"task_id,omitempty"`
-	EventID        string            `json:"event_id"`
-	AccountID      string            `json:"account_id"`
-	AccountName    string            `json:"account_name,omitempty"`
-	Action         string            `json:"action"`
-	Endpoint       string            `json:"endpoint,omitempty"`
-	HTTPStatus     int               `json:"http_status,omitempty"`
-	RequestParams  map[string]string `json:"request_params"`
-	ResponseParams string            `json:"response_params,omitempty"`
-	Error          string            `json:"error,omitempty"`
-	CreatedAt      string            `json:"created_at"`
+	ID               string            `json:"id"`
+	TaskID           string            `json:"task_id,omitempty"`
+	EventID          string            `json:"event_id"`
+	AccountID        string            `json:"account_id"`
+	AccountName      string            `json:"account_name,omitempty"`
+	Action           string            `json:"action"`
+	Endpoint         string            `json:"endpoint,omitempty"`
+	HTTPStatus       int               `json:"http_status,omitempty"`
+	RequestParams    map[string]string `json:"request_params"`
+	ResponseParams   string            `json:"response_params,omitempty"`
+	Error            string            `json:"error,omitempty"`
+	FollowPolicy     string            `json:"follow_policy,omitempty"`
+	Followed         bool              `json:"followed,omitempty"`
+	FollowMatchKnown bool              `json:"follow_match_known,omitempty"`
+	CreatedAt        string            `json:"created_at"`
 }
 
 // ParticipationSettings are safe global limits applied independently to each
@@ -194,6 +201,7 @@ type ParticipationSettings struct {
 	DrawResultTimeoutSeconds int    `json:"draw_result_timeout_seconds"`
 	MinimumDiamonds          int    `json:"minimum_diamonds"`
 	PacketType               string `json:"packet_type"`
+	FollowPolicy             string `json:"follow_policy"`
 }
 
 // Activity is safe sidebar history. It never contains credentials, request
@@ -557,6 +565,16 @@ func normalizeParticipationSettings(settings ParticipationSettings) Participatio
 	default:
 		settings.PacketType = ParticipationPacketTypeDiamond
 	}
+	switch strings.ToLower(strings.TrimSpace(settings.FollowPolicy)) {
+	case ParticipationFollowPolicyAll:
+		settings.FollowPolicy = ParticipationFollowPolicyAll
+	case ParticipationFollowPolicyOnly:
+		settings.FollowPolicy = ParticipationFollowPolicyOnly
+	case ParticipationFollowPolicyPriority:
+		settings.FollowPolicy = ParticipationFollowPolicyPriority
+	default:
+		settings.FollowPolicy = ParticipationFollowPolicyPriority
+	}
 	if settings.StopAfterJoins < 0 {
 		settings.StopAfterJoins = 0
 	}
@@ -897,7 +915,9 @@ func (s *Store) RecordParticipationTrace(task PageParticipationTask, response Pa
 		AccountName: strings.TrimSpace(task.AccountName), Action: firstNonEmpty(task.Action, "join"),
 		Endpoint: strings.TrimSpace(response.Endpoint), HTTPStatus: response.HTTPStatus,
 		RequestParams: params, ResponseParams: safeParticipationResponse(response.Body),
-		Error: safeParticipationLogText(response.Error), CreatedAt: now.Format(time.RFC3339Nano),
+		Error: safeParticipationLogText(response.Error), FollowPolicy: task.FollowPolicy,
+		Followed: task.Followed, FollowMatchKnown: task.FollowMatchKnown,
+		CreatedAt: now.Format(time.RFC3339Nano),
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()

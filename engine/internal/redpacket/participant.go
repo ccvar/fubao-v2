@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,6 +65,12 @@ type participationSettingsStore interface {
 	GetParticipationSettings() ParticipationSettings
 }
 
+// ParticipationFollowMatcher is the credential-free account-scoped follow
+// lookup consumed by the native scheduler.
+type ParticipationFollowMatcher interface {
+	MatchRoom(accountID, webRID, actualRoomID, anchorID string) (matched, known bool)
+}
+
 type participationTraceStore interface {
 	RecordParticipationTrace(task PageParticipationTask, response PageParticipationResponse) error
 }
@@ -88,17 +95,20 @@ type participationCancellationStore interface {
 // execute a luckybox action inside an account's live-room WebView. Cookies,
 // signed URLs and response bodies never cross the frontend JavaScript bridge.
 type PageParticipationTask struct {
-	Action       string
-	EventID      string
-	AccountID    string
-	AccountName  string
-	WebRID       string
-	ActualRoomID string
-	BoxID        string
-	AnchorID     string
-	BoxType      string
-	SendTime     string
-	DelayTime    string
+	Action           string
+	EventID          string
+	AccountID        string
+	AccountName      string
+	WebRID           string
+	ActualRoomID     string
+	BoxID            string
+	AnchorID         string
+	BoxType          string
+	SendTime         string
+	DelayTime        string
+	FollowPolicy     string
+	Followed         bool
+	FollowMatchKnown bool
 }
 
 // PageParticipationResponse is returned over the authenticated native
@@ -132,12 +142,14 @@ type participantClientFactory func(Event, accounts.RedPacketParticipationCredent
 // account/event pair before sending so attempts remain idempotent across engine
 // restarts as well as repeated callbacks in the current process.
 type Participant struct {
-	store         ParticipationStore
-	recordStore   ParticipationRecordStore
-	clientFactory participantClientFactory
-	pageExecutor  PageParticipationExecutor
-	sem           chan struct{}
-	retryDelay    time.Duration
+	store               ParticipationStore
+	recordStore         ParticipationRecordStore
+	clientFactory       participantClientFactory
+	pageExecutor        PageParticipationExecutor
+	sem                 chan struct{}
+	retryDelay          time.Duration
+	followPriorityDelay time.Duration
+	followMatcher       ParticipationFollowMatcher
 
 	mu        sync.Mutex
 	attempted map[string]struct{}
@@ -182,18 +194,31 @@ func newParticipant(store ParticipationStore, concurrency int, factory participa
 		concurrency = 1
 	}
 	participant := &Participant{
-		store:         store,
-		clientFactory: factory,
-		sem:           make(chan struct{}, concurrency),
-		retryDelay:    250 * time.Millisecond,
-		attempted:     map[string]struct{}{},
-		accounts:      map[string]*sync.Mutex{},
-		resolving:     map[string]struct{}{},
+		store:               store,
+		clientFactory:       factory,
+		sem:                 make(chan struct{}, concurrency),
+		retryDelay:          250 * time.Millisecond,
+		followPriorityDelay: 2 * time.Second,
+		attempted:           map[string]struct{}{},
+		accounts:            map[string]*sync.Mutex{},
+		resolving:           map[string]struct{}{},
 	}
 	if len(recordStores) > 0 {
 		participant.recordStore = recordStores[0]
 	}
 	return participant
+}
+
+// SetFollowMatcher connects the account-scoped followed-live snapshot to the
+// participant without exposing that relationship or any credential to the
+// frontend. A nil matcher leaves the default priority mode in fail-open mode.
+func (p *Participant) SetFollowMatcher(matcher ParticipationFollowMatcher) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.followMatcher = matcher
+	p.mu.Unlock()
 }
 
 // HandleEvent is suitable for Store.SetEventHandler. The red-packet store calls
@@ -211,8 +236,66 @@ func (p *Participant) HandleEvent(event Event) {
 		return
 	}
 	for _, credential := range p.store.RedPacketParticipationCredentials(time.Now()) {
-		p.dispatch(event, credential)
+		p.scheduleDispatch(event, credential, true)
 	}
+}
+
+type participationFollowDecision struct {
+	policy  string
+	matched bool
+	known   bool
+}
+
+func (p *Participant) followDecision(event Event, accountID string) participationFollowDecision {
+	decision := participationFollowDecision{policy: ParticipationFollowPolicyAll}
+	if settingsStore, ok := p.recordStore.(participationSettingsStore); ok {
+		decision.policy = settingsStore.GetParticipationSettings().FollowPolicy
+	}
+	if decision.policy == ParticipationFollowPolicyAll {
+		return decision
+	}
+	p.mu.Lock()
+	matcher := p.followMatcher
+	p.mu.Unlock()
+	if matcher != nil {
+		decision.matched, decision.known = matcher.MatchRoom(
+			accountID, event.WebRID, event.ActualRoomID, event.AnchorID,
+		)
+	}
+	return decision
+}
+
+func followDecisionAllows(decision participationFollowDecision) bool {
+	return decision.policy != ParticipationFollowPolicyOnly || (decision.known && decision.matched)
+}
+
+func (p *Participant) scheduleDispatch(event Event, credential accounts.RedPacketParticipationCredential, allowPriorityDelay bool) {
+	decision := p.followDecision(event, credential.AccountID)
+	if !followDecisionAllows(decision) {
+		return
+	}
+	if allowPriorityDelay && decision.policy == ParticipationFollowPolicyPriority && decision.known && !decision.matched {
+		delay := p.followPriorityDelay
+		if delay <= 0 {
+			delay = time.Millisecond
+		}
+		time.AfterFunc(delay, func() {
+			if eventOpenAt(event, time.Now()) {
+				p.scheduleDispatch(event, credential, false)
+			}
+		})
+		return
+	}
+	p.dispatch(event, credential, decision)
+}
+
+func eventOpenAt(event Event, now time.Time) bool {
+	for _, value := range []string{event.ExpiresAt, event.DrawAt} {
+		if deadline, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value)); err == nil {
+			return now.Before(deadline)
+		}
+	}
+	return true
 }
 
 func (p *Participant) matchesPacketType(event Event) bool {
@@ -270,7 +353,7 @@ func eventDiamondsPerShare(event Event) (float64, bool) {
 	return 0, false
 }
 
-func (p *Participant) dispatch(event Event, credential accounts.RedPacketParticipationCredential) {
+func (p *Participant) dispatch(event Event, credential accounts.RedPacketParticipationCredential, decision participationFollowDecision) {
 	if p.pageExecutor != nil && !p.pageExecutor.Ready(credential.AccountID) {
 		return
 	}
@@ -281,7 +364,7 @@ func (p *Participant) dispatch(event Event, credential accounts.RedPacketPartici
 	if !p.reserve(key) {
 		return
 	}
-	go p.run(event, credential, key)
+	go p.run(event, credential, key, decision)
 }
 
 // RetryEventForAccount is used after the user explicitly prepares an account's
@@ -303,6 +386,10 @@ func (p *Participant) RetryEventForAccount(event Event, accountID string) {
 	if selected == nil {
 		return
 	}
+	decision := p.followDecision(event, accountID)
+	if !followDecisionAllows(decision) {
+		return
+	}
 	if retryStore, ok := p.recordStore.(participationRetryStore); ok {
 		reset, err := retryStore.ResetParticipation(event.ID, accountID)
 		if err != nil || !reset {
@@ -311,7 +398,7 @@ func (p *Participant) RetryEventForAccount(event Event, accountID string) {
 	}
 	key := accountID + "\x00" + event.ID
 	p.forget(key)
-	p.dispatch(event, *selected)
+	p.scheduleDispatch(event, *selected, true)
 }
 
 func (p *Participant) reserve(key string) bool {
@@ -341,7 +428,7 @@ func (p *Participant) accountLock(accountID string) *sync.Mutex {
 	return lock
 }
 
-func (p *Participant) run(event Event, credential accounts.RedPacketParticipationCredential, key string) {
+func (p *Participant) run(event Event, credential accounts.RedPacketParticipationCredential, key string, decision participationFollowDecision) {
 	// One account must never enter several luckybox actions concurrently. The
 	// platform treats that burst as rush_spam; after the previous task records a
 	// cooldown, the next waiter re-checks eligibility and is discarded safely.
@@ -362,6 +449,11 @@ func (p *Participant) run(event Event, credential accounts.RedPacketParticipatio
 		p.forget(key)
 		return
 	}
+	decision = p.followDecision(event, credential.AccountID)
+	if !followDecisionAllows(decision) {
+		p.forget(key)
+		return
+	}
 	if p.recordStore != nil {
 		reserved, err := p.recordStore.ReserveParticipation(event, credential.AccountID, credential.AccountName)
 		if err != nil {
@@ -373,7 +465,7 @@ func (p *Participant) run(event Event, credential accounts.RedPacketParticipatio
 		}
 	}
 
-	result := p.attempt(event, credential)
+	result := p.attempt(event, credential, decision)
 	if result.joined && result.cooldown <= 0 {
 		if policy, ok := p.recordStore.(participationPolicyStore); ok {
 			_, configured := policy.ParticipationPolicy(credential.AccountID, time.Now())
@@ -590,12 +682,37 @@ func (p *Participant) retryCurrentEventsForAccount(accountID string) {
 		}
 	}
 	now := time.Now()
-	for _, event := range backlog.EventsAll() {
+	events := backlog.EventsAll()
+	sort.SliceStable(events, func(i, j int) bool {
+		left := p.followDecision(events[i], accountID)
+		right := p.followDecision(events[j], accountID)
+		return followDecisionRank(left) < followDecisionRank(right)
+	})
+	for _, event := range events {
 		if expiresAt, err := time.Parse(time.RFC3339Nano, event.ExpiresAt); err == nil && !now.Before(expiresAt) {
 			continue
 		}
 		p.RetryEventForAccount(event, accountID)
 	}
+}
+
+func followDecisionRank(decision participationFollowDecision) int {
+	if decision.policy == ParticipationFollowPolicyOnly {
+		if decision.known && decision.matched {
+			return 0
+		}
+		return 3
+	}
+	if decision.policy != ParticipationFollowPolicyPriority {
+		return 0
+	}
+	if decision.known && decision.matched {
+		return 0
+	}
+	if !decision.known {
+		return 1
+	}
+	return 2
 }
 
 func drawResultTime(event Event) time.Time {
@@ -724,9 +841,9 @@ func (p *Participant) stillEligible(accountID string) bool {
 	return false
 }
 
-func (p *Participant) attempt(event Event, credential accounts.RedPacketParticipationCredential) participationResult {
+func (p *Participant) attempt(event Event, credential accounts.RedPacketParticipationCredential, decision participationFollowDecision) participationResult {
 	if p.pageExecutor != nil {
-		return p.attemptInPage(event, credential)
+		return p.attemptInPage(event, credential, decision)
 	}
 	client := p.clientFactory(event, credential)
 	params := participationParams(event, false)
@@ -742,21 +859,24 @@ func (p *Participant) attempt(event Event, credential accounts.RedPacketParticip
 	return rush
 }
 
-func (p *Participant) attemptInPage(event Event, credential accounts.RedPacketParticipationCredential) participationResult {
+func (p *Participant) attemptInPage(event Event, credential accounts.RedPacketParticipationCredential, decision participationFollowDecision) participationResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
 	task := PageParticipationTask{
-		Action:       "join",
-		EventID:      event.ID,
-		AccountID:    credential.AccountID,
-		AccountName:  credential.AccountName,
-		WebRID:       strings.TrimSpace(event.WebRID),
-		ActualRoomID: strings.TrimSpace(event.ActualRoomID),
-		BoxID:        strings.TrimSpace(event.JoinBoxID),
-		AnchorID:     strings.TrimSpace(event.AnchorID),
-		BoxType:      strings.TrimSpace(event.BoxType),
-		SendTime:     strings.TrimSpace(event.SendTime),
-		DelayTime:    strings.TrimSpace(event.DelayTime),
+		Action:           "join",
+		EventID:          event.ID,
+		AccountID:        credential.AccountID,
+		AccountName:      credential.AccountName,
+		WebRID:           strings.TrimSpace(event.WebRID),
+		ActualRoomID:     strings.TrimSpace(event.ActualRoomID),
+		BoxID:            strings.TrimSpace(event.JoinBoxID),
+		AnchorID:         strings.TrimSpace(event.AnchorID),
+		BoxType:          strings.TrimSpace(event.BoxType),
+		SendTime:         strings.TrimSpace(event.SendTime),
+		DelayTime:        strings.TrimSpace(event.DelayTime),
+		FollowPolicy:     decision.policy,
+		Followed:         decision.matched,
+		FollowMatchKnown: decision.known,
 	}
 	response := p.pageExecutor.Execute(ctx, task)
 	if traceStore, ok := p.recordStore.(participationTraceStore); ok {

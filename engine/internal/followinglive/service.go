@@ -76,6 +76,41 @@ func (s *Service) StoreNative(accountID string, items []Item) Result {
 	return result
 }
 
+// MatchRoom reports whether a live-room event belongs to the latest
+// successful followed-live snapshot for one participation account. The second
+// result is false when no sufficiently recent snapshot exists, allowing the
+// default priority policy to fail open without mistaking a transport problem
+// for an empty follow list.
+func (s *Service) MatchRoom(accountID, webRID, actualRoomID, anchorID string) (bool, bool) {
+	accountID = strings.TrimSpace(accountID)
+	webRID = strings.TrimSpace(webRID)
+	actualRoomID = strings.TrimSpace(actualRoomID)
+	anchorID = strings.TrimSpace(anchorID)
+	if accountID == "" {
+		return false, false
+	}
+
+	s.mu.Lock()
+	entry, exists := s.cache[accountID]
+	s.mu.Unlock()
+	if !exists || time.Now().After(entry.expiresAt.Add(s.ttl)) {
+		return false, false
+	}
+	for _, item := range entry.result.Items {
+		if sameNonEmpty(webRID, item.WebRID) ||
+			sameNonEmpty(actualRoomID, item.RoomID) ||
+			sameNonEmpty(anchorID, item.UserID) ||
+			sameNonEmpty(anchorID, item.SecUID) {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+func sameNonEmpty(left, right string) bool {
+	return left != "" && left == strings.TrimSpace(right)
+}
+
 // Fetch returns the current followed accounts that are live. A stale cached
 // result is preferred over turning a temporary network failure into a false
 // empty state.

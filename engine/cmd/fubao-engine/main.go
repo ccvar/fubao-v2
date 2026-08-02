@@ -110,6 +110,7 @@ func main() {
 	if redPacketStoreErr == nil && accountStoreErr == nil && browserStoreErr == nil {
 		pageParticipation = newPageParticipationBroker(browserStore)
 		redPacketParticipant = redpacket.NewPageParticipant(accountStore, pageParticipation, redPacketStore)
+		redPacketParticipant.SetFollowMatcher(followingLiveService)
 	}
 	var remoteSyncManager *remotesync.Manager
 	remoteSyncManagerErr := dataDirErr

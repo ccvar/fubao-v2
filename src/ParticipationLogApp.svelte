@@ -21,6 +21,9 @@
     request_params: Record<string, string>;
     response_params?: string;
     error?: string;
+    follow_policy?: "all" | "follow_priority" | "follow_only";
+    followed?: boolean;
+    follow_match_known?: boolean;
     created_at: string;
   };
 
@@ -53,6 +56,16 @@
     } catch {
       return value;
     }
+  }
+
+  function followLabel(log: ParticipationTrace) {
+    if (log.follow_policy === "follow_only") return log.followed ? "只参加关注主播 · 已匹配" : "只参加关注主播";
+    if (log.follow_policy === "follow_priority") {
+      if (!log.follow_match_known) return "关注列表优先 · 快照不可用，按不限处理";
+      return log.followed ? "关注列表优先 · 已匹配关注主播" : "关注列表优先 · 非关注主播候选";
+    }
+    if (log.follow_policy === "all") return "不限关注范围";
+    return "";
   }
 
   async function clearLogs() {
@@ -97,6 +110,7 @@
             <em>{log.endpoint || "page"}{log.http_status ? ` · HTTP ${log.http_status}` : ""}</em>
           </summary>
           <div class="participation-log-detail">
+            {#if followLabel(log)}<section><h2>关注策略</h2><pre>{followLabel(log)}</pre></section>{/if}
             <section><h2>请求参数</h2><pre>{prettyJSON(log.request_params)}</pre></section>
             <section><h2>响应参数</h2><pre>{prettyJSON(log.response_params)}</pre></section>
             {#if log.error}<section class="participation-log-error"><h2>异常</h2><pre>{log.error}</pre></section>{/if}

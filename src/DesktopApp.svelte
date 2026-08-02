@@ -364,10 +364,14 @@
 	request_params: Record<string, string>;
 	response_params?: string;
 	error?: string;
+	follow_policy?: ParticipationFollowPolicy;
+	followed?: boolean;
+	follow_match_known?: boolean;
 	created_at: string;
   };
 
 	type ParticipationPacketType = "all" | "gift" | "diamond";
+	type ParticipationFollowPolicy = "all" | "follow_priority" | "follow_only";
 
   type ParticipationSettings = {
 	stop_after_joins: number;
@@ -376,6 +380,7 @@
 	draw_result_timeout_seconds: number;
 	minimum_diamonds: number;
 	packet_type: ParticipationPacketType;
+	follow_policy: ParticipationFollowPolicy;
   };
 
   type ParticipationScheduleMode = "once" | "daily" | "interval";
@@ -514,6 +519,7 @@
 	draw_result_timeout_seconds: 10,
 	minimum_diamonds: 1,
 	packet_type: "diamond",
+	follow_policy: "follow_priority",
   };
   let participationTaskMenuOpen = false;
   let participationScheduleModalOpen = false;
@@ -1072,9 +1078,12 @@
   }
 
   async function openParticipationSettings() {
-	await hideEmbeddedBrowsers();
 	participationSettingsError = "";
 	participationSettingsModalOpen = true;
+	// Publish the modal guard before issuing native hide commands. A WebView
+	// mount that was already in flight can otherwise finish in the small gap
+	// after hideEmbeddedBrowsers and paint above the newly opened dialog.
+	await hideEmbeddedBrowsers();
 	if (!isTauriDesktop()) return;
 	participationSettingsBusy = true;
 	try {
@@ -1139,6 +1148,9 @@
 		packet_type: (["all", "gift", "diamond"] as ParticipationPacketType[]).includes(participationSettings.packet_type)
 			? participationSettings.packet_type
 			: "diamond" as ParticipationPacketType,
+		follow_policy: (["all", "follow_priority", "follow_only"] as ParticipationFollowPolicy[]).includes(participationSettings.follow_policy)
+			? participationSettings.follow_policy
+			: "follow_priority" as ParticipationFollowPolicy,
 	};
 	if (!isTauriDesktop()) {
 		participationSettings = next;
@@ -4847,8 +4859,8 @@
                 disabled={participationBatchRunning}
                 onclick={toggleParticipationTaskMenu}
               >
-                {#if participationBatchRunning}<ArrowClockwise class="spinning" size={11} />{:else}<Play size={10} weight="fill" />{/if}
-                <span>{participationBatchRunning ? "启动中…" : "启动任务"}</span>
+                {#if participationBatchRunning}<ArrowClockwise class="spinning" size={11} />{:else}<Gift size={11} weight="fill" />{/if}
+                <span>{participationBatchRunning ? "抢包中…" : "抢包"}</span>
                 {#if participationTaskMenuOpen}<CaretLeft size={9} />{:else}<CaretRight size={9} />{/if}
               </button>
               <span
@@ -5957,6 +5969,21 @@
                   class:active={participationSettings.packet_type === option[0]}
                   disabled={participationSettingsBusy}
                   onclick={() => participationSettings.packet_type = option[0] as ParticipationPacketType}
+                >{option[1]}</button>
+              {/each}
+            </div>
+          </div>
+          <div class="participation-setting-row participation-packet-type-row">
+            <span><strong>参与哪些红包</strong><small>按每个参与账号自己的关注直播判断；优先模式会先等候关注主播红包，无可用关注快照时按不限处理</small></span>
+            <div class="participation-packet-type-options" role="radiogroup" aria-label="参与红包的关注范围">
+              {#each [["all", "不限"], ["follow_priority", "关注列表优先"], ["follow_only", "只参加关注主播"]] as option}
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={participationSettings.follow_policy === option[0]}
+                  class:active={participationSettings.follow_policy === option[0]}
+                  disabled={participationSettingsBusy}
+                  onclick={() => participationSettings.follow_policy = option[0] as ParticipationFollowPolicy}
                 >{option[1]}</button>
               {/each}
             </div>
