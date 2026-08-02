@@ -537,11 +537,15 @@ func (p *Participant) finishTaskIfComplete(accountID string) {
 		return
 	}
 	reason := state.StopReason
-	if err := lifecycle.FinishParticipationTask(accountID, reason); err != nil {
-		return
-	}
+	// Stop the native account context before publishing the persisted inactive
+	// state. Otherwise observers can see Active=false in the small window between
+	// FinishParticipationTask returning and StopAccount running, while the page
+	// context is still accepting work.
 	if stopper, ok := p.pageExecutor.(participationAccountStopper); ok {
 		stopper.StopAccount(accountID)
+	}
+	if err := lifecycle.FinishParticipationTask(accountID, reason); err != nil {
+		return
 	}
 }
 
