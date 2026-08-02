@@ -174,6 +174,8 @@ The followed-live detail dialog is resizable within the desktop viewport like a 
 
 Browser instance cards keep a compact loading indicator visible until the native child WebView reports its first completed Douyin page load. Initial child WebViews remain hidden and off-card until ready; never let an unpainted white native surface cover the HTML loading state.
 
+On Windows, an independently opened browser instance uses only the native system title bar; do not render the redundant in-page account/title strip above the Douyin surface. Opening an instance must restore, bring forward, and focus its independent window. Reopening the same instance reuses and foregrounds the existing native window instead of creating a duplicate WebView or surfacing an `already exists` error.
+
 Opening any settings surface from the browser-instance page must publish its modal-open guard before hiding native child WebViews. In-flight mounts must re-check that guard and remain hidden so a late native surface can never paint above the settings dialog.
 
 In the “新建浏览器实例” dialog, keep the participation-account refresh action fixed at the far left of the modal footer. Refreshing rotates that fixed icon and preserves the existing account-list surface and modal dimensions; never replace a populated list with a loading frame that makes the dialog jump.

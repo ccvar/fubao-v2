@@ -3669,8 +3669,16 @@
       query = "";
       roomRenderLimit = 300;
     } catch (error) {
-      roomError = error instanceof Error ? error.message : String(error);
-      showToast(roomError);
+      const message = error instanceof Error ? error.message : String(error);
+      // A fresh installation normally has no legacy rooms_config.json. The
+      // empty state already explains that there are no rooms, so the automatic
+      // best-effort migration must not surface the same information as a toast.
+      if (silent && message.includes("未找到旧福宝直播间数据")) {
+        roomError = "";
+      } else {
+        roomError = message;
+        showToast(roomError);
+      }
     } finally {
       roomsMigrating = false;
     }

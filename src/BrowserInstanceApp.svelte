@@ -15,6 +15,7 @@
   };
 
   const instanceId = new URL(window.location.href).searchParams.get("instance")?.trim() || "";
+  const isWindowsDesktop = /Windows/i.test(navigator.userAgent);
   let viewport: HTMLElement;
   let metadata: InstanceMetadata | null = null;
   let loading = true;
@@ -88,12 +89,14 @@
 </script>
 
 <main class="instance-window-shell">
-  <header data-tauri-drag-region>
-    <div data-tauri-drag-region>
-      <span><Browser size={14} /></span>
-      <strong>{metadata?.account_name || "浏览器实例"}</strong>
-    </div>
-  </header>
+  {#if !isWindowsDesktop}
+    <header data-tauri-drag-region>
+      <div data-tauri-drag-region>
+        <span><Browser size={14} /></span>
+        <strong>{metadata?.account_name || "浏览器实例"}</strong>
+      </div>
+    </header>
+  {/if}
   <section bind:this={viewport} class="instance-window-viewport">
     {#if loading && !error}<div class="instance-window-state"><i></i><span>正在打开实例…</span></div>{/if}
     {#if error}<div class="instance-window-state error"><WarningCircle size={20} /><span>{error}</span></div>{/if}

@@ -143,6 +143,43 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+fn reveal_window(window: &tauri::Window) -> Result<(), String> {
+    window
+        .show()
+        .map_err(|error| format!("显示窗口失败：{error}"))?;
+    let _ = window.unminimize();
+    #[cfg(windows)]
+    force_windows_window_front(window);
+    window
+        .set_focus()
+        .map_err(|error| format!("聚焦窗口失败：{error}"))?;
+    #[cfg(windows)]
+    force_windows_window_front(window);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn force_windows_window_front(window: &tauri::Window) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_NOTOPMOST,
+        HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE,
+    };
+
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW;
+    unsafe {
+        let _ = ShowWindow(hwnd.0, SW_RESTORE);
+        let _ = SetWindowPos(hwnd.0, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        let _ = BringWindowToTop(hwnd.0);
+        let _ = SetForegroundWindow(hwnd.0);
+        // Use TOPMOST only as an activation assist. The instance window must
+        // not remain above unrelated applications after it receives focus.
+        let _ = SetWindowPos(hwnd.0, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+    }
+}
+
 #[cfg(windows)]
 fn apply_windows_titlebar_palette(window: &tauri::WebviewWindow) {
     use windows_sys::Win32::Graphics::Dwm::{
@@ -2559,14 +2596,12 @@ async fn open_browser_instance_window(
         return Err("浏览器实例标识无效".into());
     }
     let label = format!("instance-window-{}", safe_window_label_part(&instance_id));
-    if let Some(window) = app.get_webview_window(&label) {
-        window
-            .show()
-            .map_err(|error| format!("显示实例窗口失败：{error}"))?;
-        let _ = window.unminimize();
-        window
-            .set_focus()
-            .map_err(|error| format!("聚焦实例窗口失败：{error}"))?;
+    // Look up the native window rather than only the WebviewWindow wrapper.
+    // On Windows the native window can already be registered while the
+    // webview lookup is briefly unavailable, which previously sent this path
+    // into a duplicate build and surfaced an `already exists` error.
+    if let Some(window) = app.get_window(&label) {
+        reveal_window(&window)?;
         return Ok(());
     }
 
@@ -2625,6 +2660,13 @@ async fn open_browser_instance_window(
     let window = match builder.build() {
         Ok(window) => window,
         Err(error) => {
+            // A concurrent second click may race with the first window build.
+            // Reuse and activate the winner instead of treating it as a user-
+            // visible creation failure.
+            if let Some(window) = app.get_window(&label) {
+                reveal_window(&window)?;
+                return Ok(());
+            }
             let _ = native_engine_request(
                 runtime.inner().clone(),
                 "browser.runtime.release",
@@ -2636,6 +2678,17 @@ async fn open_browser_instance_window(
     };
     #[cfg(windows)]
     apply_windows_titlebar_palette(&window);
+    if let Some(native_window) = app.get_window(&label) {
+        reveal_window(&native_window)?;
+    } else {
+        window
+            .show()
+            .map_err(|error| format!("显示实例窗口失败：{error}"))?;
+        let _ = window.unminimize();
+        window
+            .set_focus()
+            .map_err(|error| format!("聚焦实例窗口失败：{error}"))?;
+    }
 
     let close_app = app.clone();
     let close_runtime = runtime.inner().clone();
