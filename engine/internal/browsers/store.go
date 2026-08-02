@@ -63,9 +63,10 @@ type Admission struct {
 }
 
 type runtimeLease struct {
-	embedded bool
-	external bool
-	touched  time.Time
+	embedded      bool
+	external      bool
+	participation bool
+	touched       time.Time
 }
 
 type queueEntry struct {
@@ -282,7 +283,36 @@ func (s *Store) ReleaseEmbedded(instanceID string) (Capacity, error) {
 	}
 	if lease := s.runtimeLeases[instanceID]; lease != nil {
 		lease.embedded = false
-		if !lease.external {
+		if !lease.external && !lease.participation {
+			delete(s.runtimeLeases, instanceID)
+		}
+	}
+	delete(s.runtimeQueue, instanceID)
+	return s.capacityLocked(), nil
+}
+
+// RetainParticipationContext gives a native live-room participation WebView
+// its own runtime ownership. Unlike the visible-card embedded lease, this
+// ownership is not pruned while the card is offscreen or another app page is
+// selected; it ends only when the participation broker releases the context.
+func (s *Store) RetainParticipationContext(instanceID string) (Admission, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.instances[instanceID] == nil {
+		return Admission{}, errors.New("浏览器实例不存在")
+	}
+	return s.acquireParticipationLocked(instanceID), nil
+}
+
+func (s *Store) ReleaseParticipationContext(instanceID string) (Capacity, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.instances[instanceID] == nil {
+		return Capacity{}, errors.New("浏览器实例不存在")
+	}
+	if lease := s.runtimeLeases[instanceID]; lease != nil {
+		lease.participation = false
+		if !lease.embedded && !lease.external {
 			delete(s.runtimeLeases, instanceID)
 		}
 	}
@@ -291,6 +321,10 @@ func (s *Store) ReleaseEmbedded(instanceID string) (Capacity, error) {
 }
 
 func (s *Store) Create(accountID, accountName, requestedName string) (Instance, error) {
+	return s.CreateWithLimit(accountID, accountName, requestedName, 0)
+}
+
+func (s *Store) CreateWithLimit(accountID, accountName, requestedName string, maxInstances int) (Instance, error) {
 	accountID = strings.TrimSpace(accountID)
 	if accountID == "" {
 		return Instance{}, errors.New("请选择参与账号")
@@ -303,6 +337,9 @@ func (s *Store) Create(accountID, accountName, requestedName string) (Instance, 
 			// existing instance instead of creating a second login container.
 			return s.decorateInstanceLocked(instance), nil
 		}
+	}
+	if maxInstances > 0 && len(s.instances) >= maxInstances {
+		return Instance{}, fmt.Errorf("免费版最多只能创建 %d 个浏览器实例，请激活专业版后继续创建", maxInstances)
 	}
 	id, err := randomID()
 	if err != nil {
@@ -644,10 +681,35 @@ func (s *Store) acquireRuntimeLocked(instanceID string, external bool) Admission
 	return Admission{Granted: false, State: RuntimeWaiting, QueuePosition: position, Capacity: capacity}
 }
 
+func (s *Store) acquireParticipationLocked(instanceID string) Admission {
+	s.pruneRuntimeLocked()
+	now := s.now()
+	if lease := s.runtimeLeases[instanceID]; lease != nil {
+		lease.participation = true
+		lease.touched = now
+		delete(s.runtimeQueue, instanceID)
+		return Admission{Granted: true, State: RuntimeRunning, Capacity: s.capacityLocked()}
+	}
+	entry := s.runtimeQueue[instanceID]
+	if entry == nil {
+		entry = &queueEntry{enqueuedAt: now}
+		s.runtimeQueue[instanceID] = entry
+	}
+	entry.lastSeen = now
+	capacity := s.capacityLocked()
+	position := s.queuePositionLocked(instanceID)
+	if capacity.AvailableSlots > 0 && position == 1 {
+		delete(s.runtimeQueue, instanceID)
+		s.runtimeLeases[instanceID] = &runtimeLease{participation: true, touched: now}
+		return Admission{Granted: true, State: RuntimeRunning, Capacity: s.capacityLocked()}
+	}
+	return Admission{Granted: false, State: RuntimeWaiting, QueuePosition: position, Capacity: capacity}
+}
+
 func (s *Store) releaseExternalLocked(instanceID string) {
 	if lease := s.runtimeLeases[instanceID]; lease != nil {
 		lease.external = false
-		if !lease.embedded {
+		if !lease.embedded && !lease.participation {
 			delete(s.runtimeLeases, instanceID)
 		}
 	}
@@ -660,7 +722,7 @@ func (s *Store) pruneRuntimeLocked() {
 			delete(s.runtimeLeases, instanceID)
 			continue
 		}
-		if lease.embedded && !lease.external && now.Sub(lease.touched) > 8*time.Second {
+		if lease.embedded && !lease.external && !lease.participation && now.Sub(lease.touched) > 8*time.Second {
 			delete(s.runtimeLeases, instanceID)
 		}
 	}
@@ -673,22 +735,27 @@ func (s *Store) pruneRuntimeLocked() {
 
 func (s *Store) capacityLocked() Capacity {
 	resources := s.resourcesLocked()
-	recommended := recommendedLimit(resources)
+	recommendation := calculateCapacityRecommendation(resources)
+	recommended := recommendation.limit
 	running := len(s.runtimeLeases)
 	effective := effectiveLimit(resources, recommended, running)
 	available := maxInt(0, effective-running)
 	waiting := len(s.runtimeQueue)
 	return Capacity{
-		Mode:                 "auto",
-		Total:                len(s.instances),
-		Running:              running,
-		Waiting:              waiting,
-		RecommendedLimit:     recommended,
-		EffectiveLimit:       effective,
-		AvailableSlots:       available,
-		EstimatedPerInstance: estimatedInstanceBytes,
-		Resources:            resources,
-		Message:              capacityMessage(resources, running, waiting, effective),
+		Mode:                   "auto",
+		Total:                  len(s.instances),
+		Running:                running,
+		Waiting:                waiting,
+		RecommendedLimit:       recommended,
+		CPURecommendedLimit:    recommendation.cpuLimit,
+		MemoryRecommendedLimit: recommendation.memoryLimit,
+		MaximumAutoInstances:   maximumAutoInstances,
+		MemoryReserveBytes:     recommendation.memoryReserve,
+		EffectiveLimit:         effective,
+		AvailableSlots:         available,
+		EstimatedPerInstance:   estimatedInstanceBytes,
+		Resources:              resources,
+		Message:                capacityMessage(resources, running, waiting, effective),
 	}
 }
 

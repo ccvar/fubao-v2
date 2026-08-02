@@ -12,7 +12,18 @@ import (
 	"time"
 )
 
-const storeVersion = 3
+const storeVersion = 5
+
+const (
+	defaultAutoRecycleOfflineDays      = 7
+	defaultParticipationPrewarmMinutes = 10
+	maximumParticipationPrewarmMinutes = 24 * 60
+)
+
+type Settings struct {
+	AutoRecycleOfflineDays      int `json:"auto_recycle_offline_days"`
+	ParticipationPrewarmMinutes int `json:"participation_prewarm_minutes"`
+}
 
 // FollowSource records which participation account reported a broadcaster as
 // currently live. It contains safe attribution metadata only; credentials
@@ -62,6 +73,11 @@ type Room struct {
 	CenterLiveStatus  string         `json:"center_live_status,omitempty"`
 	CenterLiveAt      string         `json:"center_live_at,omitempty"`
 	CenterLastEventAt string         `json:"center_last_event_at,omitempty"`
+	Recycled          bool           `json:"recycled,omitempty"`
+	RecycledAt        string         `json:"recycled_at,omitempty"`
+	RecycleReason     string         `json:"recycle_reason,omitempty"`
+	OfflineDays       int            `json:"offline_days,omitempty"`
+	LastOfflineDay    string         `json:"last_offline_day,omitempty"`
 	CreatedAt         string         `json:"created_at"`
 	UpdatedAt         string         `json:"updated_at"`
 }
@@ -143,8 +159,9 @@ type MigrationResult struct {
 }
 
 type roomFile struct {
-	Version int     `json:"version"`
-	Rooms   []*Room `json:"rooms"`
+	Version  int      `json:"version"`
+	Settings Settings `json:"settings"`
+	Rooms    []*Room  `json:"rooms"`
 }
 
 type legacyRoom struct {
@@ -159,9 +176,10 @@ type legacyRoom struct {
 }
 
 type Store struct {
-	mu    sync.Mutex
-	path  string
-	rooms map[string]*Room
+	mu       sync.Mutex
+	path     string
+	rooms    map[string]*Room
+	settings Settings
 }
 
 func NewStore(dataDir string) (*Store, error) {
@@ -172,8 +190,9 @@ func NewStore(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("创建直播间数据目录失败: %w", err)
 	}
 	store := &Store{
-		path:  filepath.Join(dataDir, "rooms.json"),
-		rooms: map[string]*Room{},
+		path:     filepath.Join(dataDir, "rooms.json"),
+		rooms:    map[string]*Room{},
+		settings: defaultSettings(),
 	}
 	if err := store.load(); err != nil {
 		return nil, err
@@ -192,6 +211,18 @@ func (s *Store) load() error {
 	var file roomFile
 	if err := json.Unmarshal(data, &file); err != nil {
 		return fmt.Errorf("解析直播间数据失败: %w", err)
+	}
+	if file.Version >= 5 {
+		s.settings = normalizeSettings(file.Settings)
+	} else if file.Version >= 4 {
+		// Version 4 already persisted the automatic-recycle value. Preserve it
+		// while introducing the participation-monitor prewarm default.
+		s.settings = normalizeSettings(Settings{
+			AutoRecycleOfflineDays:      file.Settings.AutoRecycleOfflineDays,
+			ParticipationPrewarmMinutes: defaultParticipationPrewarmMinutes,
+		})
+	} else {
+		s.settings = defaultSettings()
 	}
 	removedInvalid := false
 	for _, room := range file.Rooms {
@@ -219,7 +250,7 @@ func (s *Store) saveLocked() error {
 		items = append(items, room)
 	}
 	sortRooms(items)
-	payload, err := json.MarshalIndent(roomFile{Version: storeVersion, Rooms: items}, "", "  ")
+	payload, err := json.MarshalIndent(roomFile{Version: storeVersion, Settings: s.settings, Rooms: items}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("序列化直播间数据失败: %w", err)
 	}
@@ -239,10 +270,24 @@ func (s *Store) saveLocked() error {
 }
 
 func (s *Store) List() []Room {
+	return s.list(false)
+}
+
+// All returns active and recycled rooms for internal monitor synchronization.
+// Recycled rooms remain canonical records so their monitor and event history
+// is not destroyed merely because the room is archived.
+func (s *Store) All() []Room {
+	return s.list(true)
+}
+
+func (s *Store) list(includeRecycled bool) []Room {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	items := make([]Room, 0, len(s.rooms))
 	for _, room := range s.rooms {
+		if room.Recycled && !includeRecycled {
+			continue
+		}
 		copy := *room
 		copy.FollowSources = append([]FollowSource(nil), room.FollowSources...)
 		items = append(items, copy)
@@ -251,6 +296,167 @@ func (s *Store) List() []Room {
 		return roomSortKey(&items[i]) < roomSortKey(&items[j])
 	})
 	return items
+}
+
+func (s *Store) RecycleBin() []Room {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := make([]Room, 0)
+	for _, room := range s.rooms {
+		if !room.Recycled {
+			continue
+		}
+		copy := *room
+		copy.FollowSources = append([]FollowSource(nil), room.FollowSources...)
+		items = append(items, copy)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].RecycledAt != items[j].RecycledAt {
+			return items[i].RecycledAt > items[j].RecycledAt
+		}
+		return roomSortKey(&items[i]) < roomSortKey(&items[j])
+	})
+	return items
+}
+
+func normalizeSettings(settings Settings) Settings {
+	if settings.AutoRecycleOfflineDays < 0 {
+		settings.AutoRecycleOfflineDays = 0
+	}
+	if settings.AutoRecycleOfflineDays > 3650 {
+		settings.AutoRecycleOfflineDays = 3650
+	}
+	if settings.ParticipationPrewarmMinutes < 0 {
+		settings.ParticipationPrewarmMinutes = 0
+	}
+	if settings.ParticipationPrewarmMinutes > maximumParticipationPrewarmMinutes {
+		settings.ParticipationPrewarmMinutes = maximumParticipationPrewarmMinutes
+	}
+	return settings
+}
+
+func defaultSettings() Settings {
+	return Settings{
+		AutoRecycleOfflineDays:      defaultAutoRecycleOfflineDays,
+		ParticipationPrewarmMinutes: defaultParticipationPrewarmMinutes,
+	}
+}
+
+func (s *Store) Settings() Settings {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.settings
+}
+
+func (s *Store) SetSettings(settings Settings) (Settings, error) {
+	settings = normalizeSettings(settings)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.settings
+	s.settings = settings
+	if err := s.saveLocked(); err != nil {
+		s.settings = previous
+		return Settings{}, err
+	}
+	return s.settings, nil
+}
+
+// RecordLiveResult applies only a definitive successful live probe. Unknown,
+// error, and network outcomes are ignored by design. An offline calendar day
+// is counted at most once; a confirmed live result resets the streak.
+func (s *Store) RecordLiveResult(roomID, status string, checkedAt time.Time) (bool, error) {
+	roomID = strings.TrimSpace(roomID)
+	status = strings.ToLower(strings.TrimSpace(status))
+	if roomID == "" || (status != "live" && status != "offline") {
+		return false, nil
+	}
+	if checkedAt.IsZero() {
+		checkedAt = time.Now()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	room := s.rooms[roomID]
+	if room == nil {
+		for _, candidate := range s.rooms {
+			if candidate.WebRID == roomID || candidate.ActualRoomID == roomID {
+				room = candidate
+				break
+			}
+		}
+	}
+	if room == nil || room.Recycled {
+		return false, nil
+	}
+	changed := false
+	if status == "live" {
+		if room.OfflineDays != 0 || room.LastOfflineDay != "" {
+			room.OfflineDays = 0
+			room.LastOfflineDay = ""
+			changed = true
+		}
+	} else {
+		day := checkedAt.In(time.Local).Format("2006-01-02")
+		if room.LastOfflineDay != day {
+			room.LastOfflineDay = day
+			room.OfflineDays++
+			changed = true
+		}
+		limit := s.settings.AutoRecycleOfflineDays
+		if limit > 0 && room.OfflineDays >= limit {
+			room.Recycled = true
+			room.RecycledAt = checkedAt.Format(time.RFC3339Nano)
+			room.RecycleReason = fmt.Sprintf("连续 %d 天监测未发现直播，系统自动回收", room.OfflineDays)
+			room.Enabled = false
+			room.MonitorStatus = "stopped"
+			room.ConnectionStatus = "disconnected"
+			changed = true
+		}
+	}
+	if !changed {
+		return false, nil
+	}
+	room.UpdatedAt = checkedAt.Format(time.RFC3339Nano)
+	if err := s.saveLocked(); err != nil {
+		return false, err
+	}
+	return room.Recycled, nil
+}
+
+func (s *Store) Restore(roomID string) (Room, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	room := s.rooms[strings.TrimSpace(roomID)]
+	if room == nil || !room.Recycled {
+		return Room{}, errors.New("回收站中的直播间不存在")
+	}
+	now := time.Now().Format(time.RFC3339Nano)
+	room.Recycled = false
+	room.RecycledAt = ""
+	room.RecycleReason = ""
+	room.OfflineDays = 0
+	room.LastOfflineDay = ""
+	room.Enabled = true
+	room.MonitorStatus = "stopped"
+	room.ConnectionStatus = "disconnected"
+	room.UpdatedAt = now
+	if err := s.saveLocked(); err != nil {
+		return Room{}, err
+	}
+	copy := *room
+	copy.FollowSources = append([]FollowSource(nil), room.FollowSources...)
+	return copy, nil
+}
+
+func (s *Store) DeleteRecycled(roomID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	roomID = strings.TrimSpace(roomID)
+	room := s.rooms[roomID]
+	if room == nil || !room.Recycled {
+		return errors.New("回收站中的直播间不存在")
+	}
+	delete(s.rooms, roomID)
+	return s.saveLocked()
 }
 
 // SyncFollowingLive merges one participation account's currently-live

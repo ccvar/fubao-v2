@@ -71,7 +71,7 @@ func TestUnconfiguredManagerStillQueuesSafeUploads(t *testing.T) {
 
 func TestExistingConfigReceivesDefaultFallbackEndpoint(t *testing.T) {
 	dataDir := t.TempDir()
-	content := []byte(`{"version":1,"enabled":true,"endpoint":"https://fbv2.ccvar.com/api/v1","device_token":"device-test-token"}`)
+	content := []byte(`{"version":1,"enabled":false,"endpoint":"https://fbv2.ccvar.com/api/v1","device_token":"device-test-token"}`)
 	if err := os.WriteFile(filepath.Join(dataDir, "remote_sync.json"), content, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -79,8 +79,28 @@ func TestExistingConfigReceivesDefaultFallbackEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := manager.Status().FallbackEndpoint; got != syncprotocol.DefaultFallbackEndpoint {
+	status := manager.Status()
+	if got := status.FallbackEndpoint; got != syncprotocol.DefaultFallbackEndpoint {
 		t.Fatalf("fallback endpoint = %q, want %q", got, syncprotocol.DefaultFallbackEndpoint)
+	}
+	if !status.Enabled {
+		t.Fatal("configured full-access center connection was not automatically enabled")
+	}
+	if status.TokenMasked != "devi…oken" {
+		t.Fatalf("masked token = %q, want %q", status.TokenMasked, "devi…oken")
+	}
+	statusContent, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(statusContent), "device-test-token") {
+		t.Fatalf("remote sync status exposed the raw token: %s", statusContent)
+	}
+}
+
+func TestMaskTokenNeverReturnsShortTokenVerbatim(t *testing.T) {
+	if got := maskToken("secret"); got != "••••••" {
+		t.Fatalf("short token mask = %q, want a fixed mask", got)
 	}
 }
 
@@ -165,6 +185,9 @@ func TestManagerRegistersAndFlushesToServer(t *testing.T) {
 	}
 	if strings.Contains(string(configContent), enrollmentToken) || !strings.Contains(string(configContent), "device_token") {
 		t.Fatalf("enrollment token was not replaced with a device token: %s", configContent)
+	}
+	if status.TokenMasked != "0123…cdef" {
+		t.Fatalf("masked enrollment token = %q, want %q", status.TokenMasked, "0123…cdef")
 	}
 }
 

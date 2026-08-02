@@ -35,16 +35,27 @@ type ResourceSnapshot struct {
 }
 
 type Capacity struct {
-	Mode                 string           `json:"mode"`
-	Total                int              `json:"total"`
-	Running              int              `json:"running"`
-	Waiting              int              `json:"waiting"`
-	RecommendedLimit     int              `json:"recommended_limit"`
-	EffectiveLimit       int              `json:"effective_limit"`
-	AvailableSlots       int              `json:"available_slots"`
-	EstimatedPerInstance uint64           `json:"estimated_per_instance_bytes"`
-	Resources            ResourceSnapshot `json:"resources"`
-	Message              string           `json:"message"`
+	Mode                   string           `json:"mode"`
+	Total                  int              `json:"total"`
+	Running                int              `json:"running"`
+	Waiting                int              `json:"waiting"`
+	RecommendedLimit       int              `json:"recommended_limit"`
+	CPURecommendedLimit    int              `json:"cpu_recommended_limit"`
+	MemoryRecommendedLimit int              `json:"memory_recommended_limit"`
+	MaximumAutoInstances   int              `json:"maximum_auto_instances"`
+	MemoryReserveBytes     uint64           `json:"memory_reserve_bytes"`
+	EffectiveLimit         int              `json:"effective_limit"`
+	AvailableSlots         int              `json:"available_slots"`
+	EstimatedPerInstance   uint64           `json:"estimated_per_instance_bytes"`
+	Resources              ResourceSnapshot `json:"resources"`
+	Message                string           `json:"message"`
+}
+
+type capacityRecommendation struct {
+	limit         int
+	cpuLimit      int
+	memoryLimit   int
+	memoryReserve uint64
 }
 
 func detectResources() ResourceSnapshot {
@@ -159,10 +170,14 @@ func clampPercent(value float64) float64 {
 	return value
 }
 
-func recommendedLimit(resources ResourceSnapshot) int {
-	cpuLimit := maxInt(1, resources.CPUCount)
+func calculateCapacityRecommendation(resources ResourceSnapshot) capacityRecommendation {
+	// Browser WebViews spend much of their time waiting on network, media and
+	// rendering work. A 1.5x CPU allowance uses that headroom while the memory
+	// pressure gate still protects the machine from unsafe admission.
+	cpuLimit := maxInt(1, resources.CPUCount*3/2)
 	if resources.MemoryTotal == 0 {
-		return clampInt(maxInt(1, cpuLimit/2), 1, maximumAutoInstances)
+		limit := clampInt(maxInt(1, cpuLimit/2), 1, maximumAutoInstances)
+		return capacityRecommendation{limit: limit, cpuLimit: cpuLimit, memoryLimit: limit}
 	}
 	reserve := resources.MemoryTotal / 4
 	if reserve < minimumReserveBytes {
@@ -173,7 +188,16 @@ func recommendedLimit(resources ResourceSnapshot) int {
 		usable = resources.MemoryTotal - reserve
 	}
 	memoryLimit := maxInt(1, int(usable/estimatedInstanceBytes))
-	return clampInt(minInt(cpuLimit, memoryLimit), 1, maximumAutoInstances)
+	return capacityRecommendation{
+		limit:         clampInt(minInt(cpuLimit, memoryLimit), 1, maximumAutoInstances),
+		cpuLimit:      cpuLimit,
+		memoryLimit:   memoryLimit,
+		memoryReserve: reserve,
+	}
+}
+
+func recommendedLimit(resources ResourceSnapshot) int {
+	return calculateCapacityRecommendation(resources).limit
 }
 
 func effectiveLimit(resources ResourceSnapshot, recommended, running int) int {

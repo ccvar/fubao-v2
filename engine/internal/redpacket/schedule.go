@@ -101,6 +101,68 @@ func (s *Store) DeleteParticipationSchedule(scheduleID string) error {
 	return s.saveLocked()
 }
 
+// PendingParticipationMonitorPrewarms returns schedule occurrences whose
+// configurable monitor-start window has opened. It does not mutate state: the
+// native worker marks an occurrence only after every eligible room monitor has
+// been checked successfully, allowing transient account/store failures to be
+// retried until the actual execution time.
+func (s *Store) PendingParticipationMonitorPrewarms(now time.Time, advance time.Duration) []ParticipationScheduleExecution {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if advance <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	executions := make([]ParticipationScheduleExecution, 0)
+	for _, schedule := range s.participationSchedules {
+		if !schedule.Enabled || schedule.MonitorPrewarmedFor == schedule.NextRunAt {
+			continue
+		}
+		due, err := time.Parse(time.RFC3339Nano, schedule.NextRunAt)
+		if err != nil || !due.After(now) || now.Before(due.Add(-advance)) {
+			continue
+		}
+		executions = append(executions, ParticipationScheduleExecution{
+			ScheduleID: schedule.ID,
+			Mode:       schedule.Mode,
+			Label:      participationScheduleLabel(*schedule),
+			DueAt:      schedule.NextRunAt,
+		})
+	}
+	sort.Slice(executions, func(i, j int) bool { return executions[i].DueAt < executions[j].DueAt })
+	return executions
+}
+
+// RecordParticipationMonitorPrewarm atomically marks one occurrence and adds
+// a compact safe activity summary. No account Cookie, request parameters, or
+// signed interface data enters the persisted activity feed.
+func (s *Store) RecordParticipationMonitorPrewarm(execution ParticipationScheduleExecution, advance time.Duration, monitoredRooms, accountCount int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	schedule := s.participationSchedules[strings.TrimSpace(execution.ScheduleID)]
+	if schedule == nil || schedule.NextRunAt != strings.TrimSpace(execution.DueAt) {
+		return nil
+	}
+	if schedule.MonitorPrewarmedFor == schedule.NextRunAt {
+		return nil
+	}
+	schedule.MonitorPrewarmedFor = schedule.NextRunAt
+	schedule.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+	message := fmt.Sprintf(
+		"已提前 %s检查“%s”：%d 个直播间监测已启用",
+		formatScheduleInterval(int(advance.Seconds())),
+		participationScheduleModeName(schedule.Mode),
+		maxInt(monitoredRooms, 0),
+	)
+	if accountCount > 0 {
+		message += fmt.Sprintf("，使用 %d 个监测账号", accountCount)
+	}
+	s.addActivityLocked("participation_monitor_prewarmed", schedule.ID, message, time.Now())
+	return s.saveLocked()
+}
+
 // ClaimDueParticipationSchedules atomically advances each due plan before it
 // is handed to the UI, so repeated polling cannot execute the same occurrence.
 func (s *Store) ClaimDueParticipationSchedules(now time.Time) ([]ParticipationScheduleExecution, error) {
@@ -290,6 +352,19 @@ func participationScheduleLabel(schedule ParticipationSchedule) string {
 		return fmt.Sprintf("每天 %s 执行的红包参与计划", schedule.DailyTime)
 	case ParticipationScheduleInterval:
 		return fmt.Sprintf("每 %s执行的红包参与计划", formatScheduleInterval(schedule.IntervalSeconds))
+	default:
+		return "红包参与计划"
+	}
+}
+
+func participationScheduleModeName(mode string) string {
+	switch mode {
+	case ParticipationScheduleOnce:
+		return "指定日期"
+	case ParticipationScheduleDaily:
+		return "每天固定时间"
+	case ParticipationScheduleInterval:
+		return "间隔执行"
 	default:
 		return "红包参与计划"
 	}

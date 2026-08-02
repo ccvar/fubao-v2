@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	storeVersion         = 8
+	storeVersion         = 9
 	unknownProbeInterval = 10 * time.Second
 	offlineProbeInterval = 60 * time.Second
 	livePacketInterval   = 15 * time.Second
@@ -212,16 +212,17 @@ type Activity struct {
 // ParticipationSchedule is a credential-free persisted trigger definition.
 // The frontend claims due runs, then prepares each native browser context.
 type ParticipationSchedule struct {
-	ID              string `json:"id"`
-	Mode            string `json:"mode"`
-	Enabled         bool   `json:"enabled"`
-	RunAt           string `json:"run_at,omitempty"`
-	DailyTime       string `json:"daily_time,omitempty"`
-	IntervalSeconds int    `json:"interval_seconds,omitempty"`
-	NextRunAt       string `json:"next_run_at"`
-	LastRunAt       string `json:"last_run_at,omitempty"`
-	CreatedAt       string `json:"created_at"`
-	UpdatedAt       string `json:"updated_at"`
+	ID                  string `json:"id"`
+	Mode                string `json:"mode"`
+	Enabled             bool   `json:"enabled"`
+	RunAt               string `json:"run_at,omitempty"`
+	DailyTime           string `json:"daily_time,omitempty"`
+	IntervalSeconds     int    `json:"interval_seconds,omitempty"`
+	NextRunAt           string `json:"next_run_at"`
+	MonitorPrewarmedFor string `json:"monitor_prewarmed_for,omitempty"`
+	LastRunAt           string `json:"last_run_at,omitempty"`
+	CreatedAt           string `json:"created_at"`
+	UpdatedAt           string `json:"updated_at"`
 }
 
 // ParticipationScheduleExecution is the safe claim returned when a persisted
@@ -260,6 +261,7 @@ type Store struct {
 	pool                   *accountPool
 	requestRecorder        func(accountID string, requestErr error)
 	eventHandler           func(Event)
+	liveResultHandler      func(roomID, status string, checkedAt time.Time)
 }
 
 type monitorJob struct {
@@ -312,6 +314,16 @@ func (s *Store) SetEventHandler(handler func(Event)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.eventHandler = handler
+}
+
+// SetLiveResultHandler attaches a private callback for successful, definitive
+// live/offline probes. Error and unknown outcomes are deliberately excluded so
+// room-retention policy cannot mistake a transient request failure for an
+// offline day. The callback is invoked outside the store lock.
+func (s *Store) SetLiveResultHandler(handler func(roomID, status string, checkedAt time.Time)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.liveResultHandler = handler
 }
 
 func (s *Store) load() error {
@@ -1633,16 +1645,24 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 	if probe.StreamerName != "" {
 		monitor.StreamerName = probe.StreamerName
 	}
+	liveResultHandler := s.liveResultHandler
+	roomID := monitor.RoomID
 	if monitor.LiveStatus != "live" {
 		_ = s.saveLocked()
 		status := monitor.LiveStatus
 		s.mu.Unlock()
+		if liveResultHandler != nil && status == "offline" {
+			liveResultHandler(roomID, status, time.Now())
+		}
 		if status == "offline" {
 			return offlineProbeInterval
 		}
 		return unknownProbeInterval
 	}
 	s.mu.Unlock()
+	if liveResultHandler != nil {
+		liveResultHandler(roomID, "live", time.Now())
+	}
 
 	snapshots, err := source.Fetch(ctx)
 	if ctx.Err() == nil && recorder != nil && accountID != "" && !errors.Is(err, errMonitoringAccountCooling) {

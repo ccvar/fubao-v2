@@ -23,6 +23,9 @@ func TestPageParticipationBrokerUsesPreparedAccountInstance(t *testing.T) {
 	if err != nil || accountID != "account-1" || !broker.Ready("account-1") {
 		t.Fatalf("failed to prepare account context: account=%q err=%v", accountID, err)
 	}
+	if capacity := browserStore.Capacity(); capacity.Running != 1 {
+		t.Fatalf("prepared context did not retain runtime: %+v", capacity)
+	}
 
 	resultChannel := make(chan redpacket.PageParticipationResponse, 1)
 	go func() {
@@ -57,6 +60,31 @@ func TestPageParticipationBrokerUsesPreparedAccountInstance(t *testing.T) {
 	}
 	if _, err := broker.SetContext(instance.ID, false); err != nil || broker.Ready("account-1") {
 		t.Fatalf("browser context was not released: %v", err)
+	}
+	if capacity := browserStore.Capacity(); capacity.Running != 0 {
+		t.Fatalf("released context retained runtime: %+v", capacity)
+	}
+}
+
+func TestPageParticipationBrokerStopAccountReleasesRuntime(t *testing.T) {
+	browserStore, err := browsers.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := browserStore.Create("account-finished", "完成账号", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := newPageParticipationBroker(browserStore)
+	if _, err := broker.SetContext(instance.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	broker.StopAccount("account-finished")
+	if broker.Ready("account-finished") {
+		t.Fatal("completed task kept page context ready")
+	}
+	if capacity := browserStore.Capacity(); capacity.Running != 0 {
+		t.Fatalf("completed task retained runtime: %+v", capacity)
 	}
 }
 

@@ -28,6 +28,19 @@ func TestRemoteSyncPullScopeFollowsLicenseLifetime(t *testing.T) {
 	}
 }
 
+func TestBrowserInstanceCreateLimitFollowsLicenseState(t *testing.T) {
+	if got := browserInstanceCreateLimit(nil); got != 1 {
+		t.Fatalf("nil license manager limit=%d", got)
+	}
+	if got := browserInstanceCreateLimit(newTestLicenseManager(t, "")); got != 0 {
+		t.Fatalf("active license limit=%d", got)
+	}
+	expired := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	if got := browserInstanceCreateLimit(newTestLicenseManager(t, expired)); got != 1 {
+		t.Fatalf("expired license limit=%d", got)
+	}
+}
+
 func newTestLicenseManager(t *testing.T, expiresAt string) *license.Manager {
 	t.Helper()
 	dataDir := t.TempDir()

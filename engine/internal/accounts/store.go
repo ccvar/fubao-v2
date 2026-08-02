@@ -496,9 +496,20 @@ func (s *Store) Credential(accountID string) (BrowserCredential, error) {
 // or refreshes the existing canonical account when the same Douyin identity
 // is already present. Raw Cookie data never leaves the Go store.
 func (s *Store) UpsertAuthenticatedCookie(rawCookie, nickname, userID, secUID string, role Role) (AccountView, bool, error) {
+	return s.upsertCookie(rawCookie, nickname, userID, secUID, role, "qr-login", true)
+}
+
+// UpsertImportedCookie stores an explicitly imported Cookie in the selected
+// role without claiming it has already passed an online check. The safe view
+// never exposes the imported Cookie.
+func (s *Store) UpsertImportedCookie(rawCookie, nickname, userID, secUID string, role Role) (AccountView, bool, error) {
+	return s.upsertCookie(rawCookie, nickname, userID, secUID, role, "manual-import", false)
+}
+
+func (s *Store) upsertCookie(rawCookie, nickname, userID, secUID string, role Role, source string, authenticated bool) (AccountView, bool, error) {
 	rawCookie = strings.TrimSpace(rawCookie)
 	if rawCookie == "" {
-		return AccountView{}, false, errors.New("登录窗口没有读取到 Cookie")
+		return AccountView{}, false, errors.New("没有读取到可导入的 Cookie")
 	}
 	if role != RoleMonitoring && role != RoleParticipation {
 		return AccountView{}, false, errors.New("未知账号分类")
@@ -511,12 +522,13 @@ func (s *Store) UpsertAuthenticatedCookie(rawCookie, nickname, userID, secUID st
 	}
 	account, existed := findIdentity(identityIndex, rawCookie, userID, secUID)
 	if account == nil {
-		account = newAccount("", nickname, nickname, userID, secUID, rawCookie, "qr-login", "", "")
+		account = newAccount("", nickname, nickname, userID, secUID, rawCookie, source, "", "")
 		s.accounts[account.ID] = account
 	} else {
-		mergeIdentity(account, nickname, nickname, userID, secUID, rawCookie, "qr-login", time.Now().Format(time.RFC3339Nano))
+		mergeIdentity(account, nickname, nickname, userID, secUID, rawCookie, source, time.Now().Format(time.RFC3339Nano))
 	}
-	if !hasRole(account, role) {
+	roleAdded := !hasRole(account, role)
+	if roleAdded {
 		account.Roles = append(account.Roles, role)
 	}
 	if role == RoleMonitoring && account.Monitoring == nil {
@@ -525,14 +537,25 @@ func (s *Store) UpsertAuthenticatedCookie(rawCookie, nickname, userID, secUID st
 	if role == RoleParticipation && account.Participation == nil {
 		account.Participation = &ParticipationProfile{Enabled: true}
 	}
-	account.CookieStatus = cookieStatusValid
-	account.CookieMessage = validCookieMessage
-	account.CookieChecked = time.Now().Format(time.RFC3339Nano)
-	if role == RoleMonitoring {
-		account.Monitoring.CookieStatus = cookieStatusValid
-		account.Monitoring.CookieMessage = validMonitoringCookieMessage
-		account.Monitoring.CookieChecked = account.CookieChecked
-		account.Monitoring.LastValidatedAt = account.CookieChecked
+	if authenticated {
+		account.CookieStatus = cookieStatusValid
+		account.CookieMessage = validCookieMessage
+		account.CookieChecked = time.Now().Format(time.RFC3339Nano)
+		if role == RoleMonitoring {
+			account.Monitoring.CookieStatus = cookieStatusValid
+			account.Monitoring.CookieMessage = validMonitoringCookieMessage
+			account.Monitoring.CookieChecked = account.CookieChecked
+			account.Monitoring.LastValidatedAt = account.CookieChecked
+		}
+	} else if !existed || roleAdded {
+		account.CookieStatus = cookieStatusUnknown
+		account.CookieMessage = "Cookie 已导入，等待在线校验"
+		account.CookieChecked = ""
+		if role == RoleMonitoring {
+			account.Monitoring.CookieStatus = cookieStatusUnknown
+			account.Monitoring.CookieMessage = "Cookie 已导入，等待监测接口校验"
+			account.Monitoring.CookieChecked = ""
+		}
 	}
 	account.UpdatedAt = time.Now().Format(time.RFC3339Nano)
 	if err := s.saveLocked(); err != nil {

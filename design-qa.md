@@ -127,6 +127,81 @@
 
 final result: passed
 
+## Sidebar center-library cloud status
+
+### Evidence
+
+- Source visual truth: `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-876ea0fd-50f4-412d-80fd-9d48090cc596.png` (778 × 622 px), focused on the marked position immediately after “福宝控制台”.
+- Native Tauri implementation: `.design-qa/sidebar-center-library-cloud-debug.png` (3840 × 2160 px at macOS 2× density) from the restarted `/Users/apple/work/fubao.ccvar.com` development client on port 1437.
+- Dialog implementation: `.design-qa/sidebar-center-library-cloud-implementation.png` (3840 × 2160 px at macOS 2× density), showing the authorization dialog and its downward center-library icon.
+- Same-input focused comparison: `.design-qa/sidebar-center-library-cloud-comparison.png` (1050 × 170 px), containing the source footer and implementation footer together after crop and density normalization.
+- State: active professional license with a configured center-library Key; the footer therefore shows the green cloud-download state.
+
+### Full-view and focused comparison
+
+- The cloud-download icon sits directly after the product name on the first footer line, matching the marked source slot without moving the version, edition, expiry, or settings control.
+- At 10 px inside a 15 px hit target, the icon is visually quieter than the product name and edition badge while remaining legible at native density.
+- The downward arrow is used both in the footer and throughout the center-library section of the authorization dialog, consistently communicating inbound center-library data.
+
+### State and interaction verification
+
+- The footer status waits for the safe remote-sync status read, avoiding an incorrect gray flash during startup.
+- Professional + configured renders green; professional + unconfigured renders gray; free edition renders no cloud control.
+- The icon is a real button with a state-specific accessible label, the shared dark tooltip, and the same `openLicenseModal` handler already used by the edition badge.
+- The restarted native client visibly loaded the configured green state and continued mounting the current project's embedded WebViews without a frontend crash.
+
+### Required fidelity surfaces
+
+- Typography: product-name, version, edition, and expiry typography remain unchanged.
+- Spacing and layout: a 4 px name/icon gap and fixed 15 px control preserve the compact 48 px footer and prevent the second line from shifting.
+- Colors and tokens: configured uses the established center-library green; unconfigured uses the existing quiet neutral gray; hover/focus states reuse matching soft surfaces.
+- Image and icon quality: the Phosphor `CloudArrowDown` icon is vector-sharp at native density; no CSS drawing, emoji, or placeholder asset was introduced.
+- Copy and content: tooltips distinguish “中心库已绑定” and “中心库未绑定”, while both states retain the requested authorization-management destination.
+
+### Comparison history and findings
+
+- The first pass used a larger footer icon with an upward arrow. User feedback required a smaller icon and inbound direction; it was changed to 10 px `CloudArrowDown` inside a 15 px control.
+- The second pass showed the icon only for configured professional state. User feedback added the professional/unbound gray state and free-edition omission; the final conditional rendering now covers all three cases after the status load completes.
+- No actionable P0, P1, or P2 issue remains in the scoped footer or authorization-dialog icon states.
+
+final result: passed
+
+## Center-library token panel cleanup
+
+### Evidence
+
+- Source visual truth: `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-30cc2932-8a53-44ad-9f3c-818efc91b601.png` (1286 × 550 px).
+- Browser-rendered implementation: `.design-qa/implementation-center-library-token-editing.png` (1111 × 720 px, CSS viewport 1111 × 720 at 1× density).
+- State: authorization management open with the center-library registration-token input visible; the source is an already-authorized desktop state while the browser preview uses the safe unconfigured state because the standalone browser has no native Tauri bridge.
+- Focused same-input comparison: the source and implementation captures were opened together and compared around the center-library panel, token field, removed hint row, and footer actions.
+
+### Full-view and focused comparison
+
+- The requested hint below the registration-token input is absent, so the token field now flows directly into the compact right-aligned actions.
+- The panel retains the established pale green surface, compact cloud icon, connection-state badge, typography, border, radius, and spacing language.
+- The configured variant is reduced to the masked token, its adjacent icon-only replacement action, and connection status; route, queue, success-time, and receive-toggle controls are removed from the component.
+
+### Interaction and console verification
+
+- The authorization footer action uniquely opened the dialog and exposed the `中心库数据获取` region, registration-token field, and disabled empty-state submit action.
+- The standalone browser reported only the expected missing-Tauri-bridge bootstrap message; Svelte rendered and the dialog interaction completed normally. The current Tauri development client was separately rebuilt and restarted on strict port 1437.
+- Go tests verify that remote-sync status returns only a masked token, never the raw registration or device token, and that a configured full-access connection is enabled on startup.
+
+### Required fidelity surfaces
+
+- Typography: existing system type, compact title weight, 9 px supporting copy, and current input/action sizing are preserved.
+- Spacing and layout: removing the hint closes the unwanted vertical row while retaining the existing 9 px panel rhythm and 30 px modal actions.
+- Colors and tokens: existing center-library green, quiet neutral borders, connected badge, and modal backdrop tokens are reused.
+- Image and icon quality: the existing Phosphor cloud and pencil icons are retained; no generated or improvised asset was introduced.
+- Copy and content: `中心库数据获取` is present, raw token guidance is removed, and only safe masked token metadata is exposed in configured state.
+
+### Comparison history and findings
+
+- The initial source screenshot identified the hint row as the only requested removal. The post-fix capture confirms that row no longer occupies space.
+- No actionable P0, P1, or P2 mismatch remains in this scoped panel change.
+
+final result: passed
+
 ## Authorization-managed remote synchronization token
 
 ### Evidence
@@ -595,5 +670,42 @@ final result: passed
 - The first implementation capture exposed a standalone-preview native-bridge error inside the dialog. The preview path was corrected to keep local values functional while the desktop path continues to use the Go RPC.
 - The post-fix capture contains no actionable P0, P1, or P2 issue in the requested footer control, modal, or recent-activity structure.
 - P3/expected difference: the source screenshot does not specify a modal appearance, so the implementation intentionally reuses the project’s existing modal anatomy rather than inventing a new visual language.
+
+final result: passed
+
+## Center-library token inline actions
+
+### Evidence
+
+- Source visual truth: `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-95236684-6cf9-450b-aef1-da53a14ded5b.png` (1114 × 570 px).
+- Browser-rendered implementation: `.design-qa/implementation-center-library-token-inline-actions-final.png` (1111 × 720 px, CSS viewport 1111 × 720 at 1× density).
+- State: authorization dialog open with the center-library token editor visible. The source has an existing configured token and therefore shows both cancel and save actions; the standalone browser preview is safely unconfigured and shows the same inline row with the save action only.
+- Focused same-input comparison: both captures were opened together and compared around the registration-token label, input, inline action group, panel padding, and vertical alignment.
+
+### Full-view and focused comparison
+
+- The action group now sits immediately after the flexible token input with a 6 px gap instead of occupying a second row.
+- The input and every action button resolve to exactly 30 px high and share the same y-position; the browser measurement reported `aligned: true`.
+- “保存并连接” is constrained to one line, while the row remains responsive and wraps only below the narrow-window breakpoint.
+
+### Interaction and console verification
+
+- The authorization entry opened the dialog successfully and exposed one uniquely labelled registration-token input.
+- Computed layout evidence: input `337.5 × 30`, save action `94.5 × 30`, inline gap `6`, with identical top coordinates.
+- The final fresh capture introduced no component rendering warning. The standalone browser may retain the expected historical missing-Tauri-bridge bootstrap entry; the native Tauri development client was rebuilt and restarted separately on strict port 1437.
+
+### Required fidelity surfaces
+
+- Typography: existing compact system font and 10.5 px input/action sizing are retained; action copy no longer wraps.
+- Spacing and layout: input and actions share one 30 px row, 6 px spacing, 8 px radii, and the existing panel inset.
+- Colors and tokens: current neutral input/button and center-library green tokens remain unchanged.
+- Image and icon quality: the existing Phosphor cloud icon remains sharp and unchanged; no new asset was introduced.
+- Copy and content: all existing labels and button copy are preserved; only placement and sizing changed.
+
+### Comparison history and findings
+
+- Initial capture found the input still resolving to 40 px because a later generic `.field input` rule overrode the intended height; the save label also wrapped.
+- The selector specificity and button whitespace rules were corrected. Post-fix measurement confirms exact 30 px equality and a single-line action label.
+- No actionable P0, P1, or P2 issue remains in this scoped change.
 
 final result: passed

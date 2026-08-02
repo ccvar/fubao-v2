@@ -38,6 +38,30 @@ func TestCreateKeepsOneIsolatedInstancePerAccount(t *testing.T) {
 	}
 }
 
+func TestCreateWithLimitReusesExistingAccountAndRejectsAnother(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.CreateWithLimit("account-1", "账号一", "", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reused, err := store.CreateWithLimit("account-1", "账号一", "重复实例", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reused.ID != first.ID {
+		t.Fatalf("limited create did not reuse the existing account instance: first=%q reused=%q", first.ID, reused.ID)
+	}
+	if _, err := store.CreateWithLimit("account-2", "账号二", "", 1); err == nil || !strings.Contains(err.Error(), "免费版最多只能创建 1 个浏览器实例") {
+		t.Fatalf("second limited instance error = %v", err)
+	}
+	if items := store.List(); len(items) != 1 || items[0].ID != first.ID {
+		t.Fatalf("limited create changed existing instances: %#v", items)
+	}
+}
+
 func TestRuntimeAdmissionQueuesAndPromotesByDeviceCapacity(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {
@@ -91,6 +115,26 @@ func TestRuntimeAdmissionQueuesAndPromotesByDeviceCapacity(t *testing.T) {
 	}
 }
 
+func TestRecommendedLimitUsesCPUHeadroomWithinMemoryAndAutoCaps(t *testing.T) {
+	resources := ResourceSnapshot{
+		CPUCount:    14,
+		MemoryTotal: 64 * 1024 * 1024 * 1024,
+	}
+	recommendation := calculateCapacityRecommendation(resources)
+	if recommendation.cpuLimit != 21 || recommendation.memoryLimit != 70 || recommendation.limit != 21 {
+		t.Fatalf("unexpected 14-core recommendation: %+v", recommendation)
+	}
+	if recommendation.memoryReserve != 16*1024*1024*1024 {
+		t.Fatalf("memory reserve=%d, want 16 GiB", recommendation.memoryReserve)
+	}
+
+	resources.CPUCount = 32
+	recommendation = calculateCapacityRecommendation(resources)
+	if recommendation.limit != maximumAutoInstances {
+		t.Fatalf("automatic cap was not enforced: %+v", recommendation)
+	}
+}
+
 func TestCriticalPressurePausesNewAdmissions(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {
@@ -114,6 +158,35 @@ func TestCriticalPressurePausesNewAdmissions(t *testing.T) {
 	}
 	if admission.Granted || admission.Capacity.EffectiveLimit != 0 {
 		t.Fatalf("critical admission = %#v", admission)
+	}
+}
+
+func TestParticipationContextRetainsRuntimeUntilExplicitRelease(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	store.now = func() time.Time { return now }
+	instance, err := store.Create("account-participation", "参与账号", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if admission, err := store.AcquireEmbedded(instance.ID); err != nil || !admission.Granted {
+		t.Fatalf("embedded admission = %+v, err=%v", admission, err)
+	}
+	if admission, err := store.RetainParticipationContext(instance.ID); err != nil || !admission.Granted {
+		t.Fatalf("participation admission = %+v, err=%v", admission, err)
+	}
+	if capacity, err := store.ReleaseEmbedded(instance.ID); err != nil || capacity.Running != 1 {
+		t.Fatalf("participation lease was released with card: capacity=%+v err=%v", capacity, err)
+	}
+	now = now.Add(time.Minute)
+	if capacity := store.Capacity(); capacity.Running != 1 {
+		t.Fatalf("participation lease was pruned: %+v", capacity)
+	}
+	if capacity, err := store.ReleaseParticipationContext(instance.ID); err != nil || capacity.Running != 0 {
+		t.Fatalf("participation release = %+v, err=%v", capacity, err)
 	}
 }
 

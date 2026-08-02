@@ -234,6 +234,49 @@ func TestParticipationSchedulesPersistClaimAndAdvance(t *testing.T) {
 	}
 }
 
+func TestParticipationScheduleMonitorPrewarmWindowAndIdempotency(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 8, 2, 9, 30, 0, 0, time.Local)
+	schedule, err := store.CreateParticipationSchedule(ParticipationSchedule{
+		Mode:  ParticipationScheduleOnce,
+		RunAt: now.Add(time.Hour).Format(time.RFC3339Nano),
+	}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending := store.PendingParticipationMonitorPrewarms(now.Add(49*time.Minute), 10*time.Minute); len(pending) != 0 {
+		t.Fatalf("prewarm must not run before its configured window: %+v", pending)
+	}
+	pending := store.PendingParticipationMonitorPrewarms(now.Add(50*time.Minute), 10*time.Minute)
+	if len(pending) != 1 || pending[0].ScheduleID != schedule.ID || pending[0].DueAt != schedule.NextRunAt {
+		t.Fatalf("expected one due monitor prewarm: %+v", pending)
+	}
+	if err := store.RecordParticipationMonitorPrewarm(pending[0], 10*time.Minute, 12, 2); err != nil {
+		t.Fatal(err)
+	}
+	if repeated := store.PendingParticipationMonitorPrewarms(now.Add(55*time.Minute), 10*time.Minute); len(repeated) != 0 {
+		t.Fatalf("same schedule occurrence must prewarm once: %+v", repeated)
+	}
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeated := reloaded.PendingParticipationMonitorPrewarms(now.Add(55*time.Minute), 10*time.Minute); len(repeated) != 0 {
+		t.Fatalf("prewarm marker must persist across restarts: %+v", repeated)
+	}
+	found := false
+	for _, activity := range reloaded.Activities() {
+		found = found || strings.Contains(activity.Label, "已提前 10 分钟检查“指定日期”：12 个直播间监测已启用，使用 2 个监测账号")
+	}
+	if !found {
+		t.Fatalf("safe prewarm activity missing: %+v", reloaded.Activities())
+	}
+}
+
 func TestParticipationDailyScheduleAndBatchActivity(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {
@@ -678,6 +721,10 @@ func TestPollOnceSkipsRedPacketRequestUntilRoomIsLive(t *testing.T) {
 	store.mu.Lock()
 	store.monitors["room_room-1"].Status = "running"
 	store.mu.Unlock()
+	liveResults := make(chan string, 1)
+	store.SetLiveResultHandler(func(roomID, status string, _ time.Time) {
+		liveResults <- roomID + ":" + status
+	})
 	source := &fakeMonitorSource{probe: LiveProbe{Status: "offline", RawStatus: "4", Source: "room_web_enter"}}
 	if got := store.pollOnce(context.Background(), "room_room-1", source); got != offlineProbeInterval {
 		t.Fatalf("offline room should use %s cadence, got %s", offlineProbeInterval, got)
@@ -688,6 +735,14 @@ func TestPollOnceSkipsRedPacketRequestUntilRoomIsLive(t *testing.T) {
 	monitor, _ := store.Get("room_room-1")
 	if monitor.LiveStatus != "offline" || monitor.LiveRawStatus != "4" || monitor.LastRedPacketCheckedAt != "" {
 		t.Fatalf("unexpected offline state: %+v", monitor)
+	}
+	select {
+	case result := <-liveResults:
+		if result != "room-1:offline" {
+			t.Fatalf("unexpected definitive live result callback: %s", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("offline result callback was not invoked")
 	}
 }
 
@@ -749,6 +804,10 @@ func TestPollOnceDoesNotClaimConnectedWhenLiveProbeFails(t *testing.T) {
 	store.mu.Lock()
 	store.monitors["room_room-3"].Status = "running"
 	store.mu.Unlock()
+	liveResults := make(chan string, 1)
+	store.SetLiveResultHandler(func(roomID, status string, _ time.Time) {
+		liveResults <- roomID + ":" + status
+	})
 	source := &fakeMonitorSource{probeErr: errors.New("probe failed")}
 	if got := store.pollOnce(context.Background(), "room_room-3", source); got != unknownProbeInterval {
 		t.Fatalf("failed probe should retry after %s, got %s", unknownProbeInterval, got)
@@ -756,6 +815,11 @@ func TestPollOnceDoesNotClaimConnectedWhenLiveProbeFails(t *testing.T) {
 	monitor, _ := store.Get("room_room-3")
 	if monitor.Status != "running" || monitor.LiveStatus != "error" || monitor.ConnectionStatus != "error" || monitor.LastError == "" {
 		t.Fatalf("unexpected error state: %+v", monitor)
+	}
+	select {
+	case result := <-liveResults:
+		t.Fatalf("probe failures must not emit offline evidence, got %s", result)
+	default:
 	}
 }
 

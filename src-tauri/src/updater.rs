@@ -346,42 +346,61 @@ fn launch_installer(_app: &AppHandle, package: &DownloadedPackage) -> Result<(),
     std::fs::create_dir_all(&helper_dir).map_err(|error| format!("准备升级程序失败：{error}"))?;
     let script_path = helper_dir.join(format!("install-{}.sh", std::process::id()));
     let log_path = std::env::temp_dir().join("fubao-console-updater.log");
+    let staged_app = helper_dir.join(format!("staged-{}.app", std::process::id()));
     let script = format!(
         r#"#!/bin/bash
 set -u
 DMG={dmg}
 TARGET_APP={target}
+STAGED_APP={staged}
 PID={pid}
 LOG={log}
 MOUNT=""
+SUCCESS=0
+wait_for_app_exit() {{
+  for _i in $(/usr/bin/seq 1 90); do
+    if ! /bin/kill -0 "$PID" 2>/dev/null; then return 0; fi
+    /bin/sleep 1
+  done
+  return 1
+}}
 cleanup() {{
   if [[ -n "$MOUNT" ]]; then /usr/bin/hdiutil detach "$MOUNT" -quiet >/dev/null 2>&1 || true; fi
+  /bin/rm -rf "$STAGED_APP" >/dev/null 2>&1 || true
+  if [[ "$SUCCESS" -ne 1 && -d "$TARGET_APP" ]]; then
+    wait_for_app_exit >/dev/null 2>&1 || true
+    /usr/bin/open -n "$TARGET_APP" >> "$LOG" 2>&1 || true
+  fi
 }}
 trap cleanup EXIT
 echo "[$(/bin/date '+%F %T')] preparing update $DMG" >> "$LOG"
-MOUNT=$(/usr/bin/hdiutil attach "$DMG" -nobrowse -readonly | /usr/bin/awk 'END {{print $NF}}')
+ATTACH_OUTPUT=$(/usr/bin/hdiutil attach "$DMG" -nobrowse -readonly 2>> "$LOG") || {{ echo "mount failed" >> "$LOG"; exit 1; }}
+MOUNT=$(printf '%s\n' "$ATTACH_OUTPUT" | /usr/bin/sed -n 's#^.*\(/Volumes/.*\)$#\1#p' | /usr/bin/tail -n 1)
+if [[ -z "$MOUNT" || ! -d "$MOUNT" ]]; then echo "mounted volume not found" >> "$LOG"; exit 1; fi
 NEW_APP=$(/usr/bin/find "$MOUNT" -maxdepth 2 -name '*.app' -type d -print | /usr/bin/head -n 1)
 if [[ -z "$NEW_APP" || ! -d "$NEW_APP" ]]; then echo "new app not found" >> "$LOG"; exit 1; fi
-for _i in $(/usr/bin/seq 1 90); do
-  if ! /bin/kill -0 "$PID" 2>/dev/null; then break; fi
-  /bin/sleep 1
-done
-if /bin/kill -0 "$PID" 2>/dev/null; then echo "app still running" >> "$LOG"; exit 1; fi
+/bin/rm -rf "$STAGED_APP"
+if ! /usr/bin/ditto "$NEW_APP" "$STAGED_APP" >> "$LOG" 2>&1; then echo "staging failed" >> "$LOG"; exit 1; fi
+if [[ ! -d "$STAGED_APP/Contents" ]]; then echo "staged app is invalid" >> "$LOG"; exit 1; fi
+if ! wait_for_app_exit; then echo "app still running" >> "$LOG"; exit 1; fi
 BACKUP="${{TARGET_APP}}.old.$(/bin/date '+%Y%m%d%H%M%S')"
-if ! /bin/mv "$TARGET_APP" "$BACKUP" >> "$LOG" 2>&1; then exit 1; fi
-if /usr/bin/ditto "$NEW_APP" "$TARGET_APP" >> "$LOG" 2>&1; then
-  /bin/rm -rf "$BACKUP"
-  /usr/bin/open "$TARGET_APP"
-  echo "update success" >> "$LOG"
-  exit 0
+if ! /bin/mv "$TARGET_APP" "$BACKUP" >> "$LOG" 2>&1; then echo "backup failed" >> "$LOG"; exit 1; fi
+if /bin/mv "$STAGED_APP" "$TARGET_APP" >> "$LOG" 2>&1; then
+  if /usr/bin/open -n "$TARGET_APP" >> "$LOG" 2>&1; then
+    /bin/rm -rf "$BACKUP"
+    SUCCESS=1
+    echo "update success" >> "$LOG"
+    exit 0
+  fi
+  echo "new app launch failed" >> "$LOG"
 fi
 /bin/rm -rf "$TARGET_APP"
 /bin/mv "$BACKUP" "$TARGET_APP"
-/usr/bin/open "$TARGET_APP"
 exit 1
 "#,
         dmg = shell_quote(&package.path.to_string_lossy()),
         target = shell_quote(&target_app.to_string_lossy()),
+        staged = shell_quote(&staged_app.to_string_lossy()),
         pid = std::process::id(),
         log = shell_quote(&log_path.to_string_lossy()),
     );
@@ -392,7 +411,8 @@ exit 1
     permissions.set_mode(0o700);
     std::fs::set_permissions(&script_path, permissions)
         .map_err(|error| format!("设置升级程序权限失败：{error}"))?;
-    Command::new("/bin/bash")
+    Command::new("/usr/bin/nohup")
+        .arg("/bin/bash")
         .arg(script_path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

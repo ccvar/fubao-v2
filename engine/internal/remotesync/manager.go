@@ -42,22 +42,24 @@ const (
 )
 
 type Config struct {
-	Version          int    `json:"version"`
-	Enabled          bool   `json:"enabled"`
-	Endpoint         string `json:"endpoint"`
-	FallbackEndpoint string `json:"fallback_endpoint"`
-	EnrollmentToken  string `json:"enrollment_token,omitempty"`
-	DeviceToken      string `json:"device_token,omitempty"`
-	DeviceAccess     string `json:"device_access,omitempty"`
-	PullCursor       int64  `json:"pull_cursor,omitempty"`
-	RoomPullCursor   int64  `json:"room_pull_cursor,omitempty"`
-	PacketPullCursor int64  `json:"packet_pull_cursor,omitempty"`
+	Version               int    `json:"version"`
+	Enabled               bool   `json:"enabled"`
+	Endpoint              string `json:"endpoint"`
+	FallbackEndpoint      string `json:"fallback_endpoint"`
+	EnrollmentToken       string `json:"enrollment_token,omitempty"`
+	EnrollmentTokenMasked string `json:"enrollment_token_masked,omitempty"`
+	DeviceToken           string `json:"device_token,omitempty"`
+	DeviceAccess          string `json:"device_access,omitempty"`
+	PullCursor            int64  `json:"pull_cursor,omitempty"`
+	RoomPullCursor        int64  `json:"room_pull_cursor,omitempty"`
+	PacketPullCursor      int64  `json:"packet_pull_cursor,omitempty"`
 }
 
 type Status struct {
 	Enabled          bool   `json:"enabled"`
 	Configured       bool   `json:"configured"`
 	UploadOnly       bool   `json:"upload_only"`
+	TokenMasked      string `json:"token_masked,omitempty"`
 	Endpoint         string `json:"endpoint"`
 	FallbackEndpoint string `json:"fallback_endpoint"`
 	ActiveEndpoint   string `json:"active_endpoint,omitempty"`
@@ -146,6 +148,7 @@ func (m *Manager) loadConfig() error {
 	}
 	if token := strings.TrimSpace(os.Getenv("FUBAO_SYNC_ENROLLMENT_TOKEN")); token != "" {
 		m.config.EnrollmentToken = token
+		m.config.EnrollmentTokenMasked = maskToken(token)
 		m.config.Enabled = true
 	}
 	if token := strings.TrimSpace(os.Getenv("FUBAO_SYNC_DEVICE_TOKEN")); token != "" {
@@ -166,6 +169,12 @@ func (m *Manager) loadConfig() error {
 	m.config.FallbackEndpoint = fallbackEndpoint
 	if m.config.DeviceToken != "" && m.config.DeviceAccess == "" {
 		m.config.DeviceAccess = syncprotocol.DeviceAccessFull
+	}
+	if m.config.EnrollmentTokenMasked == "" && m.config.EnrollmentToken != "" {
+		m.config.EnrollmentTokenMasked = maskToken(m.config.EnrollmentToken)
+	}
+	if m.config.DeviceToken != "" && m.config.DeviceAccess == syncprotocol.DeviceAccessFull {
+		m.config.Enabled = true
 	}
 	if m.config.PullCursor > 0 && m.config.RoomPullCursor == 0 && m.config.PacketPullCursor == 0 {
 		m.config.RoomPullCursor = m.config.PullCursor
@@ -221,6 +230,7 @@ func (m *Manager) Status() Status {
 		Enabled:          m.config.Enabled && accessMode == syncprotocol.DeviceAccessFull,
 		Configured:       m.config.EnrollmentToken != "" || accessMode == syncprotocol.DeviceAccessFull,
 		UploadOnly:       accessMode == syncprotocol.DeviceAccessUploadOnly,
+		TokenMasked:      m.tokenMaskedLocked(),
 		Endpoint:         m.config.Endpoint,
 		FallbackEndpoint: m.config.FallbackEndpoint,
 		ActiveEndpoint:   m.activeEndpoint,
@@ -320,6 +330,7 @@ func (m *Manager) Configure(ctx context.Context, enabled bool, enrollmentToken s
 	previousActiveSince := m.activeSince
 	if enrollmentToken != "" {
 		m.config.EnrollmentToken = enrollmentToken
+		m.config.EnrollmentTokenMasked = maskToken(enrollmentToken)
 		m.config.DeviceToken = ""
 		m.config.DeviceAccess = ""
 		m.activeEndpoint = ""
@@ -737,7 +748,7 @@ func (m *Manager) pullType(ctx context.Context, roomStore *rooms.Store, redPacke
 			return err
 		}
 		if len(centerRooms) > 0 {
-			if err := redPacketStore.SyncRooms(roomStore.List()); err != nil {
+			if err := redPacketStore.SyncRooms(roomStore.All()); err != nil {
 				return err
 			}
 		}
@@ -813,6 +824,27 @@ func (m *Manager) deviceAccessLocked() string {
 		return syncprotocol.DeviceAccessFull
 	}
 	return m.config.DeviceAccess
+}
+
+func (m *Manager) tokenMaskedLocked() string {
+	if m.config.EnrollmentTokenMasked != "" {
+		return m.config.EnrollmentTokenMasked
+	}
+	if m.deviceAccessLocked() != syncprotocol.DeviceAccessFull {
+		return ""
+	}
+	return maskToken(m.config.DeviceToken)
+}
+
+func maskToken(value string) string {
+	characters := []rune(strings.TrimSpace(value))
+	if len(characters) == 0 {
+		return ""
+	}
+	if len(characters) <= 8 {
+		return "••••••"
+	}
+	return string(characters[:4]) + "…" + string(characters[len(characters)-4:])
 }
 
 func (m *Manager) recordError(err error) {

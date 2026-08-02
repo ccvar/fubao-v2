@@ -5,7 +5,147 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+func TestRoomSettingsDefaultAndDisabledValuePersist(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := store.Settings().AutoRecycleOfflineDays; got != 7 {
+		t.Fatalf("new stores must default to 7 days, got %d", got)
+	}
+	if got := store.Settings().ParticipationPrewarmMinutes; got != 10 {
+		t.Fatalf("new stores must prewarm participation monitoring 10 minutes early, got %d", got)
+	}
+	if _, err := store.SetSettings(Settings{AutoRecycleOfflineDays: 0, ParticipationPrewarmMinutes: 35}); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.Settings().AutoRecycleOfflineDays; got != 0 {
+		t.Fatalf("zero must persist as disabled, got %d", got)
+	}
+	if got := reloaded.Settings().ParticipationPrewarmMinutes; got != 35 {
+		t.Fatalf("participation prewarm setting must persist, got %d", got)
+	}
+}
+
+func TestVersionFourRoomSettingsGainPrewarmDefault(t *testing.T) {
+	dataDir := t.TempDir()
+	path := filepath.Join(dataDir, "rooms.json")
+	if err := os.WriteFile(path, []byte(`{"version":4,"settings":{"auto_recycle_offline_days":0},"rooms":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := store.Settings()
+	if settings.AutoRecycleOfflineDays != 0 || settings.ParticipationPrewarmMinutes != 10 {
+		t.Fatalf("version 4 migration lost settings: %+v", settings)
+	}
+}
+
+func TestOfflineDaysRecycleRestoreAndPermanentDelete(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ImportIDs("123456789012"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetSettings(Settings{AutoRecycleOfflineDays: 2}); err != nil {
+		t.Fatal(err)
+	}
+	location := time.FixedZone("CST", 8*60*60)
+	first := time.Date(2026, 8, 1, 9, 0, 0, 0, location)
+	recycled, err := store.RecordLiveResult("123456789012", "offline", first)
+	if err != nil || recycled {
+		t.Fatalf("first offline day must remain active, recycled=%v err=%v", recycled, err)
+	}
+	// Repeated successful probes on one calendar day count only once.
+	if recycled, err = store.RecordLiveResult("123456789012", "offline", first.Add(8*time.Hour)); err != nil || recycled {
+		t.Fatalf("same day must not advance the streak, recycled=%v err=%v", recycled, err)
+	}
+	if got := store.List()[0].OfflineDays; got != 1 {
+		t.Fatalf("expected one offline day, got %d", got)
+	}
+	// Unknown and errors are not definitive evidence and must be ignored.
+	if recycled, err = store.RecordLiveResult("123456789012", "error", first.Add(24*time.Hour)); err != nil || recycled {
+		t.Fatalf("error must be ignored, recycled=%v err=%v", recycled, err)
+	}
+	// A positive live probe resets the room-specific streak.
+	if recycled, err = store.RecordLiveResult("123456789012", "live", first.Add(24*time.Hour)); err != nil || recycled {
+		t.Fatalf("live result must reset without recycling, recycled=%v err=%v", recycled, err)
+	}
+	if got := store.List()[0].OfflineDays; got != 0 {
+		t.Fatalf("live result must reset the streak, got %d", got)
+	}
+	if _, err := store.RecordLiveResult("123456789012", "offline", first.Add(48*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	recycled, err = store.RecordLiveResult("123456789012", "offline", first.Add(72*time.Hour))
+	if err != nil || !recycled {
+		t.Fatalf("second distinct offline day must recycle, recycled=%v err=%v", recycled, err)
+	}
+	if len(store.List()) != 0 || len(store.All()) != 1 || len(store.RecycleBin()) != 1 {
+		t.Fatalf("recycled room must leave active list but remain canonical")
+	}
+	archived := store.RecycleBin()[0]
+	if archived.Enabled || archived.RecycleReason == "" || archived.RecycledAt == "" {
+		t.Fatalf("recycle metadata is incomplete: %+v", archived)
+	}
+	restored, err := store.Restore(archived.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored.Recycled || !restored.Enabled || restored.OfflineDays != 0 || restored.MonitorStatus != "stopped" {
+		t.Fatalf("restore must clear archive state without starting monitoring: %+v", restored)
+	}
+	if len(store.List()) != 1 || len(store.RecycleBin()) != 0 {
+		t.Fatal("restored room must return to the active list")
+	}
+	if _, err := store.SetSettings(Settings{AutoRecycleOfflineDays: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecordLiveResult(restored.ID, "offline", first.Add(96*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteRecycled(restored.ID); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.All()) != 0 {
+		t.Fatal("permanent delete must remove the canonical room")
+	}
+}
+
+func TestAutoRecycleDisabledNeverArchives(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ImportIDs("987654321012"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetSettings(Settings{AutoRecycleOfflineDays: 0}); err != nil {
+		t.Fatal(err)
+	}
+	for day := 1; day <= 30; day++ {
+		recycled, err := store.RecordLiveResult("987654321012", "offline", time.Date(2026, 8, day, 12, 0, 0, 0, time.Local))
+		if err != nil || recycled {
+			t.Fatalf("disabled policy must never recycle on day %d, recycled=%v err=%v", day, recycled, err)
+		}
+	}
+	if len(store.List()) != 1 || len(store.RecycleBin()) != 0 {
+		t.Fatal("disabled policy removed an active room")
+	}
+}
 
 func TestLoadRemovesRoomsWithoutValidWebRID(t *testing.T) {
 	dataDir := t.TempDir()

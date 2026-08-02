@@ -97,6 +97,16 @@ func main() {
 	if redPacketStoreErr == nil && accountStoreErr == nil {
 		redPacketStore.SetRequestRecorder(accountStore.RecordMonitoringRequest)
 	}
+	if redPacketStoreErr == nil && roomStoreErr == nil {
+		redPacketStore.SetLiveResultHandler(func(roomID, status string, checkedAt time.Time) {
+			recycled, err := roomStore.RecordLiveResult(roomID, status, checkedAt)
+			if err != nil || !recycled {
+				return
+			}
+			_ = redPacketStore.Stop("room_" + roomID)
+			_ = redPacketStore.SyncRooms(roomStore.All())
+		})
+	}
 	if redPacketStoreErr == nil && accountStoreErr == nil && browserStoreErr == nil {
 		pageParticipation = newPageParticipationBroker(browserStore)
 		redPacketParticipant = redpacket.NewPageParticipant(accountStore, pageParticipation, redPacketStore)
@@ -139,6 +149,9 @@ func main() {
 	defer stopBackground()
 	if accountStoreErr == nil && browserStoreErr == nil && roomStoreErr == nil {
 		go runFollowingLiveSync(backgroundCtx, accountStore, browserStore, followingLiveService, roomStore, redPacketStore)
+	}
+	if accountStoreErr == nil && roomStoreErr == nil && redPacketStoreErr == nil {
+		go runParticipationMonitorPrewarm(backgroundCtx, accountStore, roomStore, redPacketStore)
 	}
 	if remoteSyncManagerErr == nil {
 		go remoteSyncManager.Run(backgroundCtx)
@@ -310,6 +323,58 @@ func main() {
 				OK:      true,
 				Result:  result,
 			})
+		case "account.import_cookies":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			var params struct {
+				Role    accounts.Role           `json:"role"`
+				Sources []accounts.ImportSource `json:"sources"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || (params.Role != accounts.RoleMonitoring && params.Role != accounts.RoleParticipation) {
+				writeError(encoder, req.ID, "invalid_params", "账号导入参数无效")
+				continue
+			}
+			records, invalidSources := accounts.ParseImportSources(params.Sources)
+			if len(records) == 0 {
+				writeError(encoder, req.ID, "account_import_empty", "没有识别到有效的抖音登录 Cookie")
+				continue
+			}
+			createdCount := 0
+			mergedCount := 0
+			failedCount := 0
+			identityCtx, identityCancel := context.WithTimeout(context.Background(), 12*time.Second)
+			for _, record := range records {
+				// Single Cookie/browser exports usually have no account metadata.
+				// Resolve a friendly identity for small explicit imports, while a
+				// large legacy batch remains fast and keeps its file metadata.
+				if len(records) <= 10 && strings.TrimSpace(record.UserID) == "" {
+					if identity, err := accounts.ResolveDouyinIdentity(identityCtx, record.Cookie); err == nil {
+						record.Nickname = identity.Nickname
+						record.UserID = identity.UserID
+						record.SecUID = identity.SecUID
+					}
+				}
+				_, created, err := accountStore.UpsertImportedCookie(record.Cookie, record.Nickname, record.UserID, record.SecUID, params.Role)
+				if err != nil {
+					failedCount++
+					continue
+				}
+				if created {
+					createdCount++
+				} else {
+					mergedCount++
+				}
+			}
+			identityCancel()
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]int{
+				"imported":        createdCount,
+				"merged":          mergedCount,
+				"failed":          failedCount,
+				"invalid_sources": invalidSources,
+				"total":           len(accountStore.List(params.Role)),
+			}})
 		case "account.add_role":
 			if accountStoreErr != nil {
 				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
@@ -687,7 +752,12 @@ func main() {
 				writeError(encoder, req.ID, "browser_account_invalid", err.Error())
 				continue
 			}
-			instance, err := browserStore.Create(credential.AccountID, credential.AccountName, params.Name)
+			instance, err := browserStore.CreateWithLimit(
+				credential.AccountID,
+				credential.AccountName,
+				params.Name,
+				browserInstanceCreateLimit(licenseManager),
+			)
 			if err != nil {
 				writeError(encoder, req.ID, "browser_create_failed", err.Error())
 				continue
@@ -808,6 +878,75 @@ func main() {
 				OK:      true,
 				Result:  roomStore.List(),
 			})
+		case "room.settings":
+			if roomStoreErr != nil {
+				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: roomStore.Settings()})
+		case "room.set_settings":
+			if roomStoreErr != nil {
+				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			var params rooms.Settings
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "直播间设置参数无效")
+				continue
+			}
+			result, err := roomStore.SetSettings(params)
+			if err != nil {
+				writeError(encoder, req.ID, "room_settings_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
+		case "room.recycle_bin":
+			if roomStoreErr != nil {
+				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: roomStore.RecycleBin()})
+		case "room.recycle.restore":
+			if roomStoreErr != nil {
+				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			var params struct {
+				RoomID string `json:"room_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.RoomID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "恢复直播间参数无效")
+				continue
+			}
+			result, err := roomStore.Restore(params.RoomID)
+			if err != nil {
+				writeError(encoder, req.ID, "room_restore_failed", err.Error())
+				continue
+			}
+			if redPacketStoreErr == nil {
+				_ = redPacketStore.SyncRooms(roomStore.All())
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
+		case "room.recycle.delete":
+			if roomStoreErr != nil {
+				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			var params struct {
+				RoomID string `json:"room_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.RoomID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "永久删除直播间参数无效")
+				continue
+			}
+			if err := roomStore.DeleteRecycled(params.RoomID); err != nil {
+				writeError(encoder, req.ID, "room_delete_failed", err.Error())
+				continue
+			}
+			if redPacketStoreErr == nil {
+				_ = redPacketStore.SyncRooms(roomStore.All())
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]bool{"deleted": true}})
 		case "room.migrate_legacy":
 			if roomStoreErr != nil {
 				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
@@ -860,7 +999,7 @@ func main() {
 				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
 				continue
 			}
-			if err := redPacketStore.SyncRooms(roomStore.List()); err != nil {
+			if err := redPacketStore.SyncRooms(roomStore.All()); err != nil {
 				writeError(encoder, req.ID, "red_packet_store_unavailable", err.Error())
 				continue
 			}
@@ -1196,18 +1335,13 @@ func main() {
 				writeError(encoder, req.ID, "red_packet_store_unavailable", "红包监测存储不可用")
 				continue
 			}
-			if err := redPacketStore.SyncRooms(roomStore.List()); err != nil {
-				writeError(encoder, req.ID, "red_packet_store_unavailable", err.Error())
-				continue
-			}
-			credentials := monitoringPoolCredentials(accountStore)
-			if len(credentials) == 0 {
-				writeError(encoder, req.ID, "monitor_account_missing", "请先导入或添加监测账号")
-				continue
-			}
-			result, err := redPacketStore.StartAllPool(credentials)
+			result, err := startAllEligibleRoomMonitors(accountStore, roomStore, redPacketStore)
 			if err != nil {
-				writeError(encoder, req.ID, "red_packet_start_failed", err.Error())
+				code := "red_packet_start_failed"
+				if len(monitoringPoolCredentials(accountStore)) == 0 {
+					code = "monitor_account_missing"
+				}
+				writeError(encoder, req.ID, code, err.Error())
 				continue
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
@@ -1349,6 +1483,46 @@ func monitoringPoolCredentials(store *accounts.Store) []redpacket.AccountCredent
 	return credentials
 }
 
+func startAllEligibleRoomMonitors(accountStore *accounts.Store, roomStore *rooms.Store, redPacketStore *redpacket.Store) (redpacket.PoolStartResult, error) {
+	if accountStore == nil || roomStore == nil || redPacketStore == nil {
+		return redpacket.PoolStartResult{}, errors.New("红包监测存储不可用")
+	}
+	if err := redPacketStore.SyncRooms(roomStore.All()); err != nil {
+		return redpacket.PoolStartResult{}, err
+	}
+	credentials := monitoringPoolCredentials(accountStore)
+	if len(credentials) == 0 {
+		return redpacket.PoolStartResult{}, errors.New("请先导入或添加可用的监测账号")
+	}
+	return redPacketStore.StartAllPool(credentials)
+}
+
+// runParticipationMonitorPrewarm is intentionally native and page-agnostic.
+// Scheduled monitoring preparation therefore continues while the user is on
+// another page, the main window is hidden in the tray, or no browser card is
+// mounted. Failed checks stay unmarked and are retried until the run is due.
+func runParticipationMonitorPrewarm(ctx context.Context, accountStore *accounts.Store, roomStore *rooms.Store, redPacketStore *redpacket.Store) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		settings := roomStore.Settings()
+		advance := time.Duration(settings.ParticipationPrewarmMinutes) * time.Minute
+		pending := redPacketStore.PendingParticipationMonitorPrewarms(time.Now(), advance)
+		if len(pending) > 0 {
+			if result, err := startAllEligibleRoomMonitors(accountStore, roomStore, redPacketStore); err == nil {
+				for _, execution := range pending {
+					_ = redPacketStore.RecordParticipationMonitorPrewarm(execution, advance, result.Started, result.AccountCount)
+				}
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
 func mergeFollowingLiveResult(roomStore *rooms.Store, redPacketStore *redpacket.Store, credential accounts.BrowserCredential, result followinglive.Result) error {
 	if roomStore == nil {
 		return errors.New("直播间存储不可用")
@@ -1366,7 +1540,7 @@ func mergeFollowingLiveResult(roomStore *rooms.Store, redPacketStore *redpacket.
 		return err
 	}
 	if redPacketStore != nil {
-		return redPacketStore.SyncRooms(roomStore.List())
+		return redPacketStore.SyncRooms(roomStore.All())
 	}
 	return nil
 }
@@ -1455,4 +1629,11 @@ func remoteSyncPullScope(manager *license.Manager) remotesync.PullScope {
 		return remotesync.PullAll
 	}
 	return remotesync.PullRedPackets
+}
+
+func browserInstanceCreateLimit(manager *license.Manager) int {
+	if manager != nil && manager.Status().State == "active" {
+		return 0
+	}
+	return 1
 }

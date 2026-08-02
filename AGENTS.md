@@ -14,7 +14,13 @@ In participation and monitoring account rows, keep CK health on the first line a
 
 The account status filter stays compact and exposes only “可用”, “CK 失效”, and “冷却中” in addition to “全部状态”. Account-row delete icons remain low-contrast by default and become prominent only on hover or keyboard focus.
 
+Account sorting lives beside the “状态与数据” table heading and follows the same compact menu interaction as room sorting. Monitoring accounts support request-total, today-request, last-request-time, and added-time priority; participation accounts support available, participation-count, win-count, and added-time priority. Numeric priorities sort high-to-low, time priorities sort newest-first, and equal values preserve the current list order.
+
+账号导入入口必须明确显示当前目标分类，避免让用户猜测账号会进入“参与账号”还是“监测账号”。“粘贴 Cookie / 扫码登录 / 批量导入文件 / 批量导入文件夹”都添加到当前明确显示的目标分类；同一账号再次导入到另一分类时只补充分配，不移除原分类。批量导入兼容旧福宝账号 JSON、浏览器 Cookie JSON、原始 Cookie 或 Cookie Header、cURL、Netscape cookie.txt，以及逐行 Cookie 文本。
+
 All hover help in the desktop UI uses the shared dark in-app Tooltip (`data-tooltip` plus an edge-safe placement), never the browser-native `title` tooltip. Keep `aria-label` on icon-only controls.
+
+Top-bar dropdowns and other floating menus must always render above the scrollbars of the business tables beneath them. Native table scrollbar thumbs must never bleed through or visually cover an open menu; hiding only the underlying thumb while a menu is open is acceptable and must not change table scroll position or behavior.
 
 When implementing from a selected generated mock, treat that image as the source of truth for layout, component anatomy, density, spacing, color, typography, visible content, and hierarchy.
 
@@ -52,7 +58,9 @@ Keep the compact sidebar footer permanently visible at the bottom of the window.
 
 The recent-activity section must never render demo or sample events. A fresh local store with no persisted activity shows only the low-contrast text “暂无活动”; real persisted activity replaces that empty state.
 
-The sidebar names its live counters section “数据概览”. A separate “最近活动” section sits below it, reuses the same compact icon-and-copy row language, and owns the remaining scrollable space above the fixed footer.
+The sidebar names its live counters section “数据概览”. Its four counter rows are text-only: do not render leading status icons, and place each count directly before the status label without the Chinese classifier “个”, while preserving the existing semantic colors and click targets. A separate “最近活动” section sits below it, reuses the same compact icon-and-copy row language, and owns the remaining scrollable space above the fixed footer.
+
+In the sidebar “数据概览”, render each leading count in a compact, prominent condensed numeric face with tabular figures. Keep the counts visibly larger than the deliberately smaller supporting copy, while preserving warning colors.
 
 The sidebar recent-activity list displays the complete persisted history returned by the Go store (currently up to 100 newest entries) in its own scrollable region; never impose a smaller frontend-only item cap such as four rows.
 
@@ -65,6 +73,8 @@ The DY-KIRO-derived application icon uses a flat pure-white interior tile while 
 The Tauri bundle must explicitly list the PNG, macOS `.icns`, and Windows `.ico` application icons. Never rely on implicit icon discovery, because Universal macOS CI builds can otherwise emit an `.app` without `CFBundleIconFile` or `Contents/Resources`.
 
 The sidebar footer always shows the current application version followed by the current license edition. A fresh installation defaults to “免费版”; successful Keygen activation changes it to “专业版”. Reuse the legacy 福宝/DY-KIRO product, device fingerprint, machine activation, refresh, unbind, and offline-grace semantics in the Go engine. License keys remain only in the permission-restricted Go store and the frontend receives only safe status and masked metadata. Free and professional editions currently have no feature-level restrictions. The active-license panel shows its absolute expiry or “永久有效” when Keygen provides no expiry, and exposes an icon-only “更换授权码” action; replacing a key must validate the new key before overwriting the current working authorization. When a professional license has a finite expiry, the sidebar footer shows a compact “剩余 N 天” reminder immediately after the edition badge and uses the shared dark in-app Tooltip to reveal the exact expiry; permanent licenses omit this reminder.
+
+For the professional edition, show a very small cloud-download icon immediately after “福宝控制台” in the sidebar footer once the center-library state has loaded. The downward arrow represents receiving center-library data. Use green when a center-library Key is bound and gray when it is unbound; the free edition shows no icon. The icon uses the shared dark in-app Tooltip and opens the existing authorization-management dialog. Center-library icons inside that dialog use the same downward-arrow direction.
 
 At narrow widths (760px and below), the sidebar becomes a true icon rail. Never render a web logo or any decorative mark in the native traffic-light strip, because it overlaps macOS window controls. Keep the four primary navigation icons in one dense uninterrupted group, then separate the workspace and recent-activity icon groups with restrained spacing.
 
@@ -85,6 +95,10 @@ The compact sidebar footer gear opens 红包参与设置 rather than license man
 The data-management screen is named “账号与直播间” and orders its tabs as “红包 / 直播间 / 参与账号 / 监测账号”. The red-packet monitor reuses 福宝’s signed `luckybox/box/list` request path (with `lottery_info` as a safe fallback) but must surface only explicit 红包 payloads; 福袋/lottery payloads are filtered out. Legacy room migration copies `rooms_config.json` into the Go engine’s permission-restricted local store and must never modify the old 福宝 data. The top-bar action is named “导入数据”, with “导入直播间” kept as a distinct first menu action.
 
 The room-management workflow owns red-packet monitoring controls: the “直播间” tab provides per-room start/stop actions plus “全部启动/全部停止” in its upper-right corner, while the adjacent “红包” tab is an event-only feed of red packets detected by running room monitors and must not show monitor controls.
+
+The shared settings dialog uses top-level tabs for “红包参与” and “直播间”. Room settings persist an automatic recycle threshold that defaults to 7 confirmed offline monitoring days; zero disables automatic recycling. Count each local calendar day at most once, reset the streak after any confirmed live result, and never count unknown, network-error, or CK-error outcomes as offline evidence. Recycled rooms stop monitoring but remain recoverable with the recorded reason and recycle time. Restoring clears the offline streak and returns the room in a stopped state. Permanent deletion is available only inside the recycle bin and always requires the compact destructive confirmation dialog.
+
+Participation task schedules prewarm room monitoring through the Go engine before every “指定日期 / 每天固定时间 / 间隔执行” occurrence. The lead time is persisted in the shared “直播间” settings, defaults to 10 minutes, and zero means check only when the participation batch actually starts. When the prewarm window opens, check all eligible non-recycled rooms and invoke the same native “全部启动” path only as needed; invalid monitoring CKs are skipped by the Go account store. Immediate execution always performs the execution-time check. This behavior must remain independent of the current page, browser-card rendering, and window visibility, and deleting or stopping a participation schedule must not automatically stop room monitoring.
 
 Room red-packet monitoring is explicitly two-stage. First probe Douyin's room-entry endpoint to determine whether the room is live; only a room positively confirmed live may query red-packet endpoints. Unknown rooms use a short initial probe cadence, offline rooms use a slower live-status cadence, live rooms use a faster red-packet cadence, and an active red packet uses the fastest cadence. Monitor-task state, live/offline state, and red-packet state are separate UI concepts. In the room table, combine the streamer and room identifier into one column with the identifier and source shown below the streamer, and show the current live/offline result in the status area.
 
@@ -112,6 +126,14 @@ Returning to the browser-instance screen must show each already-rendered instanc
 
 Browser instance records are not a fixed concurrency allowance. The Go engine computes a recommended runtime limit from the current machine's CPU and available memory, admits visible or explicitly opened instances into shared resource leases, and queues the rest in stable order. Existing work is never killed merely because pressure rises, but critical memory pressure closes new admission until recovery. Switching application pages only hides mounted child WebViews and retains their leases so their exact in-memory state survives; scrolling a card out of the usable viewport still destroys its embedded child WebView and releases its lease. Waiting cards retry automatically and show their queue state. Independently opened browser windows consume the same shared runtime capacity.
 
+浏览器运行建议上限的 CPU 基准使用逻辑核心数的 1.5 倍，再与扣除 25%（最低 2GB）预留后的内存容量、24 个自动硬上限取最小值；内存受限和临界压力仍会下调或暂停新增。标题栏“建议上限”必须使用共享暗色 Tooltip 展示 Go 引擎返回的 CPU 上限、内存预留、单实例估算、内存上限、自动硬上限和最终结果，不能由前端另行猜测计算。
+
+浏览器实例标题栏“建议上限”的计算 Tooltip 固定向上展开，并使用较宽的两行专用布局：第一行展示 CPU 与内存计算，第二行展示取最小值和最终建议；避免向下被原生实例 WebView 遮挡，也避免过窄多行向上侵入原生标题栏。
+
+Native browser WebView teardown is idempotent and must never inspect the page URL, Cookie, or other WKWebView state after destruction begins. Persist the last safe Douyin location only from navigation/page-load callbacks, ignore overlapping close requests, and throttle large batch-created instance mounts through a small rolling native-mount window so creating many records cannot flood the macOS main thread.
+
+An active red-packet participation task retains its real native live-room WebView and Go runtime lease even when the instance card is outside the viewport or another app page is selected; hide the surface without destroying the page context. Release both only after the participation context ends. The browser screen shows a compact live task summary from safe Go context state—active accounts, prepared/accepting contexts, task-local joined count, pending draws, and wins—and never invents frontend counters.
+
 Room records without a valid 6–20 digit `web_rid` are invalid and must be removed rather than displayed as record-only rooms. Red-packet bulk controls reflect actual runtime state: hide “全部停止” when none are running, hide “全部启动” when all eligible rooms are running, visually distinguish start from stop, and provide a compact runtime-log entry point.
 
 When dismissing the CK rebind flow, hide and destroy the native child WebView before unmounting the HTML modal. If native teardown fails, keep the modal visible and report the failure so an orphan WebView can never remain over the main interface.
@@ -131,6 +153,8 @@ One participation account may have only one unresolved accepted red packet at a 
 The personal draw-result query has a configurable post-draw timeout in the participation settings, defaulting to 10 seconds. If no definitive matching result is available when that window expires, persist the record as “开奖异常”, release the unresolved-result gate, and continue the current participation task according to its cooldown and stop limits. The participation-record tab exposes a native utility-window log entry matching the room-monitor log affordance. Participation logs may show only safe business request parameters and recursively redacted response JSON; Cookies, tokens, signatures, signed URLs, headers, device fingerprints, and other native credentials must never be persisted in or sent to that log window.
 
 Browser-instance refinements: the identity-row instance tile is 20px. Account names and Douyin IDs expose the shared dark in-app Tooltip only when the rendered text is actually truncated. Cards expose compact icon-only “打开实例” and “关闭实例” actions with shared in-app tooltips; closing always requires the compact confirmation dialog, then destroys the mounted child WebView and removes the card while preserving the account-keyed profile for later reuse. The CK-expired badge keeps its coral surface unchanged on hover and does not add a gray hover fill. When participation CK is expired, hide the red-packet participation icon in both the instance card and participation-account row instead of leaving an unusable control visible. The “新建实例” dialog supports multi-select batch creation for eligible participation accounts, while accounts that already own an instance remain excluded.
+
+有效专业版的“新建实例”多选对话框在可创建账号数量后提供紧凑的“全选 / 反选”切换；全选只作用于当前可创建账号，全部选中时“反选”清空当前选择。免费版继续保持单选且不显示全选操作。
 
 Each browser-instance identity row may show the number of accounts currently live among that instance account's Douyin follows. Read it through the Go engine with the instance's canonical participation credential, never through frontend Cookie access. Show `0` only after a successful snapshot confirms zero live follows; while loading show only the compact spinner, and when no successful result exists render neither “未知” nor a failed-result placeholder. Clicking a successful count opens safe room metadata only: avatar, account name, live title, room number, room identifier, viewer count, and an external room action. Legacy 福宝 discovery/seed-room code and `similar_room_by_anchor` are references for signing and resilient parsing only; similar-room expansion must never be presented as the current account's followed-live list.
 
@@ -198,6 +222,12 @@ On Windows, retain the native caption and system window controls. Keep the sideb
 
 远程直播间/红包同步由用户在“授权管理”中配置。界面只接收服务端注册令牌并直接交给 Go 引擎；启用同步前必须先兑换为设备凭证，状态接口不得返回注册令牌或设备凭证，兑换成功后不得再次显示注册令牌明文。更换令牌验证失败时必须保留上一套可用设备注册。
 
+“授权管理”中的中心同步区命名为“中心库数据获取”。已绑定状态只显示 Go 引擎返回的脱敏令牌、紧邻其后的图标式“更换令牌”操作和连接状态，不显示线路、待同步数量、最近成功时间或启停接收操作；完整注册令牌和设备凭证始终不得进入前端 JavaScript。
+
+中心库令牌编辑状态把令牌输入框与“取消 / 保存并连接”操作排在同一行，按钮紧邻输入框右侧，输入框与按钮保持相同高度；仅在窄窗口空间不足时换行。
+
 所有绑定中心服务的客户端共享直播间与红包业务数据。任一客户端的本地发现按稳定直播间/红包标识上传中心库，其他客户端使用持久化增量游标自动拉取并合并；本机产生的记录保留本地来源，仅从远端取得的记录在直播间和红包列表明确标记“来源于中心库”。客户端必须忽略自身中心变更并禁止把纯中心来源数据回传，避免循环同步；Cookie、账号、签名、请求上下文和参与数据仍不得同步。
 
 中心库上传不以同步 KEY 或授权状态为前提：未绑定同步 KEY 的客户端自动注册仅上传设备身份，持续上传安全白名单内的直播间与红包数据，但服务端必须拒绝该身份读取中心增量。绑定同步 KEY 后才取得完整设备身份；无有效授权仍只上传，有限期且当前有效的授权只拉取红包，永久有效授权才拉取直播间与红包。直播间和红包使用独立持久化游标，保证有限期授权升级为永久授权后仍能补拉直播间；已落地的中心数据不因授权变化主动删除。
+
+免费版或无有效授权的客户端最多只能创建一个浏览器实例；有效专业版不受该授权数量限制，仍服从机器资源建议上限。实例数量限制必须由 Go 引擎在复用判断与持久化新实例的同一临界区内强制执行，前端只负责同步提示与免费版单选；授权失效不得自动删除或关闭既有实例，只阻止继续新增。

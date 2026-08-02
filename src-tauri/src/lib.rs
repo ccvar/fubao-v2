@@ -37,6 +37,10 @@ struct EngineRuntime {
     // last safe Douyin location here so remounting the same stable instance
     // restores its page instead of always jumping back to the home page.
     browser_locations: Mutex<HashMap<String, String>>,
+    // Closing a child WKWebView is asynchronous at the WebKit/Tauri boundary.
+    // Keep a native tombstone so overlapping layout, scroll, and modal cleanup
+    // requests cannot reuse or close the same invalidating handle twice.
+    browser_webviews_closing: Mutex<HashSet<String>>,
     browser_red_packet_contexts: Mutex<HashSet<String>>,
     browser_cookie_synced_at: Mutex<HashMap<String, Instant>>,
 }
@@ -49,6 +53,7 @@ impl Default for EngineRuntime {
             native_secret: Uuid::new_v4().to_string(),
             pending: Mutex::new(HashMap::new()),
             browser_locations: Mutex::new(HashMap::new()),
+            browser_webviews_closing: Mutex::new(HashSet::new()),
             browser_red_packet_contexts: Mutex::new(HashSet::new()),
             browser_cookie_synced_at: Mutex::new(HashMap::new()),
         }
@@ -380,19 +385,43 @@ fn browser_webview_label(instance_id: &str, parent_label: &str) -> String {
     )
 }
 
-fn browser_webviews_for_instance(app: &tauri::AppHandle, instance_id: &str) -> Vec<tauri::Webview> {
+fn browser_webview_is_closing(runtime: &EngineRuntime, label: &str) -> bool {
+    runtime
+        .browser_webviews_closing
+        .lock()
+        .map(|labels| labels.contains(label))
+        .unwrap_or(true)
+}
+
+fn begin_browser_webview_close(runtime: &EngineRuntime, label: &str) -> Result<bool, String> {
+    runtime
+        .browser_webviews_closing
+        .lock()
+        .map_err(|_| "浏览器实例销毁状态锁不可用".to_string())
+        .map(|mut labels| labels.insert(label.to_string()))
+}
+
+fn browser_webviews_for_instance(
+    app: &tauri::AppHandle,
+    runtime: &EngineRuntime,
+    instance_id: &str,
+) -> Vec<tauri::Webview> {
     let prefix = browser_webview_prefix(instance_id);
     app.webviews()
         .into_values()
-        .filter(|webview| webview.label().starts_with(&prefix))
+        .filter(|webview| {
+            webview.label().starts_with(&prefix)
+                && !browser_webview_is_closing(runtime, webview.label())
+        })
         .collect()
 }
 
 fn browser_webview_for_instance(
     app: &tauri::AppHandle,
+    runtime: &EngineRuntime,
     instance_id: &str,
 ) -> Option<tauri::Webview> {
-    browser_webviews_for_instance(app, instance_id)
+    browser_webviews_for_instance(app, runtime, instance_id)
         .into_iter()
         .next()
 }
@@ -544,7 +573,11 @@ fn login_cookie_values(raw_cookie: &str) -> HashMap<String, String> {
 
 #[cfg(test)]
 mod cookie_tests {
-    use super::{canonical_cookie_values, login_cookie_values};
+    use super::{
+        begin_browser_webview_close, browser_location_matches_live_room,
+        browser_webview_is_closing, canonical_cookie_values, login_cookie_values,
+        remember_browser_location, EngineRuntime, Url,
+    };
 
     #[test]
     fn complete_cookie_comparison_ignores_order_but_detects_auxiliary_changes() {
@@ -562,6 +595,52 @@ mod cookie_tests {
             login_cookie_values("sessionid_ss=session; ttwid=old"),
             login_cookie_values("sessionid_ss=session; ttwid=new")
         );
+    }
+
+    #[test]
+    fn browser_close_tombstone_makes_overlapping_close_idempotent() {
+        let runtime = EngineRuntime::default();
+
+        assert!(!browser_webview_is_closing(&runtime, "browser-a--main"));
+        assert_eq!(
+            begin_browser_webview_close(&runtime, "browser-a--main"),
+            Ok(true)
+        );
+        assert!(browser_webview_is_closing(&runtime, "browser-a--main"));
+        assert_eq!(
+            begin_browser_webview_close(&runtime, "browser-a--main"),
+            Ok(false)
+        );
+        assert_eq!(
+            begin_browser_webview_close(&runtime, "browser-b--main"),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn browser_location_cache_matches_only_the_requested_live_room() {
+        let runtime = EngineRuntime::default();
+        let room_url = "https://live.douyin.com/123456789?from=fubao"
+            .parse::<Url>()
+            .expect("test URL must parse");
+
+        remember_browser_location(&runtime, "instance-a", &room_url);
+
+        assert!(browser_location_matches_live_room(
+            &runtime,
+            "instance-a",
+            "123456789"
+        ));
+        assert!(!browser_location_matches_live_room(
+            &runtime,
+            "instance-a",
+            "987654321"
+        ));
+        assert!(!browser_location_matches_live_room(
+            &runtime,
+            "instance-b",
+            "123456789"
+        ));
     }
 }
 
@@ -638,23 +717,24 @@ fn live_room_url(web_rid: &str) -> Result<Url, String> {
 
 async fn navigate_browser_to_live_room(
     webview: &tauri::Webview,
+    runtime: &EngineRuntime,
+    instance_id: &str,
     web_rid: &str,
 ) -> Result<(), String> {
     let target = live_room_url(web_rid)?;
-    let already_there = webview.url().ok().is_some_and(|current| {
-        current.domain() == Some("live.douyin.com")
-            && current.path().trim_matches('/') == web_rid.trim()
-    });
+    // Never query WKWebView.url() from task/teardown races. Wry's macOS
+    // implementation unwraps the underlying NSURL and aborts the process if
+    // WebKit has already invalidated it. Navigation callbacks maintain this
+    // safe native cache without touching a closing page object.
+    let already_there = browser_location_matches_live_room(runtime, instance_id, web_rid);
     if !already_there {
         webview
-            .navigate(target)
+            .navigate(target.clone())
             .map_err(|error| format!("切换到直播间失败：{error}"))?;
+        remember_browser_location(runtime, instance_id, &target);
     }
     for _ in 0..40 {
-        if webview.url().ok().is_some_and(|current| {
-            current.domain() == Some("live.douyin.com")
-                && current.path().trim_matches('/') == web_rid.trim()
-        }) {
+        if browser_location_matches_live_room(runtime, instance_id, web_rid) {
             tokio::time::sleep(Duration::from_millis(if already_there {
                 500
             } else {
@@ -1084,8 +1164,17 @@ async fn handle_page_participation_task(
         || task.box_id.trim().is_empty()
     {
         NativePageParticipationResult::context_missing("红包参与任务缺少直播间参数")
-    } else if let Some(webview) = browser_webview_for_instance(&app, &task.instance_id) {
-        match navigate_browser_to_live_room(&webview, &task.web_rid).await {
+    } else if let Some(webview) =
+        browser_webview_for_instance(&app, runtime.as_ref(), &task.instance_id)
+    {
+        match navigate_browser_to_live_room(
+            &webview,
+            runtime.as_ref(),
+            &task.instance_id,
+            &task.web_rid,
+        )
+        .await
+        {
             Ok(()) => match inspect_douyin_login(&webview).await {
                 Ok(snapshot) if snapshot.state == BrowserLoginState::LoggedOut => {
                     NativePageParticipationResult::login_expired("CK 已失效：直播页面要求重新登录")
@@ -1506,6 +1595,8 @@ fn apply_browser_bounds(webview: &tauri::Webview, bounds: &BrowserBounds) -> Res
 fn schedule_browser_webview_reveal(
     webview: tauri::Webview,
     app: tauri::AppHandle,
+    runtime: Arc<EngineRuntime>,
+    webview_label: String,
     instance_id: String,
     revealed: Arc<AtomicBool>,
     delay: std::time::Duration,
@@ -1516,6 +1607,9 @@ fn schedule_browser_webview_reveal(
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
+            return;
+        }
+        if browser_webview_is_closing(&runtime, &webview_label) {
             return;
         }
         match webview.show() {
@@ -1569,6 +1663,23 @@ fn browser_restore_location(runtime: &EngineRuntime, instance_id: &str) -> Url {
         })
 }
 
+fn browser_location_matches_live_room(
+    runtime: &EngineRuntime,
+    instance_id: &str,
+    web_rid: &str,
+) -> bool {
+    runtime
+        .browser_locations
+        .lock()
+        .ok()
+        .and_then(|locations| locations.get(instance_id).cloned())
+        .and_then(|location| location.parse::<Url>().ok())
+        .is_some_and(|current| {
+            current.domain() == Some("live.douyin.com")
+                && current.path().trim_matches('/') == web_rid.trim()
+        })
+}
+
 async fn ensure_browser_webview(
     app: &tauri::AppHandle,
     window: &tauri::Window,
@@ -1578,6 +1689,17 @@ async fn ensure_browser_webview(
     reveal_when_ready: bool,
 ) -> Result<tauri::Webview, String> {
     let label = browser_webview_label(&instance_id, window.label());
+    let was_closing = browser_webview_is_closing(&runtime, &label);
+    if was_closing {
+        if app.get_webview(&label).is_some() {
+            return Err("浏览器实例正在释放，请稍后重试".into());
+        }
+        runtime
+            .browser_webviews_closing
+            .lock()
+            .map_err(|_| "浏览器实例销毁状态锁不可用")?
+            .remove(&label);
+    }
     if let Some(webview) = app.get_webview(&label) {
         if reveal_when_ready {
             apply_browser_bounds(&webview, bounds)?;
@@ -1612,6 +1734,7 @@ async fn ensure_browser_webview(
     let page_runtime = runtime.clone();
     let page_instance_id = instance_id.to_string();
     let restore_url = browser_restore_location(&runtime, &instance_id);
+    let restore_url_text = restore_url.to_string();
     let mut builder = WebviewBuilder::new(label.clone(), WebviewUrl::External(blank_url))
         .focused(false)
         .accept_first_mouse(true)
@@ -1644,6 +1767,8 @@ async fn ensure_browser_webview(
                 schedule_browser_webview_reveal(
                     webview.clone(),
                     ready_app.clone(),
+                    page_runtime.clone(),
+                    webview.label().to_string(),
                     ready_instance_id.clone(),
                     ready_once_for_page.clone(),
                     std::time::Duration::from_millis(1_200),
@@ -1696,18 +1821,16 @@ async fn ensure_browser_webview(
         schedule_browser_webview_reveal(
             webview.clone(),
             app.clone(),
+            runtime.clone(),
+            webview.label().to_string(),
             instance_id.to_string(),
             ready_once,
             std::time::Duration::from_millis(5_000),
         );
     }
     if cfg!(debug_assertions) {
-        let current_url = webview
-            .url()
-            .map(|url| url.to_string())
-            .unwrap_or_else(|error| format!("读取地址失败：{error}"));
         eprintln!(
-            "[embedded-browser] mounted label={label} account={} visibility={} url={current_url}",
+            "[embedded-browser] mounted label={label} account={} visibility={} url={restore_url_text}",
             credential.account_id,
             if reveal_when_ready {
                 "card"
@@ -1756,11 +1879,15 @@ async fn mount_browser_webview(
 fn sync_browser_webview(
     app: tauri::AppHandle,
     window: tauri::Window,
+    runtime: tauri::State<'_, Arc<EngineRuntime>>,
     instance_id: String,
     bounds: BrowserBounds,
     reveal: bool,
 ) -> Result<(), String> {
     let label = browser_webview_label(&instance_id, window.label());
+    if browser_webview_is_closing(runtime.inner().as_ref(), &label) {
+        return Err("嵌入浏览器正在释放".into());
+    }
     let webview = app.get_webview(&label).ok_or("嵌入浏览器尚未创建")?;
     // Geometry synchronization must not reveal an initial white native
     // surface. Once the frontend has observed the first page-load event,
@@ -1778,9 +1905,13 @@ fn sync_browser_webview(
 fn hide_browser_webview(
     app: tauri::AppHandle,
     window: tauri::Window,
+    runtime: tauri::State<'_, Arc<EngineRuntime>>,
     instance_id: String,
 ) -> Result<(), String> {
     let label = browser_webview_label(&instance_id, window.label());
+    if browser_webview_is_closing(runtime.inner().as_ref(), &label) {
+        return Ok(());
+    }
     if let Some(webview) = app.get_webview(&label) {
         webview
             .hide()
@@ -1797,18 +1928,17 @@ fn close_browser_webview(
     instance_id: String,
 ) -> Result<(), String> {
     let label = browser_webview_label(&instance_id, window.label());
-    if let Some(webview) = app.get_webview(&label) {
-        // Douyin is a SPA, so its current address can change without a full
-        // page-load callback. Snapshot the live native URL immediately before
-        // releasing the child WebView so returning to the browser screen can
-        // restore the same safe Douyin location instead of falling back to the
-        // home page.
-        if let Ok(url) = webview.url() {
-            remember_browser_location(runtime.inner().as_ref(), &instance_id, &url);
+    let should_close = begin_browser_webview_close(runtime.inner().as_ref(), &label)?;
+    if should_close {
+        if let Some(webview) = app.get_webview(&label) {
+            // The last safe location is already captured by on_navigation and
+            // on_page_load. Calling webview.url() here can abort on macOS when
+            // WKWebView is concurrently invalidating, so teardown deliberately
+            // performs no page inspection and is safe to request repeatedly.
+            webview
+                .close()
+                .map_err(|error| format!("关闭嵌入浏览器失败：{error}"))?;
         }
-        webview
-            .close()
-            .map_err(|error| format!("关闭嵌入浏览器失败：{error}"))?;
     }
     if let Ok(mut contexts) = runtime.browser_red_packet_contexts.lock() {
         contexts.remove(&instance_id);
@@ -1846,11 +1976,13 @@ async fn prepare_browser_red_packet_context(
     // Reuse any account WebView already alive in another app page/window; when
     // none exists, create an off-screen native WebView backed by the exact same
     // account-keyed data store and Cookie injection path as a visible card.
-    let webview = if let Some(webview) = browser_webview_for_instance(&app, &instance_id) {
+    let (webview, created_background) = if let Some(webview) =
+        browser_webview_for_instance(&app, runtime.inner().as_ref(), &instance_id)
+    {
         if cfg!(debug_assertions) {
             eprintln!("[redpacket-schedule] reused page context instance={instance_id}");
         }
-        webview
+        (webview, false)
     } else {
         let webview = ensure_browser_webview(
             &app,
@@ -1871,9 +2003,10 @@ async fn prepare_browser_red_packet_context(
                 "[redpacket-schedule] created background page context instance={instance_id}"
             );
         }
-        webview
+        (webview, true)
     };
-    navigate_browser_to_live_room(&webview, &web_rid).await?;
+    navigate_browser_to_live_room(&webview, runtime.inner().as_ref(), &instance_id, &web_rid)
+        .await?;
     let mut snapshot = inspect_douyin_login(&webview).await?;
     // A freshly-created hidden WebView may have committed the live-room URL
     // before Douyin's SPA has exposed its login state. Give it a bounded native
@@ -1891,7 +2024,7 @@ async fn prepare_browser_red_packet_context(
         BrowserLoginState::Unknown => return Err("直播页面尚未完成加载，请稍后重试".into()),
     }
     let runtime = runtime.inner().clone();
-    native_engine_request(
+    if let Err(error) = native_engine_request(
         runtime.clone(),
         "red_packet_participation.native_context",
         json!({
@@ -1901,7 +2034,19 @@ async fn prepare_browser_red_packet_context(
             "secret": runtime.native_secret,
         }),
     )
-    .await?;
+    .await
+    {
+        // A context created only for a scheduled/background run must not stay
+        // alive without the matching Go participation lease. Existing visible
+        // card WebViews remain untouched when admission is temporarily denied.
+        if created_background {
+            let label = webview.label().to_string();
+            if begin_browser_webview_close(runtime.as_ref(), &label).unwrap_or(false) {
+                let _ = webview.close();
+            }
+        }
+        return Err(error);
+    }
     runtime
         .browser_red_packet_contexts
         .lock()
@@ -1944,7 +2089,7 @@ async fn refresh_browser_account_cookie(
     runtime: tauri::State<'_, Arc<EngineRuntime>>,
     instance_id: String,
 ) -> Result<(), String> {
-    let webviews = browser_webviews_for_instance(&app, &instance_id);
+    let webviews = browser_webviews_for_instance(&app, runtime.inner().as_ref(), &instance_id);
     if webviews.is_empty() {
         // An unmounted instance receives the latest canonical Cookie during
         // its next mount, so there is nothing to refresh now.
@@ -1986,7 +2131,7 @@ async fn sync_browser_account_cookie(
     let label = browser_webview_label(&instance_id, window.label());
     let Some(webview) = app
         .get_webview(&label)
-        .or_else(|| browser_webview_for_instance(&app, &instance_id))
+        .or_else(|| browser_webview_for_instance(&app, runtime.inner().as_ref(), &instance_id))
     else {
         if require_logged_in {
             return Err("当前卡片登录页面尚未就绪，请等待卡片加载完成后重试".into());
@@ -2114,7 +2259,7 @@ async fn sync_browser_following_live(
     let label = browser_webview_label(&instance_id, window.label());
     let webview = app
         .get_webview(&label)
-        .or_else(|| browser_webview_for_instance(&app, &instance_id))
+        .or_else(|| browser_webview_for_instance(&app, runtime.inner().as_ref(), &instance_id))
         .ok_or("浏览器实例页面尚未就绪，请等待卡片加载完成后重试")?;
     let mut login_state = BrowserLoginState::Unknown;
     for _ in 0..25 {

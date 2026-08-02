@@ -67,7 +67,19 @@ func (b *pageParticipationBroker) SetContext(instanceID string, ready bool) (str
 	if err != nil {
 		return "", err
 	}
+	instanceID = strings.TrimSpace(instanceID)
+	if ready {
+		admission, retainErr := b.browsers.RetainParticipationContext(instanceID)
+		if retainErr != nil {
+			return "", retainErr
+		}
+		if !admission.Granted {
+			_, _ = b.browsers.ReleaseParticipationContext(instanceID)
+			return "", errors.New("当前设备安全并发已满，红包参与上下文等待资源")
+		}
+	}
 	b.mu.Lock()
+	previousInstanceID := b.readyByAccount[accountID]
 	if ready {
 		b.readyByAccount[accountID] = instanceID
 	} else if b.readyByAccount[accountID] == instanceID {
@@ -86,6 +98,12 @@ func (b *pageParticipationBroker) SetContext(instanceID string, ready bool) (str
 		}
 	}
 	b.mu.Unlock()
+	if ready && previousInstanceID != "" && previousInstanceID != instanceID {
+		_, _ = b.browsers.ReleaseParticipationContext(previousInstanceID)
+	}
+	if !ready && previousInstanceID == instanceID {
+		_, _ = b.browsers.ReleaseParticipationContext(instanceID)
+	}
 	for _, pending := range cancelled {
 		pending.result <- redpacket.PageParticipationResponse{
 			ContextMissing: true,
@@ -105,7 +123,9 @@ func (b *pageParticipationBroker) Ready(accountID string) bool {
 // delivered native request to return. Undelivered joins are cancelled.
 func (b *pageParticipationBroker) StopAccount(accountID string) {
 	b.mu.Lock()
-	delete(b.readyByAccount, strings.TrimSpace(accountID))
+	accountID = strings.TrimSpace(accountID)
+	instanceID := b.readyByAccount[accountID]
+	delete(b.readyByAccount, accountID)
 	var cancelled []*pageParticipationPending
 	for taskID, pending := range b.pending {
 		if pending != nil && pending.accountID == accountID && !pending.delivered {
@@ -114,6 +134,9 @@ func (b *pageParticipationBroker) StopAccount(accountID string) {
 		}
 	}
 	b.mu.Unlock()
+	if instanceID != "" && b.browsers != nil {
+		_, _ = b.browsers.ReleaseParticipationContext(instanceID)
+	}
 	for _, pending := range cancelled {
 		pending.result <- redpacket.PageParticipationResponse{ContextMissing: true, Error: "本次红包参与任务已结束"}
 	}

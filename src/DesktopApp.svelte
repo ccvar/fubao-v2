@@ -17,7 +17,7 @@
     CheckCircleIcon as CheckCircle,
     ClockCountdownIcon as ClockCountdown,
     ClipboardTextIcon as ClipboardText,
-    CloudArrowUpIcon as CloudArrowUp,
+    CloudArrowDownIcon as CloudArrowDown,
     SketchLogoIcon as DiamondGem,
     DotsThreeIcon as DotsThree,
     DownloadSimpleIcon as DownloadSimple,
@@ -52,6 +52,15 @@
   type ManagementTab = "redpackets" | "rooms" | "participation-records" | AccountRole;
   type AccountStatusFilter = "all" | "available" | "expired" | "cooldown";
   type RoomSortMode = "default" | "instance-first" | "live-first" | "recent-live" | "recent-redpacket";
+  type MonitoringAccountSortMode = "default" | "total-requests" | "today-requests" | "last-request" | "created-at";
+  type ParticipationAccountSortMode = "default" | "available-first" | "join-count" | "win-count" | "created-at";
+  type AccountSortMode = MonitoringAccountSortMode | ParticipationAccountSortMode;
+  type SettingsTab = "participation" | "rooms";
+
+  type RoomSettings = {
+    auto_recycle_offline_days: number;
+    participation_prewarm_minutes: number;
+  };
 
   type LicenseStatus = {
     state: "inactive" | "active" | "expired" | "stale" | "machine_mismatch";
@@ -72,6 +81,7 @@
     enabled: boolean;
     configured: boolean;
 	upload_only?: boolean;
+    token_masked?: string;
     endpoint: string;
     fallback_endpoint: string;
     active_endpoint?: string;
@@ -164,6 +174,10 @@
     running: number;
     waiting: number;
     recommended_limit: number;
+    cpu_recommended_limit: number;
+    memory_recommended_limit: number;
+    maximum_auto_instances: number;
+    memory_reserve_bytes: number;
     effective_limit: number;
     available_slots: number;
     estimated_per_instance_bytes: number;
@@ -249,6 +263,11 @@
 	center_live_status?: string;
 	center_live_at?: string;
 	center_last_event_at?: string;
+	recycled?: boolean;
+	recycled_at?: string;
+	recycle_reason?: string;
+	offline_days?: number;
+	last_offline_day?: string;
     created_at: string;
     updated_at: string;
   };
@@ -470,6 +489,7 @@
     pending: 0,
     client_id: "",
   };
+  let remoteSyncStatusLoaded = false;
   let remoteSyncToken = "";
   let remoteSyncBusy = false;
   let remoteSyncError = "";
@@ -477,6 +497,8 @@
   let participationSettingsModalOpen = false;
   let participationSettingsBusy = false;
   let participationSettingsError = "";
+  let settingsTab: SettingsTab = "participation";
+  let roomSettings: RoomSettings = { auto_recycle_offline_days: 7, participation_prewarm_minutes: 10 };
   let participationSettings: ParticipationSettings = {
 	stop_after_joins: 0,
 	cooldown_seconds: 0,
@@ -562,6 +584,7 @@
   let browserWebviewReadyIds: string[] = [];
   let browserWebviewMountedIds: string[] = [];
   let browserWebviewReleasingIds: string[] = [];
+  const browserWebviewMountConcurrency = 2;
   let browserWebviewErrors: Record<string, string> = {};
   let browserWebviewSyncFrame = 0;
   let browserViewSettled = false;
@@ -576,6 +599,12 @@
   let roomsLoading = false;
   let roomsMigrating = false;
   let roomError = "";
+  let recycledRooms: RoomItem[] = [];
+  let roomRecycleModalOpen = false;
+  let roomRecycleLoading = false;
+  let roomRecycleBusyId = "";
+  let roomRecycleError = "";
+  let roomPendingPermanentDelete: RoomItem | null = null;
   let roomRenderLimit = 300;
   let roomImportModalOpen = false;
   let roomImportText = "";
@@ -610,6 +639,9 @@
   let accountError = "";
   let accountStatusFilter: AccountStatusFilter = "all";
   let statusMenuOpen = false;
+  let accountSortMenuOpen = false;
+  let monitoringAccountSortMode: MonitoringAccountSortMode = "default";
+  let participationAccountSortMode: ParticipationAccountSortMode = "default";
   let importMenuOpen = false;
   let accountFileInput: HTMLInputElement;
   let accountFolderInput: HTMLInputElement;
@@ -620,6 +652,7 @@
 	let accountRebindRole: AccountRole = "participation";
   let accountCreateSessionId = "";
   let accountCreateRole: AccountRole = "participation";
+  let accountImportBusy = false;
   let accountRebindOpeningId = "";
   let accountRebindCompleting = false;
   let accountRebindViewport: HTMLDivElement;
@@ -771,9 +804,17 @@
       .some((value) => String(value).toLowerCase().includes(needle));
   });
   $: visibleParticipationRecords = filteredParticipationRecords.slice(0, participationRecordRenderLimit);
-  $: browserSubtitle = browserCapacity
-    ? `${browserInstances.length} 个实例 · ${browserCapacity.running} 个运行 · 建议上限 ${browserCapacity.recommended_limit}${browserCapacity.waiting > 0 ? ` · ${browserCapacity.waiting} 个等待` : ""}`
-    : `${browserInstances.length} 个实例 · ${browserInstances.filter((item) => item.status === "online").length} 个在线 · ${browserInstances.filter(browserCookieExpired).length} 个失效`;
+  $: browserSubtitle = `${browserInstances.length} 个实例 · ${browserInstances.filter((item) => item.status === "online").length} 个在线 · ${browserInstances.filter(browserCookieExpired).length} 个失效`;
+  $: activeBrowserParticipationContexts = Object.values(browserParticipationContexts).filter((context) => context.active);
+  $: browserParticipationRuntime = {
+    accounts: activeBrowserParticipationContexts.length,
+    prepared: activeBrowserParticipationContexts.filter((context) => context.prepared).length,
+    accepting: activeBrowserParticipationContexts.filter((context) => context.accepting).length,
+    joined: activeBrowserParticipationContexts.reduce((total, context) => total + Math.max(0, context.join_count || 0), 0),
+    pending: activeBrowserParticipationContexts.reduce((total, context) => total + Math.max(0, context.pending_draw_count || 0), 0),
+    won: activeBrowserParticipationContexts.reduce((total, context) => total + Math.max(0, context.win_count || 0), 0),
+  };
+  $: browserInstanceCreateLimitReached = licenseStatus.state !== "active" && browserInstances.length >= 1;
   $: visibleBrowserInstances = browserInstances.filter((item) => {
     const haystack = `${item.name} ${item.account_name} ${item.browser}`.toLowerCase();
     return haystack.includes(query.trim().toLowerCase());
@@ -787,8 +828,8 @@
       account.participation?.enabled &&
       !browserInstances.some((instance) => instance.account_id === account.id),
   );
-  $: visibleAccounts = (accountRole === "monitoring" ? monitoringAccounts : participationAccounts).filter(
-    (account) => {
+  $: visibleAccounts = (accountRole === "monitoring" ? monitoringAccounts : participationAccounts)
+    .filter((account) => {
       const haystack = `${account.name} ${account.nickname ?? ""} ${account.user_id ?? ""}`.toLowerCase();
       const searchMatches = haystack.includes(query.trim().toLowerCase());
       const status = accountStatus(account, redPacketClock);
@@ -798,8 +839,10 @@
         (accountStatusFilter === "expired" && status === "CK 失效") ||
         (accountStatusFilter === "cooldown" && status === "冷却中");
       return searchMatches && statusMatches;
-    },
-  );
+    })
+    .map((account, index) => ({ account, index }))
+    .sort((left, right) => accountSortDifference(left.account, right.account) || left.index - right.index)
+    .map(({ account }) => account);
 
   const pendingRequests = new Map<
     string,
@@ -831,7 +874,7 @@
       const timer = window.setTimeout(() => {
         pendingRequests.delete(id);
         reject(new Error("Go 引擎响应超时"));
-      }, method.startsWith("license.") || method.startsWith("remote_sync.") ? 35000 : 12000);
+      }, method.startsWith("account.import_") ? 60000 : method.startsWith("license.") || method.startsWith("remote_sync.") ? 35000 : 12000);
       pendingRequests.set(id, {
         resolve: (value) => resolve(value as T),
         reject,
@@ -866,6 +909,7 @@
     if (!engineListenerReady) return;
     try {
       remoteSyncStatus = await engineRequest<RemoteSyncStatus>("remote_sync.status");
+      remoteSyncStatusLoaded = true;
     } catch (error) {
       if (reportError) remoteSyncError = error instanceof Error ? error.message : String(error);
     }
@@ -1025,7 +1069,10 @@
 	if (!isTauriDesktop()) return;
 	participationSettingsBusy = true;
 	try {
-		participationSettings = await engineRequest<ParticipationSettings>("red_packet_participation.settings");
+		[participationSettings, roomSettings] = await Promise.all([
+			engineRequest<ParticipationSettings>("red_packet_participation.settings"),
+			engineRequest<RoomSettings>("room.settings"),
+		]);
 	} catch (error) {
 		participationSettingsError = error instanceof Error ? error.message : String(error);
 	} finally {
@@ -1050,6 +1097,30 @@
 	if (participationSettingsBusy) return;
 	participationSettingsBusy = true;
 	participationSettingsError = "";
+	if (settingsTab === "rooms") {
+		const nextRoomSettings = {
+			auto_recycle_offline_days: normalizedParticipationSetting(roomSettings.auto_recycle_offline_days, 3650),
+			participation_prewarm_minutes: normalizedParticipationSetting(roomSettings.participation_prewarm_minutes, 1440),
+		};
+		if (!isTauriDesktop()) {
+			roomSettings = nextRoomSettings;
+			participationSettingsBusy = false;
+			toast = "直播间设置已保存";
+			closeParticipationSettings();
+			return;
+		}
+		try {
+			roomSettings = await engineRequest<RoomSettings>("room.set_settings", nextRoomSettings);
+			toast = roomSettings.auto_recycle_offline_days === 0 ? "已关闭直播间自动回收" : "直播间设置已保存";
+			participationSettingsBusy = false;
+			closeParticipationSettings();
+		} catch (error) {
+			participationSettingsError = error instanceof Error ? error.message : String(error);
+		} finally {
+			participationSettingsBusy = false;
+		}
+		return;
+	}
 	const next = {
 		stop_after_joins: normalizedParticipationSetting(participationSettings.stop_after_joins, 100000),
 		cooldown_seconds: normalizedParticipationSetting(participationSettings.cooldown_seconds, 86400),
@@ -1079,6 +1150,77 @@
 		participationSettingsBusy = false;
 	}
   }
+
+  async function loadRoomRecycleBin() {
+	if (roomRecycleLoading || !isTauriDesktop()) return;
+	roomRecycleLoading = true;
+	roomRecycleError = "";
+	try {
+		recycledRooms = await engineRequest<RoomItem[]>("room.recycle_bin");
+	} catch (error) {
+		roomRecycleError = error instanceof Error ? error.message : String(error);
+	} finally {
+		roomRecycleLoading = false;
+	}
+  }
+
+  async function openRoomRecycleBin() {
+	await hideEmbeddedBrowsers();
+	roomRecycleModalOpen = true;
+	roomRecycleError = "";
+	await loadRoomRecycleBin();
+  }
+
+  function closeRoomRecycleBin() {
+	if (roomRecycleBusyId) return;
+	roomRecycleModalOpen = false;
+	roomRecycleError = "";
+	scheduleEmbeddedBrowserSync();
+  }
+
+  async function restoreRecycledRoom(room: RoomItem) {
+	if (!isTauriDesktop() || roomRecycleBusyId) return;
+	roomRecycleBusyId = room.id;
+	roomRecycleError = "";
+	try {
+		await engineRequest<RoomItem>("room.recycle.restore", { room_id: room.id });
+		await Promise.all([loadRooms(false), loadRedPacketMonitors(true), loadRoomRecycleBin()]);
+		showToast(`已将「${roomDisplayName(room)}」恢复到直播间列表`);
+	} catch (error) {
+		roomRecycleError = error instanceof Error ? error.message : String(error);
+	} finally {
+		roomRecycleBusyId = "";
+	}
+  }
+
+  function requestPermanentDeleteRoom(room: RoomItem) {
+	roomPendingPermanentDelete = room;
+	}
+
+  async function permanentlyDeleteRecycledRoom() {
+	const room = roomPendingPermanentDelete;
+	if (!room || !isTauriDesktop() || roomRecycleBusyId) return;
+	roomRecycleBusyId = room.id;
+	roomRecycleError = "";
+	try {
+		await engineRequest<{ deleted: boolean }>("room.recycle.delete", { room_id: room.id });
+		roomPendingPermanentDelete = null;
+		await Promise.all([loadRooms(false), loadRedPacketMonitors(true), loadRoomRecycleBin()]);
+		showToast(`已永久删除直播间「${roomDisplayName(room)}」`);
+	} catch (error) {
+		roomRecycleError = error instanceof Error ? error.message : String(error);
+	} finally {
+		roomRecycleBusyId = "";
+	}
+  }
+
+  function formatRecycleTime(value?: string) {
+	const timestamp = Date.parse(value || "");
+	if (!Number.isFinite(timestamp)) return "时间未知";
+	return new Intl.DateTimeFormat("zh-CN", {
+		month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false,
+	}).format(timestamp);
+	}
 
   function localDateTimeInput(value: Date) {
 	const offset = value.getTimezoneOffset() * 60_000;
@@ -1334,11 +1476,6 @@
     return "等待连接";
   }
 
-  function remoteSyncLineLabel(status: RemoteSyncStatus) {
-    if (!status.active_endpoint) return "尚未建立连接";
-    return status.active_endpoint.includes(":8087") ? "8087 备用线路" : "标准 HTTPS 线路";
-  }
-
   async function configureRemoteSync(enabled: boolean, enrollmentToken = "") {
     if (remoteSyncBusy) return;
     if (enabled && !remoteSyncStatus.configured && !enrollmentToken.trim()) {
@@ -1450,6 +1587,15 @@
     const { memory_total_bytes: total, memory_available_bytes: available } = capacity.resources;
     const used = total ? total - Math.min(total, available) : 0;
     return `CPU ${browserCPUUsagePercent(capacity)}% · 内存已用 ${formatFileSize(used)} / ${formatFileSize(total)}`;
+  }
+
+  function browserRecommendedLimitTooltip(capacity: BrowserCapacity) {
+    const cpuCount = Math.max(1, capacity.resources.cpu_count || 1);
+    const cpuLimit = Math.max(1, capacity.cpu_recommended_limit || Math.floor(cpuCount * 1.5));
+    const memoryLimit = Math.max(1, capacity.memory_recommended_limit || 1);
+    const autoLimit = Math.max(1, capacity.maximum_auto_instances || 24);
+    const reserve = capacity.memory_reserve_bytes || 0;
+    return `CPU：${cpuCount} 核 × 1.5 = ${cpuLimit} · 内存：预留 ${formatFileSize(reserve)}，按 ${formatFileSize(capacity.estimated_per_instance_bytes)}/实例 = ${memoryLimit}\n取 CPU ${cpuLimit}、内存 ${memoryLimit}、自动上限 ${autoLimit} 的最小值，最终建议 ${capacity.recommended_limit}`;
   }
 
   async function checkForAppUpdate(silent = false, openWhenAvailable = false) {
@@ -1939,6 +2085,7 @@
     statusMenuOpen = false;
     importMenuOpen = false;
     roomSortMenuOpen = false;
+    accountSortMenuOpen = false;
     if (engineListenerReady && (key === "accounts" || key === "browsers")) {
       void loadAccounts();
     }
@@ -2113,6 +2260,17 @@
     if (browserWebviewReleasingIds.includes(instance.id)) return;
     const mounted = browserWebviewMountedIds.includes(instance.id) || browserWebviewMountingIds.includes(instance.id);
     const reserved = instance.runtime_state === "running" || instance.runtime_state === "waiting";
+    const participationContext = browserParticipationContexts[instance.id];
+    const retainedForParticipation = browserRedPacketContextIds.includes(instance.id) || Boolean(
+      participationContext?.active && participationContext?.prepared,
+    );
+    // A participation task owns a real live-room page context even when its
+    // card is outside the viewport. Hide a visible surface, but retain both
+    // the native WebView and its Go runtime lease until the task/context ends.
+    if (retainedForParticipation) {
+      if (isTauriDesktop() && mounted) await hideEmbeddedBrowser(instance.id);
+      return;
+    }
     if (!mounted && !reserved) return;
     browserWebviewReleasingIds = [...browserWebviewReleasingIds, instance.id];
     try {
@@ -2141,6 +2299,7 @@
   async function mountEmbeddedBrowser(instance: BrowserInstance, element: HTMLElement) {
     if (
       browserWebviewMountingIds.includes(instance.id) ||
+      browserWebviewMountingIds.length >= browserWebviewMountConcurrency ||
       activeView !== "browsers" ||
       instanceModalOpen ||
       licenseModalOpen ||
@@ -2223,6 +2382,10 @@
       }).catch(() => undefined);
     } finally {
       browserWebviewMountingIds = browserWebviewMountingIds.filter((id) => id !== instance.id);
+      // Large batch creation can expose many cards at once. Admit native
+      // WKWebViews in a small rolling window instead of flooding the macOS
+      // main thread with every eligible mount in the same render frame.
+      window.setTimeout(scheduleEmbeddedBrowserSync, 80);
     }
   }
 
@@ -2357,13 +2520,33 @@
   }
 
   function toggleParticipationAccount(accountId: string) {
-    selectedParticipationAccountIds = selectedParticipationAccountIds.includes(accountId)
-      ? selectedParticipationAccountIds.filter((id) => id !== accountId)
-      : [...selectedParticipationAccountIds, accountId];
+    if (selectedParticipationAccountIds.includes(accountId)) {
+      selectedParticipationAccountIds = selectedParticipationAccountIds.filter((id) => id !== accountId);
+      return;
+    }
+    selectedParticipationAccountIds = licenseStatus.state === "active"
+      ? [...selectedParticipationAccountIds, accountId]
+      : [accountId];
+  }
+
+  function allSelectableParticipationAccountsSelected() {
+    return selectableParticipationAccounts.length > 0 && selectableParticipationAccounts.every((account) =>
+      selectedParticipationAccountIds.includes(account.id),
+    );
+  }
+
+  function toggleAllParticipationAccounts() {
+    if (licenseStatus.state !== "active" || browserCreating) return;
+    selectedParticipationAccountIds = allSelectableParticipationAccountsSelected()
+      ? []
+      : selectableParticipationAccounts.map((account) => account.id);
   }
 
   function selectManagementTab(tab: ManagementTab) {
     managementTab = tab;
+    accountSortMenuOpen = false;
+    roomSortMenuOpen = false;
+    statusMenuOpen = false;
     query = "";
     roomRenderLimit = 300;
     redPacketRenderLimit = 300;
@@ -2470,12 +2653,14 @@
   function toggleImportMenu() {
     importMenuOpen = !importMenuOpen;
     statusMenuOpen = false;
+    accountSortMenuOpen = false;
 	void closeParticipationTaskMenu();
   }
 
   function toggleStatusMenu() {
     statusMenuOpen = !statusMenuOpen;
     importMenuOpen = false;
+    accountSortMenuOpen = false;
 	void closeParticipationTaskMenu();
   }
 
@@ -2488,9 +2673,92 @@
       statusMenuOpen = false;
       importMenuOpen = false;
       roomSortMenuOpen = false;
+      accountSortMenuOpen = false;
 	  participationScheduleUnitMenuOpen = false;
 	  void closeParticipationTaskMenu();
     }
+  }
+
+  function currentAccountSortMode(): AccountSortMode {
+    return accountRole === "monitoring" ? monitoringAccountSortMode : participationAccountSortMode;
+  }
+
+  function accountSortModeLabel(mode: AccountSortMode) {
+    if (mode === "total-requests") return "请求总数优先";
+    if (mode === "today-requests") return "今日次数优先";
+    if (mode === "last-request") return "最后请求时间优先";
+    if (mode === "available-first") return "可用优先";
+    if (mode === "join-count") return "参与次数优先";
+    if (mode === "win-count") return "中奖次数优先";
+    if (mode === "created-at") return "添加时间优先";
+    return "默认顺序";
+  }
+
+  function accountSortOptions(): [AccountSortMode, string][] {
+    if (accountRole === "monitoring") {
+      return [
+        ["default", "默认顺序"],
+        ["total-requests", "请求总数优先"],
+        ["today-requests", "今日次数优先"],
+        ["last-request", "最后请求时间优先"],
+        ["created-at", "添加时间优先"],
+      ];
+    }
+    return [
+      ["default", "默认顺序"],
+      ["available-first", "可用优先"],
+      ["join-count", "参与次数优先"],
+      ["win-count", "中奖次数优先"],
+      ["created-at", "添加时间优先"],
+    ];
+  }
+
+  function accountSortTimestamp(value?: string) {
+    if (!value) return 0;
+    const timestamp = new Date(value).getTime();
+    return Number.isNaN(timestamp) ? 0 : timestamp;
+  }
+
+  function accountSortDifference(left: AccountItem, right: AccountItem) {
+    const mode = currentAccountSortMode();
+    if (mode === "total-requests") {
+      return (right.monitoring?.total_request_count ?? 0) - (left.monitoring?.total_request_count ?? 0);
+    }
+    if (mode === "today-requests") {
+      return (right.monitoring?.today_request_count ?? 0) - (left.monitoring?.today_request_count ?? 0);
+    }
+    if (mode === "last-request") {
+      return accountSortTimestamp(right.monitoring?.last_used_at) - accountSortTimestamp(left.monitoring?.last_used_at);
+    }
+    if (mode === "available-first") {
+      return Number(accountStatus(right, redPacketClock) === "可用") - Number(accountStatus(left, redPacketClock) === "可用");
+    }
+    if (mode === "join-count") {
+      return (right.participation?.join_count ?? 0) - (left.participation?.join_count ?? 0);
+    }
+    if (mode === "win-count") {
+      return (right.participation?.win_count ?? 0) - (left.participation?.win_count ?? 0);
+    }
+    if (mode === "created-at") {
+      return accountSortTimestamp(right.created_at) - accountSortTimestamp(left.created_at);
+    }
+    return 0;
+  }
+
+  function selectAccountSortMode(mode: AccountSortMode) {
+    if (accountRole === "monitoring") {
+      monitoringAccountSortMode = mode as MonitoringAccountSortMode;
+    } else {
+      participationAccountSortMode = mode as ParticipationAccountSortMode;
+    }
+    accountSortMenuOpen = false;
+  }
+
+  function toggleAccountSortMenu() {
+    accountSortMenuOpen = !accountSortMenuOpen;
+    roomSortMenuOpen = false;
+    statusMenuOpen = false;
+    importMenuOpen = false;
   }
 
   function roomSortModeLabel(mode: RoomSortMode) {
@@ -2510,19 +2778,53 @@
     roomSortMenuOpen = !roomSortMenuOpen;
     statusMenuOpen = false;
     importMenuOpen = false;
+    accountSortMenuOpen = false;
   }
 
   async function pasteAccountCookie() {
     importMenuOpen = false;
+    if (accountImportBusy) return;
     try {
       const cookie = await navigator.clipboard.readText();
       if (!cookie.trim()) {
         showToast("剪贴板里没有 Cookie");
         return;
       }
-      showToast("已读取 Cookie，等待识别账号");
+      await importAccountSources([{ name: "粘贴 Cookie", content: cookie }], currentAccountImportRole());
     } catch {
       showToast("无法读取剪贴板，请检查系统权限");
+    }
+  }
+
+  function currentAccountImportRole(): AccountRole {
+    return managementTab === "monitoring" || managementTab === "participation" ? managementTab : accountRole;
+  }
+
+  async function importAccountSources(sources: Array<{ name: string; content: string }>, role: AccountRole) {
+    if (accountImportBusy || sources.length === 0) return;
+    accountImportBusy = true;
+    try {
+      const result = await engineRequest<{
+        imported: number;
+        merged: number;
+        failed: number;
+        invalid_sources: number;
+        total: number;
+      }>("account.import_cookies", { role, sources });
+      await loadAccounts(false);
+      managementTab = role;
+      accountRole = role;
+      const details = [
+        result.imported ? `新增 ${result.imported} 个` : "",
+        result.merged ? `更新或归类 ${result.merged} 个` : "",
+        result.failed ? `${result.failed} 个导入失败` : "",
+        result.invalid_sources ? `${result.invalid_sources} 个文件未识别` : "",
+      ].filter(Boolean).join("，");
+      showToast(`已导入到${roleLabel(role)}${details ? `：${details}` : ""}`);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error));
+    } finally {
+      accountImportBusy = false;
     }
   }
 
@@ -2609,11 +2911,25 @@
     }
   }
 
-  function handleAccountFiles(event: Event, folder = false) {
+  async function handleAccountFiles(event: Event, folder = false) {
     const input = event.currentTarget as HTMLInputElement;
-    const count = input.files?.length ?? 0;
-    if (count > 0) showToast(folder ? `已选择包含 ${count} 个文件的文件夹` : `已选择 ${count} 个账号文件`);
-    input.value = "";
+    const files = Array.from(input.files ?? []).filter((file) => /\.(json|txt|cookie)$/i.test(file.name));
+    const role = currentAccountImportRole();
+    try {
+      const sources = await Promise.all(files.map(async (file) => ({
+        name: file.webkitRelativePath || file.name,
+        content: await file.text(),
+      })));
+      if (sources.length === 0) {
+        showToast(folder ? "文件夹中没有可导入的 Cookie 文件" : "没有选择可导入的 Cookie 文件");
+        return;
+      }
+      await importAccountSources(sources, role);
+    } catch (error) {
+      showToast(`读取账号文件失败：${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      input.value = "";
+    }
   }
 
   function setDirectoryInput(node: HTMLInputElement) {
@@ -3158,8 +3474,12 @@
     roomsLoading = true;
     roomError = "";
     try {
-      const items = await engineRequest<RoomItem[]>("room.list");
+      const [items, recycled] = await Promise.all([
+        engineRequest<RoomItem[]>("room.list"),
+        engineRequest<RoomItem[]>("room.recycle_bin").catch(() => recycledRooms),
+      ]);
       rooms = items;
+      recycledRooms = recycled;
       if (items.length === 0 && autoMigrate) {
         await migrateLegacyRooms(true);
       }
@@ -3407,6 +3727,7 @@
 		const items = await engineRequest<BrowserParticipationContext[]>("red_packet_participation.contexts");
 		browserParticipationContexts = Object.fromEntries(items.map((item) => [item.instance_id, item]));
 		browserRedPacketContextIds = items.filter((item) => item.accepting).map((item) => item.instance_id);
+		scheduleEmbeddedBrowserSync();
 	} catch {
 		// Keep the last native context state during a transient sidecar refresh.
 	}
@@ -3536,13 +3857,17 @@
 
   async function openInstanceModal() {
     selectedParticipationAccountIds = [];
-    await hideEmbeddedBrowsers();
-    instanceModalOpen = true;
     if (!engineListenerReady) {
       browserError = "Go 引擎尚未连接";
       return;
     }
-    await Promise.all([loadAccounts(false), loadBrowserInstances()]);
+    await Promise.all([loadLicenseStatus(), loadAccounts(false), loadBrowserInstances()]);
+    if (licenseStatus.state !== "active" && browserInstances.length >= 1) {
+      showToast("免费版最多只能创建 1 个浏览器实例，请激活专业版后继续创建");
+      return;
+    }
+    await hideEmbeddedBrowsers();
+    instanceModalOpen = true;
   }
 
   async function createBrowserInstance() {
@@ -3560,10 +3885,14 @@
         failed.push(`${account?.nickname || account?.name || accountId}：${error instanceof Error ? error.message : String(error)}`);
       }
     }
-    for (const instance of created) {
-      browserInstances = browserInstances.some((item) => item.id === instance.id)
-        ? browserInstances.map((item) => (item.id === instance.id ? instance : item))
-        : [...browserInstances, instance];
+    if (created.length > 0) {
+      const createdByID = new Map(created.map((instance) => [instance.id, instance]));
+      const merged = browserInstances.map((item) => createdByID.get(item.id) ?? item);
+      const knownIDs = new Set(merged.map((item) => item.id));
+      browserInstances = [
+        ...merged,
+        ...created.filter((instance) => !knownIDs.has(instance.id)),
+      ];
     }
     try {
       if (failed.length > 0) {
@@ -3821,8 +4150,19 @@
 	browserError = "";
 	let started = 0;
 	let skipped = 0;
+	let monitorPreparationWarning = "";
 	const startedAccountIDs: string[] = [];
 	try {
+		// Scheduled runs normally reach this point after the Go-side prewarm.
+		// Immediate runs, zero-minute settings, or a missed prewarm still get a
+		// final native check without allowing a monitoring-account issue to
+		// consume the separate participation batch.
+		try {
+			await engineRequest("red_packet_monitor.start_all");
+			void loadRedPacketMonitors();
+		} catch (error) {
+			monitorPreparationWarning = error instanceof Error ? error.message : String(error);
+		}
 		await Promise.all([loadAccounts(false), loadBrowserParticipationContexts()]);
 		for (const instance of browserInstances) {
 			if (await startBrowserRedPacketFromBatch(instance)) {
@@ -3839,7 +4179,7 @@
 		});
 		await Promise.all([loadBrowserParticipationContexts(), loadSidebarActivities(), loadAccounts(false)]);
 		const prefix = execution ? `${participationScheduleModeLabel(execution.mode)}计划已执行` : "红包参与任务已启动";
-		showToast(`${prefix}：成功 ${started} 个${skipped > 0 ? `，跳过 ${skipped} 个` : ""}`);
+		showToast(`${prefix}：成功 ${started} 个${skipped > 0 ? `，跳过 ${skipped} 个` : ""}${monitorPreparationWarning ? "；直播间监测未能全部补启" : ""}`);
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		browserError = message;
@@ -4005,6 +4345,7 @@
           unlistenEngine = unlisten;
           engineListenerReady = true;
           void loadLicenseStatus();
+          void loadRemoteSyncStatus(false);
           void loadAccounts(false);
           void loadRedPacketMonitors();
 		  void loadRedPacketEvents();
@@ -4216,20 +4557,16 @@
     <div class="quick-list sidebar-data-overview">
       <p class="section-label">数据概览</p>
       <button class="quick-row" onclick={() => openManagementTab("rooms")}>
-        <span class="quick-status live"><Radio size={14} weight="fill" /></span>
-        <span>{runningRedPacketMonitorCount} 个直播间正在监测</span>
+        <span><strong class="quick-value">{runningRedPacketMonitorCount}</strong> 直播间正在监测</span>
       </button>
       <button class="quick-row" onclick={() => openManagementTab("redpackets")}>
-        <span class="quick-status live"><Gift size={14} weight="fill" /></span>
-        <span>{activeRedPacketCount} 个红包发放中</span>
+        <span><strong class="quick-value">{activeRedPacketCount}</strong> 红包发放中</span>
       </button>
       <button class:warning={expiredParticipationAccountCount > 0} class="quick-row" onclick={() => showExpiredAccounts("participation")}>
-        <span class="quick-status"><UserCircle size={15} /></span>
-        <span>{expiredParticipationAccountCount} 个参与账号 CK 失效</span>
+        <span><strong class="quick-value">{expiredParticipationAccountCount}</strong> 参与账号 CK 失效</span>
       </button>
       <button class:warning={expiredMonitoringAccountCount > 0} class="quick-row" onclick={() => showExpiredAccounts("monitoring")}>
-        <span class="quick-status"><UserFocus size={15} /></span>
-        <span>{expiredMonitoringAccountCount} 个监测账号 CK 失效</span>
+        <span><strong class="quick-value">{expiredMonitoringAccountCount}</strong> 监测账号 CK 失效</span>
       </button>
     </div>
 
@@ -4303,7 +4640,19 @@
     <div class="sidebar-footer">
       <span class="brand-mark"><img src={appIconUrl} alt="" /></span>
       <span class="brand-copy">
-        <strong>福宝控制台</strong>
+        <span class="brand-title-row">
+          <strong>福宝控制台</strong>
+          {#if licenseStatus.edition === "专业版" && remoteSyncStatusLoaded}
+            <button
+              class:configured={remoteSyncStatus.configured}
+              class="center-library-status-button"
+              aria-label={remoteSyncStatus.configured ? "中心库已绑定，打开授权管理" : "中心库未绑定，打开授权管理"}
+              data-tooltip={remoteSyncStatus.configured ? "中心库已绑定" : "中心库未绑定"}
+              data-tooltip-placement="top"
+              onclick={openLicenseModal}
+            ><CloudArrowDown size={10} weight="bold" /></button>
+          {/if}
+        </span>
         <span class="brand-meta">
           <button
             class:update-available={Boolean(updateStatus?.available)}
@@ -4342,8 +4691,8 @@
       </span>
       <button
         class="icon-button"
-        aria-label="红包参与设置"
-        data-tooltip="红包参与设置"
+        aria-label="打开设置"
+        data-tooltip="设置"
         data-tooltip-placement="top"
         onclick={openParticipationSettings}
       ><GearSix size={16} /></button>
@@ -4424,8 +4773,20 @@
           {/if}
         </div>
         <p data-tauri-drag-region>
-          {activeView === "accounts" ? accountSubtitle : browserSubtitle}
-          {#if activeView === "browsers"}
+          {#if activeView === "accounts"}
+            {accountSubtitle}
+          {:else}
+            {#if browserCapacity}
+              <span class="browser-subtitle-copy" data-tauri-drag-region>{browserInstances.length} 个实例 · {browserCapacity.running} 个运行 ·</span>
+              <span
+                class="browser-recommended-limit"
+                data-tooltip={browserRecommendedLimitTooltip(browserCapacity)}
+                data-tooltip-placement="top"
+              >建议上限 {browserCapacity.recommended_limit}</span>
+              {#if browserCapacity.waiting > 0}<span class="browser-subtitle-copy" data-tauri-drag-region>· {browserCapacity.waiting} 个等待</span>{/if}
+            {:else}
+              {browserSubtitle}
+            {/if}
             <span data-tauri-drag-region>·</span>
             <span
               class="browser-resource-usage"
@@ -4486,10 +4847,11 @@
                   <Radio size={17} /><span>导入直播间</span>
                 </button>
                 <span class="menu-divider"></span>
-                <button role="menuitem" onclick={pasteAccountCookie}><ClipboardText size={17} /><span>粘贴 Cookie</span></button>
-                <button role="menuitem" onclick={startQrLogin}><QrCode size={17} /><span>扫码登录</span></button>
-                <button role="menuitem" onclick={() => chooseAccountFiles(false)}><FileArrowUp size={17} /><span>导入文件</span></button>
-                <button role="menuitem" onclick={() => chooseAccountFiles(true)}><FolderOpen size={17} /><span>导入文件夹</span></button>
+                <span class="import-target-label">账号添加到 <strong>{roleLabel(currentAccountImportRole())}</strong></span>
+                <button role="menuitem" disabled={accountImportBusy} onclick={pasteAccountCookie}><ClipboardText size={17} /><span>粘贴 Cookie</span></button>
+                <button role="menuitem" disabled={accountImportBusy} onclick={startQrLogin}><QrCode size={17} /><span>扫码登录并添加</span></button>
+                <button role="menuitem" disabled={accountImportBusy} onclick={() => chooseAccountFiles(false)}><FileArrowUp size={17} /><span>批量导入文件</span></button>
+                <button role="menuitem" disabled={accountImportBusy} onclick={() => chooseAccountFiles(true)}><FolderOpen size={17} /><span>批量导入文件夹</span></button>
               </div>
             {/if}
           </div>
@@ -4518,7 +4880,15 @@
             onchange={readRoomImportFile}
           />
         {:else if activeView === "browsers"}
-          <button class="primary-action" onclick={openInstanceModal}>
+          <button
+            class:limit-reached={browserInstanceCreateLimitReached}
+            class="primary-action"
+            aria-disabled={browserInstanceCreateLimitReached}
+            aria-label={browserInstanceCreateLimitReached ? "免费版浏览器实例数量已达上限" : "新建实例"}
+            data-tooltip={browserInstanceCreateLimitReached ? "免费版最多创建 1 个实例" : undefined}
+            data-tooltip-placement="bottom"
+            onclick={openInstanceModal}
+          >
             <Plus size={14} weight="bold" />
             <span>新建实例</span>
           </button>
@@ -4538,11 +4908,34 @@
         {#if browserLoading && browserInstances.length === 0}
           <div class="empty-state"><ArrowClockwise class="spinning" size={25} /><strong>正在读取浏览器实例</strong><span>由 Go 引擎加载本机独立配置</span></div>
         {:else if visibleBrowserInstances.length > 0}
-          {#if browserCapacity && (browserCapacity.waiting > 0 || browserCapacity.resources.pressure === "constrained" || browserCapacity.resources.pressure === "critical")}
-            <div class:critical={browserCapacity.resources.pressure === "critical"} class="browser-capacity-note">
-              <ClockCountdown size={14} />
-              <span>{browserCapacity.message}</span>
-              <small>运行 {browserCapacity.running}/{browserCapacity.effective_limit} · 建议 {browserCapacity.recommended_limit}</small>
+          {#if (browserCapacity && (browserCapacity.waiting > 0 || browserCapacity.resources.pressure === "constrained" || browserCapacity.resources.pressure === "critical")) || participationBatchRunning || browserParticipationRuntime.accounts > 0}
+            <div class="browser-runtime-strip">
+              {#if browserCapacity && (browserCapacity.waiting > 0 || browserCapacity.resources.pressure === "constrained" || browserCapacity.resources.pressure === "critical")}
+                <div class:critical={browserCapacity.resources.pressure === "critical"} class="browser-capacity-note">
+                  <ClockCountdown size={14} />
+                  <span>{browserCapacity.message}</span>
+                  <small>运行 {browserCapacity.running}/{browserCapacity.effective_limit} · 建议 {browserCapacity.recommended_limit}</small>
+                </div>
+              {/if}
+              {#if participationBatchRunning || browserParticipationRuntime.accounts > 0}
+                <button
+                  class="browser-participation-runtime"
+                  aria-label="查看实际红包参与情况"
+                  data-tooltip="查看参与记录"
+                  data-tooltip-placement="bottom"
+                  onclick={() => openManagementTab("participation-records")}
+                >
+                  <span class="browser-participation-runtime-state"><i></i>{participationBatchRunning && browserParticipationRuntime.accounts === 0 ? "正在准备参与上下文" : "参与任务进行中"}</span>
+                  {#if browserParticipationRuntime.accounts > 0}
+                    <span>{browserParticipationRuntime.accounts} 个账号</span>
+                    <span>就绪 {browserParticipationRuntime.prepared}/{browserParticipationRuntime.accounts}</span>
+                    <span>可参与 {browserParticipationRuntime.accepting}</span>
+                    <span>已参与 {browserParticipationRuntime.joined}</span>
+                    <span>待开奖 {browserParticipationRuntime.pending}</span>
+                    <span>中奖 {browserParticipationRuntime.won}</span>
+                  {/if}
+                </button>
+              {/if}
             </div>
           {/if}
           <div
@@ -4786,6 +5179,16 @@
             </div>
           {:else if managementTab === "rooms"}
             <div class="room-monitor-bulk-actions" aria-label="直播间红包监测批量操作">
+              <button
+                class="monitor-log-button room-recycle-entry"
+                aria-label={`打开直播间回收站${recycledRooms.length ? `，${recycledRooms.length} 个直播间` : ""}`}
+                data-tooltip="直播间回收站"
+                data-tooltip-placement="top"
+                onclick={openRoomRecycleBin}
+              >
+                <Trash size={13} />
+                {#if recycledRooms.length > 0}<span>{recycledRooms.length}</span>{/if}
+              </button>
               <button class="monitor-log-button" aria-label="查看红包监测运行日志" data-tooltip="查看红包监测运行日志" data-tooltip-placement="top" onclick={openMonitorRuntimeLog}>
                 <TerminalWindow size={13} />
               </button>
@@ -5157,7 +5560,39 @@
           {:else}
             <div class="account-list">
               <div class="account-list-head">
-                <span>账号</span><span>分类</span><span>状态与数据</span><span>操作</span>
+                <span>账号</span>
+                <span>分类</span>
+                <span class="account-list-status-head menu-anchor">
+                  <span>状态与数据</span>
+                  <button
+                    type="button"
+                    class:active={currentAccountSortMode() !== "default"}
+                    class="room-live-sort-button"
+                    aria-label={`${roleLabel(accountRole)}排序：${accountSortModeLabel(currentAccountSortMode())}`}
+                    aria-haspopup="menu"
+                    aria-expanded={accountSortMenuOpen}
+                    data-tooltip={accountSortMenuOpen ? undefined : accountSortModeLabel(currentAccountSortMode())}
+                    data-tooltip-placement="bottom"
+                    onclick={toggleAccountSortMenu}
+                  ><ArrowsDownUp size={11} weight="bold" /></button>
+                  {#if accountSortMenuOpen}
+                    <div class="floating-menu account-sort-menu" role="menu" aria-label={`${roleLabel(accountRole)}排序`}>
+                      {#each accountSortOptions() as option}
+                        <button
+                          type="button"
+                          class:active={currentAccountSortMode() === option[0]}
+                          role="menuitemradio"
+                          aria-checked={currentAccountSortMode() === option[0]}
+                          onclick={() => selectAccountSortMode(option[0])}
+                        >
+                          <span>{option[1]}</span>
+                          {#if currentAccountSortMode() === option[0]}<CheckCircle size={13} weight="fill" />{/if}
+                        </button>
+                      {/each}
+                    </div>
+                  {/if}
+                </span>
+                <span>操作</span>
               </div>
               {#each visibleAccounts as account}
                 <article class="account-row">
@@ -5223,7 +5658,7 @@
                       {/if}
                     </div>
                     <small
-                      data-tooltip={accountRole === "monitoring" ? accountMonitoringUsageTip(account) : undefined}
+                      use:portalTooltip={accountRole === "monitoring" ? accountMonitoringUsageTip(account) : ""}
                       data-tooltip-placement="top"
                     >{accountMeta(account)}</small>
                   </div>
@@ -5392,50 +5827,69 @@
     <dialog class="modal participation-settings-modal" open aria-labelledby="participation-settings-title">
       <div class="modal-head">
         <div>
-          <span class="modal-icon participation-settings-icon"><Gift size={18} weight="fill" /></span>
-          <h2 id="participation-settings-title">红包参与设置</h2>
+          <span class="modal-icon participation-settings-icon"><GearSix size={18} weight="fill" /></span>
+          <h2 id="participation-settings-title">设置</h2>
         </div>
         <button class="icon-button" aria-label="关闭" disabled={participationSettingsBusy} onclick={closeParticipationSettings}><X size={17} /></button>
       </div>
 
-      <p class="participation-settings-intro">以下限制按每个参与账号独立计算，填 0 表示不限制。</p>
-      <div class="participation-settings-list">
-        <div class="participation-setting-row participation-packet-type-row">
-          <span><strong>参与红包类型</strong><small>只分配符合所选类型的红包，默认仅参与钻石红包</small></span>
-          <div class="participation-packet-type-options" role="radiogroup" aria-label="可以参与的红包类型">
-            {#each [["all", "不限"], ["gift", "礼物红包"], ["diamond", "钻石红包"]] as option}
-              <button
-                type="button"
-                role="radio"
-                aria-checked={participationSettings.packet_type === option[0]}
-                class:active={participationSettings.packet_type === option[0]}
-                disabled={participationSettingsBusy}
-                onclick={() => participationSettings.packet_type = option[0] as ParticipationPacketType}
-              >{option[1]}</button>
-            {/each}
-          </div>
-        </div>
-        <label class="participation-setting-row">
-          <span><strong>参与停止</strong><small>参与达到指定次数后，不再分配后续红包任务</small></span>
-          <span class="number-field"><input type="number" min="0" max="100000" step="1" bind:value={participationSettings.stop_after_joins} /><em>次</em></span>
-        </label>
-        <label class="participation-setting-row">
-          <span><strong>参与冷却</strong><small>参与成功后，等待指定秒数才能参与下一次</small></span>
-          <span class="number-field"><input type="number" min="0" max="86400" step="1" bind:value={participationSettings.cooldown_seconds} /><em>秒</em></span>
-        </label>
-        <label class="participation-setting-row">
-          <span><strong>中奖停止</strong><small>累计中奖达到指定次数后，不再分配后续红包任务</small></span>
-          <span class="number-field"><input type="number" min="0" max="100000" step="1" bind:value={participationSettings.stop_after_wins} /><em>次</em></span>
-        </label>
-        <label class="participation-setting-row">
-          <span><strong>开奖异常等待</strong><small>超过开奖时间仍未取得结果时，标记开奖异常并继续下一轮</small></span>
-          <span class="number-field"><input type="number" min="1" max="300" step="1" bind:value={participationSettings.draw_result_timeout_seconds} /><em>秒</em></span>
-        </label>
-        <label class="participation-setting-row">
-          <span><strong>最低钻石</strong><small>能明确计算每份红包钻石数时，低于该门槛不参与</small></span>
-          <span class="number-field"><input type="number" min="1" max="1000000" step="1" bind:value={participationSettings.minimum_diamonds} /><em>钻</em></span>
-        </label>
+      <div class="general-settings-tabs" role="tablist" aria-label="设置分类">
+        <button type="button" role="tab" aria-selected={settingsTab === "participation"} class:active={settingsTab === "participation"} onclick={() => settingsTab = "participation"}><Gift size={13} />红包参与</button>
+        <button type="button" role="tab" aria-selected={settingsTab === "rooms"} class:active={settingsTab === "rooms"} onclick={() => settingsTab = "rooms"}><Radio size={13} />直播间</button>
       </div>
+
+      {#if settingsTab === "participation"}
+        <p class="participation-settings-intro">以下限制按每个参与账号独立计算，填 0 表示不限制。</p>
+        <div class="participation-settings-list">
+          <div class="participation-setting-row participation-packet-type-row">
+            <span><strong>参与红包类型</strong><small>只分配符合所选类型的红包，默认仅参与钻石红包</small></span>
+            <div class="participation-packet-type-options" role="radiogroup" aria-label="可以参与的红包类型">
+              {#each [["all", "不限"], ["gift", "礼物红包"], ["diamond", "钻石红包"]] as option}
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={participationSettings.packet_type === option[0]}
+                  class:active={participationSettings.packet_type === option[0]}
+                  disabled={participationSettingsBusy}
+                  onclick={() => participationSettings.packet_type = option[0] as ParticipationPacketType}
+                >{option[1]}</button>
+              {/each}
+            </div>
+          </div>
+          <label class="participation-setting-row">
+            <span><strong>参与停止</strong><small>参与达到指定次数后，不再分配后续红包任务</small></span>
+            <span class="number-field"><input type="number" min="0" max="100000" step="1" bind:value={participationSettings.stop_after_joins} /><em>次</em></span>
+          </label>
+          <label class="participation-setting-row">
+            <span><strong>参与冷却</strong><small>参与成功后，等待指定秒数才能参与下一次</small></span>
+            <span class="number-field"><input type="number" min="0" max="86400" step="1" bind:value={participationSettings.cooldown_seconds} /><em>秒</em></span>
+          </label>
+          <label class="participation-setting-row">
+            <span><strong>中奖停止</strong><small>累计中奖达到指定次数后，不再分配后续红包任务</small></span>
+            <span class="number-field"><input type="number" min="0" max="100000" step="1" bind:value={participationSettings.stop_after_wins} /><em>次</em></span>
+          </label>
+          <label class="participation-setting-row">
+            <span><strong>开奖异常等待</strong><small>超过开奖时间仍未取得结果时，标记开奖异常并继续下一轮</small></span>
+            <span class="number-field"><input type="number" min="1" max="300" step="1" bind:value={participationSettings.draw_result_timeout_seconds} /><em>秒</em></span>
+          </label>
+          <label class="participation-setting-row">
+            <span><strong>最低钻石</strong><small>能明确计算每份红包钻石数时，低于该门槛不参与</small></span>
+            <span class="number-field"><input type="number" min="1" max="1000000" step="1" bind:value={participationSettings.minimum_diamonds} /><em>钻</em></span>
+          </label>
+        </div>
+      {:else}
+        <p class="participation-settings-intro">直播间自动整理与参与任务预热均由 Go 引擎持久化执行，不依赖当前页面或实例卡片是否渲染。</p>
+        <div class="participation-settings-list">
+          <label class="participation-setting-row room-auto-recycle-setting">
+            <span><strong>参与任务提前检查</strong><small>指定日期、每天固定时间和间隔执行会在每轮任务前检查直播间监测状态，未全部启动时自动执行“全部启动”；填 0 表示仅在执行时检查</small></span>
+            <span class="number-field"><input type="number" min="0" max="1440" step="1" bind:value={roomSettings.participation_prewarm_minutes} /><em>分钟</em></span>
+          </label>
+          <label class="participation-setting-row room-auto-recycle-setting">
+            <span><strong>自动回收未开播直播间</strong><small>连续指定天数的监测均明确确认未开播后，自动停止监测并移入回收站；填 0 关闭自动回收</small></span>
+            <span class="number-field"><input type="number" min="0" max="3650" step="1" bind:value={roomSettings.auto_recycle_offline_days} /><em>天</em></span>
+          </label>
+        </div>
+      {/if}
 
       {#if participationSettingsError}<div class="license-error"><WarningCircle size={14} />{participationSettingsError}</div>{/if}
       <div class="modal-actions">
@@ -5445,6 +5899,49 @@
           {participationSettingsBusy ? "保存中…" : "保存设置"}
         </button>
       </div>
+    </dialog>
+  </div>
+{/if}
+
+{#if roomRecycleModalOpen}
+  <div class="modal-backdrop" role="presentation" onclick={(event) => event.currentTarget === event.target && closeRoomRecycleBin()}>
+    <dialog class="modal room-recycle-modal" open aria-labelledby="room-recycle-title">
+      <div class="modal-head">
+        <div>
+          <span class="modal-icon room-recycle-icon"><Trash size={18} /></span>
+          <h2 id="room-recycle-title">直播间回收站</h2>
+        </div>
+        <button class="icon-button" aria-label="关闭" disabled={Boolean(roomRecycleBusyId)} onclick={closeRoomRecycleBin}><X size={17} /></button>
+      </div>
+      <p class="participation-settings-intro">自动回收只归档直播间，不会在这里直接丢失记录。恢复后保持未启动状态；永久删除不可撤销。</p>
+      <div class="room-recycle-list">
+        {#if roomRecycleLoading && recycledRooms.length === 0}
+          <div class="room-recycle-empty"><ArrowClockwise class="spinning" size={18} />正在读取回收站…</div>
+        {:else if recycledRooms.length === 0}
+          <div class="room-recycle-empty"><Trash size={20} /><span>回收站为空</span></div>
+        {:else}
+          {#each recycledRooms as room}
+            <article class="room-recycle-row">
+              <span class="room-avatar"><Radio size={16} weight="fill" /></span>
+              <div class="room-recycle-copy">
+                <strong>{roomDisplayName(room)}</strong>
+                <small>{room.web_rid ? `房间号 ${room.web_rid}` : `记录号 ${room.id}`} · {formatRecycleTime(room.recycled_at)}</small>
+                <p>{room.recycle_reason || "已进入直播间回收站"}</p>
+              </div>
+              <div class="room-recycle-actions">
+                <button class="icon-button restore" aria-label="恢复到直播间列表" data-tooltip="恢复到直播间列表" data-tooltip-placement="top" disabled={Boolean(roomRecycleBusyId)} onclick={() => restoreRecycledRoom(room)}>
+                  <ArrowClockwise class={roomRecycleBusyId === room.id && !roomPendingPermanentDelete ? "spinning" : undefined} size={14} />
+                </button>
+                <button class="icon-button permanent-delete" aria-label="永久删除直播间" data-tooltip="永久删除" data-tooltip-placement="top" disabled={Boolean(roomRecycleBusyId)} onclick={() => requestPermanentDeleteRoom(room)}>
+                  <Trash size={14} />
+                </button>
+              </div>
+            </article>
+          {/each}
+        {/if}
+      </div>
+      {#if roomRecycleError}<div class="license-error"><WarningCircle size={14} />{roomRecycleError}</div>{/if}
+      <div class="modal-actions"><button class="secondary-button" disabled={Boolean(roomRecycleBusyId)} onclick={closeRoomRecycleBin}>完成</button></div>
     </dialog>
   </div>
 {/if}
@@ -5650,51 +6147,49 @@
         aria-labelledby="remote-sync-title"
       >
         <div class="remote-sync-head">
-          <span class="remote-sync-icon"><CloudArrowUp size={15} weight="bold" /></span>
+          <span class="remote-sync-icon"><CloudArrowDown size={15} weight="bold" /></span>
           <div>
-            <strong id="remote-sync-title">远程同步</strong>
-            <small>仅同步直播间与红包数据</small>
+            <strong id="remote-sync-title">中心库数据获取</strong>
+            <span class="remote-sync-token-summary">
+              <small>{remoteSyncStatus.configured ? (remoteSyncStatus.token_masked || "令牌已绑定") : "尚未绑定令牌"}</small>
+              {#if remoteSyncStatus.configured && !remoteSyncEditing}
+                <button
+                  type="button"
+                  aria-label="更换令牌"
+                  data-tooltip="更换令牌"
+                  data-tooltip-placement="top"
+                  disabled={remoteSyncBusy}
+                  onclick={beginRemoteSyncTokenChange}
+                ><PencilSimple size={11} /></button>
+              {/if}
+            </span>
           </div>
           <span class="remote-sync-state">{remoteSyncStateLabel(remoteSyncStatus)}</span>
         </div>
 
-        <div class="remote-sync-details">
-          <span><small>当前线路</small><strong>{remoteSyncLineLabel(remoteSyncStatus)}</strong></span>
-          <span><small>待同步</small><strong>{remoteSyncStatus.pending} 条</strong></span>
-          <span><small>最近成功</small><strong>{formatLicenseDate(remoteSyncStatus.last_success_at, "暂无")}</strong></span>
-        </div>
-
         {#if !remoteSyncStatus.configured || remoteSyncEditing}
-          <label class="field remote-sync-token-field">
+          <div class="field remote-sync-token-field">
             <span>服务器注册令牌</span>
-            <input
-              type="password"
-              bind:value={remoteSyncToken}
-              placeholder="输入服务器安装完成后生成的注册令牌"
-              autocomplete="off"
-              spellcheck="false"
-              onkeydown={(event) => event.key === "Enter" && saveRemoteSyncToken()}
-            />
-          </label>
-          <p class="remote-sync-hint">未绑定 KEY 时仅上传本机发现的数据；令牌验证成功后会兑换成完整设备凭证，并按授权范围接收中心数据。</p>
-          <div class="remote-sync-actions">
-            {#if remoteSyncEditing}
-              <button class="secondary-button" disabled={remoteSyncBusy} onclick={cancelRemoteSyncTokenChange}>取消</button>
-            {/if}
-            <button class="primary-action" disabled={remoteSyncBusy || !remoteSyncToken.trim()} onclick={saveRemoteSyncToken}>
-              {#if remoteSyncBusy}<ArrowClockwise class="spinning" size={13} />{:else}<CloudArrowUp size={13} />{/if}
-              {remoteSyncBusy ? "连接中…" : "保存并连接"}
-            </button>
-          </div>
-        {:else}
-          <div class="remote-sync-actions">
-            <button class="secondary-button" disabled={remoteSyncBusy} onclick={beginRemoteSyncTokenChange}><PencilSimple size={12} />更换令牌</button>
-            <button
-              class:danger={remoteSyncStatus.enabled}
-              class="secondary-button remote-sync-toggle"
-              disabled={remoteSyncBusy}
-              onclick={() => configureRemoteSync(!remoteSyncStatus.enabled)}
-            >{remoteSyncStatus.enabled ? "停用接收" : "启用接收"}</button>
+            <div class="remote-sync-token-row">
+              <input
+                aria-label="服务器注册令牌"
+                type="password"
+                bind:value={remoteSyncToken}
+                placeholder="输入服务器安装完成后生成的注册令牌"
+                autocomplete="off"
+                spellcheck="false"
+                onkeydown={(event) => event.key === "Enter" && saveRemoteSyncToken()}
+              />
+              <div class="remote-sync-actions">
+                {#if remoteSyncEditing}
+                  <button class="secondary-button" disabled={remoteSyncBusy} onclick={cancelRemoteSyncTokenChange}>取消</button>
+                {/if}
+                <button class="primary-action" disabled={remoteSyncBusy || !remoteSyncToken.trim()} onclick={saveRemoteSyncToken}>
+                  {#if remoteSyncBusy}<ArrowClockwise class="spinning" size={13} />{:else}<CloudArrowDown size={13} />{/if}
+                  {remoteSyncBusy ? "连接中…" : "保存并连接"}
+                </button>
+              </div>
+            </div>
           </div>
         {/if}
 
@@ -5748,12 +6243,23 @@
         ><X size={17} /></button>
       </div>
       <p class="modal-intro">
-        选择一个或多个参与账号。创建后先显示在实例卡片中，点击卡片时才打开独立浏览器窗口。
+        {licenseStatus.state === "active" ? "选择一个或多个参与账号。" : "免费版最多创建 1 个浏览器实例，请选择一个参与账号。"}创建后先显示在实例卡片中，点击卡片时才打开独立浏览器窗口。
       </p>
 
       <div class="instance-account-heading">
         <strong>选择参与账号</strong>
-        <span>{selectedParticipationAccountIds.length > 0 ? `${selectedParticipationAccountIds.length} 个已选 · ` : ""}{selectableParticipationAccounts.length} 个可创建</span>
+        <span class="instance-account-heading-actions">
+          <span>{selectedParticipationAccountIds.length > 0 ? `${selectedParticipationAccountIds.length} 个已选 · ` : ""}{selectableParticipationAccounts.length} 个可创建</span>
+          {#if licenseStatus.state === "active" && selectableParticipationAccounts.length > 0}
+            <button
+              type="button"
+              class="instance-select-all"
+              disabled={browserCreating}
+              aria-pressed={allSelectableParticipationAccountsSelected()}
+              onclick={toggleAllParticipationAccounts}
+            >{allSelectableParticipationAccountsSelected() ? "反选" : "全选"}</button>
+          {/if}
+        </span>
       </div>
 
       {#if accountsLoading}
@@ -5773,7 +6279,7 @@
           >前往账号管理</button>
         </div>
       {:else}
-        <div class="instance-account-list" role="group" aria-label="选择参与账号，可多选">
+        <div class="instance-account-list" role="group" aria-label={licenseStatus.state === "active" ? "选择参与账号，可多选" : "选择一个参与账号"}>
           {#each selectableParticipationAccounts as account}
             <button
               class:selected={selectedParticipationAccountIds.includes(account.id)}
@@ -5983,6 +6489,17 @@
     busy={accountDeleting}
     onCancel={() => !accountDeleting && (accountPendingDelete = null)}
     onConfirm={deleteAccount}
+  />
+{/if}
+
+{#if roomPendingPermanentDelete}
+  <ConfirmDialog
+    title="永久删除直播间"
+    message={`确定永久删除「${roomDisplayName(roomPendingPermanentDelete)}」吗？\n直播间记录、对应监测快照和本地红包历史将被移除，此操作无法撤销。`}
+    confirmText="永久删除"
+    busy={roomRecycleBusyId === roomPendingPermanentDelete.id}
+    onCancel={() => !roomRecycleBusyId && (roomPendingPermanentDelete = null)}
+    onConfirm={permanentlyDeleteRecycledRoom}
   />
 {/if}
 
