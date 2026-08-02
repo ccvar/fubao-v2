@@ -2,11 +2,14 @@
   import { invoke } from "@tauri-apps/api/core";
   import { getVersion } from "@tauri-apps/api/app";
   import { emit, listen } from "@tauri-apps/api/event";
+  import { relaunch } from "@tauri-apps/plugin-process";
+  import { check as checkUpdater, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
   import { tick, onMount } from "svelte";
   import ConfirmDialog from "./lib/ConfirmDialog.svelte";
   import appIconUrl from "../src-tauri/icons/64x64.png";
   import {
     PulseIcon as Activity,
+    ArchiveIcon as Archive,
     ArrowClockwiseIcon as ArrowClockwise,
     ArrowsDownUpIcon as ArrowsDownUp,
     ArrowSquareOutIcon as ArrowSquareOut,
@@ -196,6 +199,10 @@
     state: "stopped" | "waiting" | "running";
     queue_position?: number;
     capacity: BrowserCapacity;
+  };
+
+  type BrowserInstanceWindowEvent = {
+    instance_id: string;
   };
 
   type BrowserParticipationContext = {
@@ -461,6 +468,7 @@
   let navContextMenu: { key: NavKey; x: number; y: number } | null = null;
   let clientVersion = __APP_VERSION__;
   let updateStatus: UpdateStatus | null = null;
+  let pendingAppUpdate: Update | null = null;
   let updateChecking = false;
   let updateModalOpen = false;
   let updateDownloading = false;
@@ -582,6 +590,7 @@
   // returning to this view can describe the operation as a restore. The real
   // WebView is still destroyed off-screen to release its runtime lease.
   let browserWebviewReadyIds: string[] = [];
+  let browserIndependentWindowIds: string[] = [];
   let browserWebviewMountedIds: string[] = [];
   let browserWebviewReleasingIds: string[] = [];
   const browserWebviewMountConcurrency = 2;
@@ -594,6 +603,7 @@
   let browserLayoutRevision = 0;
   let browserLayoutChanging = false;
   let selectedParticipationAccountIds: string[] = [];
+  let instanceAccountsRefreshing = false;
   let managementTab: ManagementTab = "rooms";
   let rooms: RoomItem[] = [];
   let roomsLoading = false;
@@ -649,7 +659,6 @@
   let accountDeleting = false;
 	let redPacketAPITogglingAccountIds: string[] = [];
   let accountRebinding: AccountItem | null = null;
-	let accountRebindRole: AccountRole = "participation";
   let accountCreateSessionId = "";
   let accountCreateRole: AccountRole = "participation";
   let accountImportBusy = false;
@@ -1603,11 +1612,38 @@
     updateChecking = true;
     if (!silent) updateError = "";
     try {
-      updateStatus = await invoke<UpdateStatus>("check_app_update");
-      if (updateStatus.available) {
+      if (pendingAppUpdate && !updateDownloaded) {
+        try { await pendingAppUpdate.close(); } catch { /* ignore stale updater resources */ }
+        pendingAppUpdate = null;
+      }
+      const update = await checkUpdater();
+      if (update) {
+        pendingAppUpdate = update;
+        const declaredSize = Number(update.rawJson?.size || 0);
+        updateStatus = {
+          current_version: update.currentVersion || clientVersion,
+          latest_version: update.version,
+          available: true,
+          notes: update.body || "",
+          force: false,
+          filename: "",
+          size: Number.isFinite(declaredSize) && declaredSize > 0 ? declaredSize : 0,
+        };
         if (openWhenAvailable) await openUpdateModal();
-      } else if (!silent) {
-        showToast(`当前 v${clientVersion} 已是最新版本`);
+      } else {
+        pendingAppUpdate = null;
+        updateStatus = {
+          current_version: clientVersion,
+          latest_version: clientVersion,
+          available: false,
+          notes: "",
+          force: false,
+          filename: "",
+          size: 0,
+        };
+        if (!silent) {
+          showToast(`当前 v${clientVersion} 已是最新版本`);
+        }
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -1637,16 +1673,32 @@
   }
 
   async function downloadAppUpdate() {
-    if (updateDownloading || updateDownloaded) return;
+    if (updateDownloading || updateDownloaded || !pendingAppUpdate) return;
     updateDownloading = true;
     updateError = "";
     updateProgress = { downloaded: 0, total: updateStatus?.size || 0, percent: 0 };
     try {
-      await invoke("download_app_update");
+      let downloaded = 0;
+      let total = updateStatus?.size || 0;
+      await pendingAppUpdate.downloadAndInstall((event: DownloadEvent) => {
+        if (event.event === "Started") {
+          downloaded = 0;
+          total = event.data.contentLength || total;
+        } else if (event.event === "Progress") {
+          downloaded += event.data.chunkLength;
+        } else if (event.event === "Finished" && total > 0) {
+          downloaded = total;
+        }
+        updateProgress = {
+          downloaded,
+          total,
+          percent: total > 0 ? Math.min(100, Math.round((downloaded / total) * 100)) : event.event === "Finished" ? 100 : 0,
+        };
+      });
       updateDownloaded = true;
       updateProgress = {
-        downloaded: updateStatus?.size || updateProgress.downloaded,
-        total: updateStatus?.size || updateProgress.total,
+        downloaded: updateProgress.total || updateProgress.downloaded,
+        total: updateProgress.total,
         percent: 100,
       };
     } catch (error) {
@@ -1657,11 +1709,18 @@
   }
 
   async function installAppUpdate() {
-    if (!updateDownloaded || updateInstalling) return;
+    if (!updateDownloaded || updateInstalling || !pendingAppUpdate) return;
     updateInstalling = true;
     updateError = "";
     try {
-      await invoke("install_app_update");
+      const installedVersion = pendingAppUpdate.version;
+      try {
+        localStorage.setItem("fubao.desktop.updateReceipt", JSON.stringify({
+          target: installedVersion,
+          installedAt: Date.now(),
+        }));
+      } catch { /* update installation must not depend on local storage */ }
+      await relaunch();
     } catch (error) {
       updateInstalling = false;
       updateError = error instanceof Error ? error.message : String(error);
@@ -2298,6 +2357,7 @@
 
   async function mountEmbeddedBrowser(instance: BrowserInstance, element: HTMLElement) {
     if (
+      browserIndependentWindowIds.includes(instance.id) ||
       browserWebviewMountingIds.includes(instance.id) ||
       browserWebviewMountingIds.length >= browserWebviewMountConcurrency ||
       activeView !== "browsers" ||
@@ -2410,6 +2470,10 @@
     await Promise.all(
       browserInstances.map(async (instance) => {
         if (browserLayoutChanging || expectedRevision !== browserLayoutRevision) return;
+        if (browserIndependentWindowIds.includes(instance.id)) {
+          if (browserWebviewMountedIds.includes(instance.id)) await hideEmbeddedBrowser(instance.id);
+          return;
+        }
         if (
           activeView !== "browsers" ||
           !browserViewSettled ||
@@ -3560,7 +3624,6 @@
   async function openAccountRebind(account: AccountItem) {
     if (accountRebindOpeningId || accountRebindCompleting) return;
     accountRebindOpeningId = account.id;
-	accountRebindRole = accountRole;
     await hideEmbeddedBrowsers();
     accountCreateSessionId = "";
     accountRebinding = account;
@@ -3613,7 +3676,8 @@
     accountRebindCompleting = true;
     try {
       if (account) {
-        await invoke("complete_account_rebind", { accountId: account.id });
+        const updatedAccount = await invoke<AccountItem>("complete_account_rebind", { accountId: account.id });
+        accounts = accounts.map((item) => item.id === updatedAccount.id ? updatedAccount : item);
         accountRebinding = null;
         const accountInstances = browserInstances.filter((instance) => instance.account_id === account.id);
         await Promise.all(
@@ -3621,7 +3685,6 @@
             invoke("refresh_browser_account_cookie", { instanceId: instance.id }),
           ),
         );
-		await validateAccountCookie(account.id, accountRebindRole, true);
         await loadBrowserInstances();
         showToast(`已重新绑定「${account.nickname || account.name}」并更新 CK`);
       } else {
@@ -3870,6 +3933,28 @@
     instanceModalOpen = true;
   }
 
+  async function refreshInstanceAccounts() {
+    if (instanceAccountsRefreshing || accountsLoading || browserCreating) return;
+    instanceAccountsRefreshing = true;
+    browserError = "";
+    try {
+      await loadAccounts(false);
+      const ownedAccountIds = new Set(browserInstances.map((instance) => instance.account_id));
+      const eligibleAccountIds = new Set(
+        accounts
+          .filter((account) =>
+            account.roles.includes("participation") &&
+            account.participation?.enabled &&
+            !ownedAccountIds.has(account.id),
+          )
+          .map((account) => account.id),
+      );
+      selectedParticipationAccountIds = selectedParticipationAccountIds.filter((id) => eligibleAccountIds.has(id));
+    } finally {
+      instanceAccountsRefreshing = false;
+    }
+  }
+
   async function createBrowserInstance() {
     const selectedIds = [...selectedParticipationAccountIds];
     if (selectedIds.length === 0 || browserCreating) return;
@@ -3963,10 +4048,9 @@
     browserOpeningId = instance.id;
     browserError = "";
     try {
-      // The embedded WKWebView can contain a newer login than the persisted
-      // account credential. Flush it through the native channel before the
-      // card WebView is destroyed so the independent Chrome window receives
-      // the exact same canonical account session.
+      // The card and the framed independent window use the same account-keyed
+      // native data store. Flush the latest login before moving the visible
+      // page surface into its own utility window.
       if (isTauriDesktop()) {
         browserCookieCheckedAt.set(instance.id, Date.now());
         const loginStateUpdated = await invoke<boolean>("sync_browser_account_cookie", {
@@ -3976,11 +4060,11 @@
         if (loginStateUpdated) accounts = await engineRequest<AccountItem[]>("account.list");
       }
       await releaseEmbeddedBrowser(instance);
-      const opened = await engineRequest<BrowserInstance>("browser.open", {
-        instance_id: instance.id,
-      });
-      browserInstances = browserInstances.map((item) => (item.id === opened.id ? opened : item));
-      showToast(`已打开「${opened.account_name}」的独立抖音窗口`);
+      await invoke("open_browser_instance_window", { instanceId: instance.id });
+      if (!browserIndependentWindowIds.includes(instance.id)) {
+        browserIndependentWindowIds = [...browserIndependentWindowIds, instance.id];
+      }
+      showToast(`已打开「${instance.account_name}」的独立实例窗口`);
       await loadBrowserInstances();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -4241,16 +4325,31 @@
     showToast("监测状态已更新");
   }
 
-  function refresh() {
+  async function refresh() {
     if (refreshing) return;
     refreshing = true;
-    window.setTimeout(() => {
+    const startedAt = performance.now();
+    try {
+      if (activeView === "browsers") {
+        await Promise.all([loadBrowserInstances(), loadAccounts(false)]);
+      } else if (managementTab === "redpackets") {
+        await loadRedPacketEvents();
+      } else if (managementTab === "rooms") {
+        await Promise.all([loadRooms(false), loadRedPacketMonitors(true)]);
+      } else if (managementTab === "participation-records") {
+        await Promise.all([loadParticipationRecords(), loadParticipationRuntimeLogs()]);
+      } else {
+        await loadAccounts(false);
+      }
+      await loadSidebarActivities();
+      const remaining = 260 - (performance.now() - startedAt);
+      if (remaining > 0) await new Promise<void>((resolve) => window.setTimeout(resolve, remaining));
+      showToast("最新状态已刷新");
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error));
+    } finally {
       refreshing = false;
-      monitors = monitors.map((item) =>
-        item.state === "running" ? { ...item, lastSeen: "刚刚" } : item,
-      );
-      showToast("运行状态已刷新");
-    }, 650);
+    }
   }
 
   function showToast(message: string) {
@@ -4338,7 +4437,7 @@
     let unlistenParticipationLogClear: (() => void) | undefined;
     let unlistenBrowserWebviewReady: (() => void) | undefined;
     let unlistenBrowserWebviewLoadError: (() => void) | undefined;
-    let unlistenUpdateProgress: (() => void) | undefined;
+    let unlistenBrowserInstanceWindowClosed: (() => void) | undefined;
     if ("__TAURI_INTERNALS__" in window) {
       void listen<string>("engine://message", (event) => handleEngineMessage(event.payload))
         .then((unlisten) => {
@@ -4416,10 +4515,14 @@
       }).then((unlisten) => {
         unlistenBrowserWebviewLoadError = unlisten;
       });
-      void listen<UpdateProgress>("update://progress", (event) => {
-        updateProgress = event.payload;
+      void listen<BrowserInstanceWindowEvent>("browser-instance-window://closed", (event) => {
+        const instanceId = event.payload.instance_id?.trim();
+        if (!instanceId) return;
+        browserIndependentWindowIds = browserIndependentWindowIds.filter((id) => id !== instanceId);
+        browserWebviewReadyIds = browserWebviewReadyIds.filter((id) => id !== instanceId);
+        void loadBrowserInstances().finally(() => scheduleEmbeddedBrowserSync());
       }).then((unlisten) => {
-        unlistenUpdateProgress = unlisten;
+        unlistenBrowserInstanceWindowClosed = unlisten;
       });
     }
 
@@ -4497,7 +4600,7 @@
       unlistenParticipationLogClear?.();
       unlistenBrowserWebviewReady?.();
       unlistenBrowserWebviewLoadError?.();
-      unlistenUpdateProgress?.();
+      unlistenBrowserInstanceWindowClosed?.();
       for (const pending of pendingRequests.values()) {
         window.clearTimeout(pending.timer);
         pending.reject(new Error("页面已关闭"));
@@ -5183,10 +5286,10 @@
                 class="monitor-log-button room-recycle-entry"
                 aria-label={`打开直播间回收站${recycledRooms.length ? `，${recycledRooms.length} 个直播间` : ""}`}
                 data-tooltip="直播间回收站"
-                data-tooltip-placement="top"
+                data-tooltip-placement="bottom"
                 onclick={openRoomRecycleBin}
               >
-                <Trash size={13} />
+                <Archive size={13} />
                 {#if recycledRooms.length > 0}<span>{recycledRooms.length}</span>{/if}
               </button>
               <button class="monitor-log-button" aria-label="查看红包监测运行日志" data-tooltip="查看红包监测运行日志" data-tooltip-placement="top" onclick={openMonitorRuntimeLog}>
@@ -5787,7 +5890,7 @@
       {#if updateDownloading || updateDownloaded}
         <div class="update-progress-block">
           <div>
-            <span>{updateDownloaded ? "下载完成，安装包校验通过" : "正在下载并校验安装包…"}</span>
+            <span>{updateDownloaded ? "新版本已安装，等待重启" : "正在下载、验签并安装…"}</span>
             <strong>{updateProgress.percent}%</strong>
           </div>
           <progress max="100" value={updateProgress.percent}></progress>
@@ -5796,8 +5899,10 @@
             {#if updateProgress.total > 0} / {formatFileSize(updateProgress.total)}{/if}
           </small>
         </div>
-      {:else}
+      {:else if updateStatus.size > 0}
         <p class="update-package-meta">安装包 {formatFileSize(updateStatus.size)} · 下载后自动校验完整性</p>
+      {:else}
+        <p class="update-package-meta">签名更新包 · 自动验签并安装</p>
       {/if}
 
       {#if updateError}<div class="license-error"><WarningCircle size={14} />{updateError}</div>{/if}
@@ -5806,7 +5911,7 @@
         {#if updateDownloaded}
           <button class="primary-action" disabled={updateInstalling} onclick={installAppUpdate}>
             <ArrowClockwise class={updateInstalling ? "spinning" : undefined} size={14} />
-            {updateInstalling ? "正在启动…" : "安装并重启"}
+            {updateInstalling ? "正在重启…" : "重启并完成更新"}
           </button>
         {:else}
           <button class="primary-action" disabled={updateDownloading} onclick={downloadAppUpdate}>
@@ -5908,7 +6013,7 @@
     <dialog class="modal room-recycle-modal" open aria-labelledby="room-recycle-title">
       <div class="modal-head">
         <div>
-          <span class="modal-icon room-recycle-icon"><Trash size={18} /></span>
+          <span class="modal-icon room-recycle-icon"><Archive size={18} /></span>
           <h2 id="room-recycle-title">直播间回收站</h2>
         </div>
         <button class="icon-button" aria-label="关闭" disabled={Boolean(roomRecycleBusyId)} onclick={closeRoomRecycleBin}><X size={17} /></button>
@@ -5918,7 +6023,7 @@
         {#if roomRecycleLoading && recycledRooms.length === 0}
           <div class="room-recycle-empty"><ArrowClockwise class="spinning" size={18} />正在读取回收站…</div>
         {:else if recycledRooms.length === 0}
-          <div class="room-recycle-empty"><Trash size={20} /><span>回收站为空</span></div>
+          <div class="room-recycle-empty"><Archive size={20} /><span>回收站为空</span></div>
         {:else}
           {#each recycledRooms as room}
             <article class="room-recycle-row">
@@ -6262,7 +6367,7 @@
         </span>
       </div>
 
-      {#if accountsLoading}
+      {#if accountsLoading && accounts.length === 0}
         <div class="instance-account-empty"><ArrowClockwise class="spinning" size={20} /><span>正在读取参与账号…</span></div>
       {:else if selectableParticipationAccounts.length === 0}
         <div class="instance-account-empty">
@@ -6309,7 +6414,16 @@
         <ShieldCheck size={17} />
         <span>Cookie 仅在 Go 引擎与实例配置目录之间同步，不会返回界面；每个实例的缓存和登录态完全隔离。</span>
       </div>
-      <div class="modal-actions">
+      <div class="modal-actions instance-modal-actions">
+        <button
+          type="button"
+          class="icon-button instance-account-refresh"
+          disabled={browserCreating || accountsLoading || instanceAccountsRefreshing}
+          aria-label="刷新参与账号"
+          data-tooltip={instanceAccountsRefreshing || accountsLoading ? "正在刷新参与账号" : "刷新参与账号"}
+          data-tooltip-placement="top"
+          onclick={refreshInstanceAccounts}
+        ><ArrowClockwise class={instanceAccountsRefreshing || accountsLoading ? "spinning" : undefined} size={14} /></button>
         <button class="secondary-button" disabled={browserCreating} onclick={closeInstanceModal}>取消</button>
         <button
           class="primary-action instance-create-action"

@@ -70,16 +70,21 @@ jobs:
             os: macos-15
             target: universal-apple-darwin
             rust_targets: aarch64-apple-darwin x86_64-apple-darwin
-            bundles: dmg
+            bundles: app,dmg
             artifact: fubao-macos-universal
-            bundle_path: src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            bundle_path: |
+              src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+              src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
+              src-tauri/target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig
           - label: Windows x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
             rust_targets: x86_64-pc-windows-msvc
             bundles: nsis
             artifact: fubao-windows-x64
-            bundle_path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            bundle_path: |
+              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+              src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
 
     steps:
       - name: Checkout source
@@ -107,9 +112,21 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Verify updater signing key
+        env:
+          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          if [[ -z "$SIGNING_KEY" ]]; then
+            echo "::error::Missing TAURI_SIGNING_PRIVATE_KEY required for signed desktop updates."
+            exit 1
+          fi
+
       - name: Build desktop client
         env:
           TAURI_ENV_TARGET_TRIPLE: ${{ matrix.target }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: npm run tauri build -- --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
 
       - name: Verify Windows executables do not open a console
@@ -177,21 +194,31 @@ jobs:
           TAG="v${VERSION}"
           NOTES="${NOTES_INPUT:-福宝控制台自动构建发布包。}"
 
-          MACOS_SOURCE="$(find release-assets -type f -name '*.dmg' -print -quit)"
+          MACOS_DMG_SOURCE="$(find release-assets -type f -name '*.dmg' -print -quit)"
+          MACOS_UPDATE_SOURCE="$(find release-assets -type f -name '*.app.tar.gz' -print -quit)"
+          MACOS_SIGNATURE_SOURCE="$(find release-assets -type f -name '*.app.tar.gz.sig' -print -quit)"
           WINDOWS_SOURCE="$(find release-assets -type f -name '*.exe' -print -quit)"
-          if [[ -z "$MACOS_SOURCE" || -z "$WINDOWS_SOURCE" ]]; then
-            echo "Both macOS and Windows installers are required." >&2
+          WINDOWS_SIGNATURE_SOURCE="$(find release-assets -type f -name '*.exe.sig' -print -quit)"
+          if [[ -z "$MACOS_DMG_SOURCE" || -z "$MACOS_UPDATE_SOURCE" || -z "$MACOS_SIGNATURE_SOURCE" || -z "$WINDOWS_SOURCE" || -z "$WINDOWS_SIGNATURE_SOURCE" ]]; then
+            echo "macOS installer/updater and Windows installer/updater signatures are all required." >&2
             find release-assets -maxdepth 2 -type f -print >&2
             exit 1
           fi
 
-          MACOS_FILE="fubao-console-${VERSION}-macos-universal.dmg"
+          MACOS_DMG_FILE="fubao-console-${VERSION}-macos-universal.dmg"
+          MACOS_UPDATE_FILE="fubao-console-${VERSION}-macos-universal.app.tar.gz"
+          MACOS_SIGNATURE_FILE="${MACOS_UPDATE_FILE}.sig"
           WINDOWS_FILE="fubao-console-${VERSION}-windows-x64-setup.exe"
-          mv "$MACOS_SOURCE" "release-assets/$MACOS_FILE"
-          mv "$WINDOWS_SOURCE" "release-assets/$WINDOWS_FILE"
+          WINDOWS_SIGNATURE_FILE="${WINDOWS_FILE}.sig"
+          cp "$MACOS_DMG_SOURCE" "release-assets/$MACOS_DMG_FILE"
+          cp "$MACOS_UPDATE_SOURCE" "release-assets/$MACOS_UPDATE_FILE"
+          cp "$MACOS_SIGNATURE_SOURCE" "release-assets/$MACOS_SIGNATURE_FILE"
+          cp "$WINDOWS_SOURCE" "release-assets/$WINDOWS_FILE"
+          cp "$WINDOWS_SIGNATURE_SOURCE" "release-assets/$WINDOWS_SIGNATURE_FILE"
 
-          export VERSION TAG NOTES MACOS_FILE WINDOWS_FILE
+          export VERSION TAG NOTES MACOS_DMG_FILE MACOS_UPDATE_FILE MACOS_SIGNATURE_FILE WINDOWS_FILE WINDOWS_SIGNATURE_FILE
           python - <<'PY'
+          import datetime
           import hashlib
           import json
           import os
@@ -201,7 +228,13 @@ jobs:
           repository = os.environ["RELEASE_REPOSITORY"]
           tag = os.environ["TAG"]
 
-          def package(filename: str) -> dict:
+          def package(filename: str, signature_filename: str) -> dict:
+              return {
+                  "url": f"https://github.com/{repository}/releases/download/{tag}/{filename}",
+                  "signature": (assets / signature_filename).read_text(encoding="utf-8").strip(),
+              }
+
+          def legacy_package(filename: str) -> dict:
               path = assets / filename
               return {
                   "url": f"https://github.com/{repository}/releases/download/{tag}/{filename}",
@@ -210,13 +243,24 @@ jobs:
                   "size": path.stat().st_size,
               }
 
+          macos = package(os.environ["MACOS_UPDATE_FILE"], os.environ["MACOS_SIGNATURE_FILE"])
+          windows = package(os.environ["WINDOWS_FILE"], os.environ["WINDOWS_SIGNATURE_FILE"])
           manifest = {
               "version": os.environ["VERSION"],
-              "force": False,
               "notes": os.environ["NOTES"],
+              "force": False,
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+              "platforms": {
+                  "darwin-aarch64": macos,
+                  "darwin-x86_64": macos,
+                  "windows-x86_64": windows,
+              },
+              # Keep one transition release readable by the pre-Tauri updater in
+              # 0.1.17. Tauri ignores these extra fields; old clients ignore the
+              # new signed `platforms` object.
               "packages": {
-                  "windows": package(os.environ["WINDOWS_FILE"]),
-                  "macos": package(os.environ["MACOS_FILE"]),
+                  "macos": legacy_package(os.environ["MACOS_DMG_FILE"]),
+                  "windows": legacy_package(os.environ["WINDOWS_FILE"]),
               },
           }
           (assets / "latest.json").write_text(
@@ -228,8 +272,11 @@ jobs:
           {
             echo "version=$VERSION"
             echo "tag=$TAG"
-            echo "macos_file=$MACOS_FILE"
+            echo "macos_dmg_file=$MACOS_DMG_FILE"
+            echo "macos_update_file=$MACOS_UPDATE_FILE"
+            echo "macos_signature_file=$MACOS_SIGNATURE_FILE"
             echo "windows_file=$WINDOWS_FILE"
+            echo "windows_signature_file=$WINDOWS_SIGNATURE_FILE"
           } >> "$GITHUB_OUTPUT"
           cat release-assets/latest.json
 
@@ -286,8 +333,11 @@ jobs:
           fi
 
           gh release upload "$TAG" \
-            "release-assets/${{ steps.metadata.outputs.macos_file }}" \
+            "release-assets/${{ steps.metadata.outputs.macos_dmg_file }}" \
+            "release-assets/${{ steps.metadata.outputs.macos_update_file }}" \
+            "release-assets/${{ steps.metadata.outputs.macos_signature_file }}" \
             "release-assets/${{ steps.metadata.outputs.windows_file }}" \
+            "release-assets/${{ steps.metadata.outputs.windows_signature_file }}" \
             release-assets/latest.json \
             --repo "$RELEASE_REPOSITORY" \
             --clobber

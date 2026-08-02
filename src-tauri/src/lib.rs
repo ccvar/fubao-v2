@@ -24,9 +24,6 @@ use tauri_plugin_shell::{
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
-mod updater;
-use updater::{check_app_update, download_app_update, install_app_update, UpdaterRuntime};
-
 struct EngineRuntime {
     child: Mutex<Option<CommandChild>>,
     online: AtomicBool,
@@ -699,6 +696,33 @@ async fn inspect_douyin_login(webview: &tauri::Webview) -> Result<BrowserLoginSn
         _ => BrowserLoginState::Unknown,
     };
     Ok(BrowserLoginSnapshot { raw_cookie, state })
+}
+
+async fn read_authenticated_douyin_cookie(webview: &tauri::Webview) -> Result<String, String> {
+    // WebView2 can publish the navigation/UI state slightly before its Cookie
+    // manager exposes the final HttpOnly login values. Retry the native read
+    // briefly instead of saving the previously injected, expired account CK.
+    let mut last_error = "尚未检测到登录状态，请先在抖音窗口完成登录".to_string();
+    for attempt in 0..4 {
+        match inspect_douyin_login(webview).await {
+            Ok(BrowserLoginSnapshot {
+                raw_cookie: Some(raw_cookie),
+                state: BrowserLoginState::LoggedIn,
+            }) => return Ok(raw_cookie),
+            Ok(BrowserLoginSnapshot {
+                state: BrowserLoginState::LoggedOut,
+                ..
+            }) => return Err("抖音页面仍处于未登录状态，请完成登录后再更新 CK".into()),
+            Ok(_) => {
+                last_error = "登录页面尚未同步完成，请稍后重试".into();
+            }
+            Err(error) => last_error = error,
+        }
+        if attempt < 3 {
+            tokio::time::sleep(Duration::from_millis(220)).await;
+        }
+    }
+    Err(last_error)
 }
 
 fn valid_live_room_id(value: &str) -> bool {
@@ -1411,18 +1435,27 @@ async fn complete_account_rebind(
     window: tauri::Window,
     runtime: tauri::State<'_, Arc<EngineRuntime>>,
     account_id: String,
-) -> Result<(), String> {
+) -> Result<Value, String> {
     let account_id = account_id.trim().to_string();
     let label = rebind_webview_label(&account_id, window.label());
     let webview = app
         .get_webview(&label)
         .ok_or("登录页面已关闭，请重新打开")?;
-    let raw_cookie = read_douyin_cookie(&webview)?;
+    let raw_cookie = read_authenticated_douyin_cookie(&webview).await?;
     let runtime = runtime.inner().clone();
     native_engine_request(
         runtime.clone(),
         "account.native_replace_cookie",
         json!({ "account_id": account_id, "cookie": raw_cookie, "secret": runtime.native_secret }),
+    )
+    .await?;
+    // The user has just completed a fresh authenticated native-page check.
+    // Persist that authoritative browser signal so a transient online API
+    // failure cannot leave the previous expired badge visible on Windows.
+    let account = native_engine_request(
+        runtime.clone(),
+        "account.native_set_browser_login_state",
+        json!({ "account_id": account_id, "logged_in": true, "secret": runtime.native_secret }),
     )
     .await?;
     webview
@@ -1431,7 +1464,7 @@ async fn complete_account_rebind(
     // Hiding is the visual guarantee. Closing releases the native WebView;
     // if WebKit delays teardown, it must never remain over the main UI.
     let _ = webview.close();
-    Ok(())
+    Ok(account)
 }
 
 #[tauri::command]
@@ -2482,6 +2515,152 @@ async fn open_participation_log(app: tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn browser_instance_window_metadata(
+    runtime: tauri::State<'_, Arc<EngineRuntime>>,
+    instance_id: String,
+) -> Result<Value, String> {
+    let result = native_engine_request(
+        runtime.inner().clone(),
+        "browser.native_credential",
+        json!({
+            "instance_id": instance_id,
+            "secret": runtime.native_secret,
+        }),
+    )
+    .await?;
+    let credential: NativeBrowserCredential = serde_json::from_value(result)
+        .map_err(|error| format!("解析浏览器实例信息失败：{error}"))?;
+    Ok(json!({
+        "instance_id": credential.instance_id,
+        "account_id": credential.account_id,
+        "account_name": credential.account_name,
+        "cookie_status": credential.cookie_status,
+    }))
+}
+
+#[tauri::command]
+async fn open_browser_instance_window(
+    app: tauri::AppHandle,
+    runtime: tauri::State<'_, Arc<EngineRuntime>>,
+    instance_id: String,
+) -> Result<(), String> {
+    let instance_id = instance_id.trim().to_string();
+    if instance_id.is_empty()
+        || !instance_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return Err("浏览器实例标识无效".into());
+    }
+    let label = format!("instance-window-{}", safe_window_label_part(&instance_id));
+    if let Some(window) = app.get_webview_window(&label) {
+        window
+            .show()
+            .map_err(|error| format!("显示实例窗口失败：{error}"))?;
+        let _ = window.unminimize();
+        window
+            .set_focus()
+            .map_err(|error| format!("聚焦实例窗口失败：{error}"))?;
+        return Ok(());
+    }
+
+    let credential_result = native_engine_request(
+        runtime.inner().clone(),
+        "browser.native_credential",
+        json!({
+            "instance_id": instance_id,
+            "secret": runtime.native_secret,
+        }),
+    )
+    .await?;
+    let credential: NativeBrowserCredential = serde_json::from_value(credential_result)
+        .map_err(|error| format!("解析浏览器实例信息失败：{error}"))?;
+    if credential.cookie_status == "expired" {
+        return Err("参与账号 CK 已失效，请先重新绑定".into());
+    }
+
+    let admission = native_engine_request(
+        runtime.inner().clone(),
+        "browser.runtime.acquire",
+        json!({ "instance_id": instance_id }),
+    )
+    .await?;
+    if admission.get("granted").and_then(Value::as_bool) != Some(true) {
+        let position = admission
+            .get("queue_position")
+            .and_then(Value::as_i64)
+            .unwrap_or(1);
+        let limit = admission
+            .pointer("/capacity/effective_limit")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
+        return Err(format!(
+            "当前设备安全并发为 {limit}，实例已进入等待队列（第 {position} 位）"
+        ));
+    }
+
+    let route = format!("index.html?window=browser-instance&instance={instance_id}");
+    let builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(route.into()))
+        .title(format!("福宝浏览器实例 · {}", credential.account_name))
+        .inner_size(1080.0, 760.0)
+        .min_inner_size(640.0, 460.0)
+        .resizable(true)
+        .decorations(true)
+        .center()
+        .focused(true);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .title_bar_style(tauri::TitleBarStyle::Overlay)
+        .hidden_title(true)
+        .traffic_light_position(LogicalPosition::new(15.0, 20.0))
+        .background_color(tauri::webview::Color(255, 255, 255, 255));
+
+    let window = match builder.build() {
+        Ok(window) => window,
+        Err(error) => {
+            let _ = native_engine_request(
+                runtime.inner().clone(),
+                "browser.runtime.release",
+                json!({ "instance_id": instance_id }),
+            )
+            .await;
+            return Err(format!("打开实例窗口失败：{error}"));
+        }
+    };
+    #[cfg(windows)]
+    apply_windows_titlebar_palette(&window);
+
+    let close_app = app.clone();
+    let close_runtime = runtime.inner().clone();
+    let close_instance_id = instance_id.clone();
+    let close_window_label = label.clone();
+    let released = Arc::new(AtomicBool::new(false));
+    window.on_window_event(move |event| {
+        if !matches!(event, WindowEvent::Destroyed) || released.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let child_label = browser_webview_label(&close_instance_id, &close_window_label);
+        let _ = begin_browser_webview_close(close_runtime.as_ref(), &child_label);
+        let _ = close_app.emit(
+            "browser-instance-window://closed",
+            json!({ "instance_id": close_instance_id }),
+        );
+        let runtime = close_runtime.clone();
+        let instance_id = close_instance_id.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = native_engine_request(
+                runtime.clone(),
+                "browser.runtime.release",
+                json!({ "instance_id": instance_id }),
+            )
+            .await;
+        });
+    });
+    Ok(())
+}
+
+#[tauri::command]
 async fn open_page_window(app: tauri::AppHandle, view: String) -> Result<(), String> {
     let view = view.trim();
     let title = match view {
@@ -2554,11 +2733,12 @@ fn close_monitor_log(app: tauri::AppHandle) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let runtime = Arc::new(EngineRuntime::default());
             app.manage(runtime.clone());
-            app.manage(Arc::new(UpdaterRuntime::default()));
             if let Err(error) = start_engine(app.handle().clone(), runtime) {
                 eprintln!("{error}");
             }
@@ -2593,12 +2773,11 @@ pub fn run() {
             refresh_window_surface,
             open_monitor_log,
             open_participation_log,
+            open_browser_instance_window,
+            browser_instance_window_metadata,
             open_page_window,
             open_live_room,
             close_monitor_log,
-            check_app_update,
-            download_app_update,
-            install_app_update,
             mount_browser_webview,
             sync_browser_webview,
             hide_browser_webview,

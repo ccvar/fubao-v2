@@ -2,6 +2,7 @@ import { mount } from "svelte";
 import App from "./DesktopApp.svelte";
 import MonitorLogApp from "./MonitorLogApp.svelte";
 import ParticipationLogApp from "./ParticipationLogApp.svelte";
+import BrowserInstanceApp from "./BrowserInstanceApp.svelte";
 import "./styles.css";
 
 function reportFrontendError(level: string, value: unknown) {
@@ -34,7 +35,17 @@ try {
   if (!target) throw new Error("找不到应用挂载节点");
   const isMonitorLogWindow = new URL(window.location.href).searchParams.get("window") === "monitor-log";
   const isParticipationLogWindow = new URL(window.location.href).searchParams.get("window") === "participation-log";
-  mount(isMonitorLogWindow ? MonitorLogApp : isParticipationLogWindow ? ParticipationLogApp : App, { target });
+  const isBrowserInstanceWindow = new URL(window.location.href).searchParams.get("window") === "browser-instance";
+  mount(
+    isMonitorLogWindow
+      ? MonitorLogApp
+      : isParticipationLogWindow
+        ? ParticipationLogApp
+        : isBrowserInstanceWindow
+          ? BrowserInstanceApp
+          : App,
+    { target },
+  );
   if (window.location.protocol === "http:" || window.location.protocol === "https:") {
     window.setTimeout(() => {
       void import("@tauri-apps/api/core")

@@ -5493,6 +5493,22 @@ label.browser-column-control[data-tooltip]:focus-within {
   margin-top: 14px;
 }
 
+.instance-modal-actions .instance-account-refresh {
+  width: var(--modal-action-height);
+  min-width: var(--modal-action-height);
+  margin-right: auto;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #8e8981;
+}
+
+.instance-modal-actions .instance-account-refresh:hover:not(:disabled),
+.instance-modal-actions .instance-account-refresh:focus-visible {
+  background: #f2f0ec;
+  color: #55514b;
+}
+
 .instance-create-action {
   min-width: 112px;
 }
