@@ -17,6 +17,7 @@
     CheckCircleIcon as CheckCircle,
     ClockCountdownIcon as ClockCountdown,
     ClipboardTextIcon as ClipboardText,
+    CloudArrowUpIcon as CloudArrowUp,
     SketchLogoIcon as DiamondGem,
     DotsThreeIcon as DotsThree,
     DownloadSimpleIcon as DownloadSimple,
@@ -66,6 +67,19 @@
   };
 
   type LicenseOperation = { success: boolean; message: string; status: LicenseStatus };
+
+  type RemoteSyncStatus = {
+    enabled: boolean;
+    configured: boolean;
+    endpoint: string;
+    fallback_endpoint: string;
+    active_endpoint?: string;
+    pending: number;
+    client_id: string;
+    last_success_at?: string;
+    last_error?: string;
+    last_error_at?: string;
+  };
 
   type UpdateStatus = {
     current_version: string;
@@ -231,6 +245,9 @@
     follow_sources?: RoomFollowSource[];
     following_live?: boolean;
     last_seen_live_at?: string;
+	center_live_status?: string;
+	center_live_at?: string;
+	center_last_event_at?: string;
     created_at: string;
     updated_at: string;
   };
@@ -277,6 +294,7 @@
     title?: string;
     prize?: string;
     source: string;
+	data_source?: string;
     detected_at: string;
     draw_at?: string;
 	expires_at?: string;
@@ -322,12 +340,15 @@
 	created_at: string;
   };
 
+	type ParticipationPacketType = "all" | "gift" | "diamond";
+
   type ParticipationSettings = {
 	stop_after_joins: number;
 	cooldown_seconds: number;
 	stop_after_wins: number;
 	draw_result_timeout_seconds: number;
 	minimum_diamonds: number;
+	packet_type: ParticipationPacketType;
   };
 
   type ParticipationScheduleMode = "once" | "daily" | "interval";
@@ -440,6 +461,18 @@
   let licenseBusy = false;
   let licenseError = "";
   let licenseReplacing = false;
+  let remoteSyncStatus: RemoteSyncStatus = {
+    enabled: false,
+    configured: false,
+    endpoint: "https://fbv2.ccvar.com/api/v1",
+    fallback_endpoint: "https://fbv2.ccvar.com:8087/api/v1",
+    pending: 0,
+    client_id: "",
+  };
+  let remoteSyncToken = "";
+  let remoteSyncBusy = false;
+  let remoteSyncError = "";
+  let remoteSyncEditing = false;
   let participationSettingsModalOpen = false;
   let participationSettingsBusy = false;
   let participationSettingsError = "";
@@ -449,6 +482,7 @@
 	stop_after_wins: 0,
 	draw_result_timeout_seconds: 10,
 	minimum_diamonds: 1,
+	packet_type: "diamond",
   };
   let participationTaskMenuOpen = false;
   let participationScheduleModalOpen = false;
@@ -499,11 +533,13 @@
   let refreshing = false;
   let instanceModalOpen = false;
   let browserInstances: BrowserInstance[] = [];
+  let browserInventoryLoaded = false;
   let browserCapacity: BrowserCapacity | null = null;
   let browserLoading = false;
   let browserStatusPolling = false;
   let browserCookieSyncing = false;
   let browserCookieCheckingIds: string[] = [];
+  const browserCookieCheckedAt = new Map<string, number>();
   let browserError = "";
   let browserCreating = false;
   let browserOpeningId = "";
@@ -794,7 +830,7 @@
       const timer = window.setTimeout(() => {
         pendingRequests.delete(id);
         reject(new Error("Go 引擎响应超时"));
-      }, method.startsWith("license.") ? 35000 : 12000);
+      }, method.startsWith("license.") || method.startsWith("remote_sync.") ? 35000 : 12000);
       pendingRequests.set(id, {
         resolve: (value) => resolve(value as T),
         reject,
@@ -825,19 +861,35 @@
     }
   }
 
+  async function loadRemoteSyncStatus(reportError = true) {
+    if (!engineListenerReady) return;
+    try {
+      remoteSyncStatus = await engineRequest<RemoteSyncStatus>("remote_sync.status");
+    } catch (error) {
+      if (reportError) remoteSyncError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
   async function openLicenseModal() {
     await hideEmbeddedBrowsers();
     licenseError = "";
+    remoteSyncError = "";
+    remoteSyncToken = "";
+    remoteSyncEditing = false;
     licenseModalOpen = true;
     void loadLicenseStatus();
+    void loadRemoteSyncStatus();
   }
 
   function closeLicenseModal() {
-    if (licenseBusy) return;
+    if (licenseBusy || remoteSyncBusy) return;
     licenseModalOpen = false;
     licenseKey = "";
     licenseError = "";
     licenseReplacing = false;
+    remoteSyncToken = "";
+    remoteSyncError = "";
+    remoteSyncEditing = false;
     scheduleEmbeddedBrowserSync();
   }
 
@@ -1003,6 +1055,9 @@
 		stop_after_wins: normalizedParticipationSetting(participationSettings.stop_after_wins, 100000),
 		draw_result_timeout_seconds: Math.max(1, normalizedParticipationSetting(participationSettings.draw_result_timeout_seconds, 300)),
 		minimum_diamonds: Math.max(1, normalizedParticipationSetting(participationSettings.minimum_diamonds, 1000000)),
+		packet_type: (["all", "gift", "diamond"] as ParticipationPacketType[]).includes(participationSettings.packet_type)
+			? participationSettings.packet_type
+			: "diamond" as ParticipationPacketType,
 	};
 	if (!isTauriDesktop()) {
 		participationSettings = next;
@@ -1226,7 +1281,7 @@
 		// The browser page may never have been opened in this frontend session.
 		// Populate the native instance inventory before atomically claiming a
 		// due occurrence so an empty UI array cannot consume a scheduled run.
-		if (browserInstances.length === 0) await loadBrowserInstances();
+		if (!browserInventoryLoaded) await loadBrowserInstances();
 		if (browserInstances.length === 0) return;
 		const executions = await engineRequest<ParticipationScheduleExecution[]>("red_packet_participation.schedule.claim_due");
 		for (const execution of executions) {
@@ -1253,6 +1308,62 @@
     licenseKey = "";
     licenseError = "";
     licenseReplacing = false;
+  }
+
+  function beginRemoteSyncTokenChange() {
+    if (remoteSyncBusy) return;
+    remoteSyncToken = "";
+    remoteSyncError = "";
+    remoteSyncEditing = true;
+  }
+
+  function cancelRemoteSyncTokenChange() {
+    if (remoteSyncBusy) return;
+    remoteSyncToken = "";
+    remoteSyncError = "";
+    remoteSyncEditing = false;
+  }
+
+  function remoteSyncStateLabel(status: RemoteSyncStatus) {
+    if (remoteSyncBusy) return "连接中";
+    if (!status.enabled) return status.configured ? "已停用" : "未配置";
+    if (status.active_endpoint) return "已连接";
+    if (status.last_error) return "连接异常";
+    return "等待连接";
+  }
+
+  function remoteSyncLineLabel(status: RemoteSyncStatus) {
+    if (!status.active_endpoint) return "尚未建立连接";
+    return status.active_endpoint.includes(":8087") ? "8087 备用线路" : "标准 HTTPS 线路";
+  }
+
+  async function configureRemoteSync(enabled: boolean, enrollmentToken = "") {
+    if (remoteSyncBusy) return;
+    if (enabled && !remoteSyncStatus.configured && !enrollmentToken.trim()) {
+      remoteSyncError = "请输入服务器安装时生成的注册令牌";
+      return;
+    }
+    remoteSyncBusy = true;
+    remoteSyncError = "";
+    try {
+      remoteSyncStatus = await engineRequest<RemoteSyncStatus>("remote_sync.configure", {
+        enabled,
+        enrollment_token: enrollmentToken.trim(),
+      });
+      remoteSyncToken = "";
+      remoteSyncEditing = false;
+      toast = enabled ? "远程同步已连接" : "远程同步已停用";
+      window.setTimeout(() => (toast = ""), 2200);
+    } catch (error) {
+      remoteSyncError = error instanceof Error ? error.message : String(error);
+      await loadRemoteSyncStatus(false);
+    } finally {
+      remoteSyncBusy = false;
+    }
+  }
+
+  function saveRemoteSyncToken() {
+    void configureRemoteSync(true, remoteSyncToken);
   }
 
   function formatLicenseDate(value?: string, emptyLabel = "永久有效") {
@@ -1506,6 +1617,7 @@
     if (sources.length > 1) return `${sources[0].account_name}等 ${sources.length} 个账号的关注`;
     if (room.source === "dy-kiro") return "旧福宝导入";
     if (room.source === "manual") return "手动导入";
+	if (room.source === "center") return "来源于中心库";
     return "本机创建";
   }
 
@@ -2087,6 +2199,7 @@
       // A persistent account profile can already contain a fresh login from
       // the prior session. Synchronize immediately on mount instead of
       // leaving the stale CK badge visible until the polling interval fires.
+      browserCookieCheckedAt.set(instance.id, Date.now());
       const loginStateUpdated = await invoke<boolean>("sync_browser_account_cookie", {
         instanceId: instance.id,
       }).catch(() => false);
@@ -2328,7 +2441,11 @@
   }
 
   function browserCookieExpired(instance: BrowserInstance) {
-    return accounts.find((account) => account.id === instance.account_id)?.cookie_status === "expired";
+    return browserCookieStatus(instance) === "expired";
+  }
+
+  function browserCookieStatus(instance: BrowserInstance) {
+    return accounts.find((account) => account.id === instance.account_id)?.cookie_status || "unknown";
   }
 
   function browserCookieMessage(instance: BrowserInstance) {
@@ -2688,8 +2805,16 @@
   ) {
     if (!room.enabled) return "已停用";
     if (roomIsFollowingLive(room, clock)) return "已开播";
-    if (monitor) return roomLiveStatus(monitor, status);
+	if (monitor && status === "running") return roomLiveStatus(monitor, status);
+	if (room.center_live_status === "live" && centerRoomEvidenceFresh(room, clock)) return "已开播";
+	if (room.center_live_status === "offline") return "未开播";
+	if (monitor) return roomLiveStatus(monitor, status);
     return "未监测";
+  }
+
+  function centerRoomEvidenceFresh(room: RoomItem, clock = Date.now()) {
+	const timestamp = Date.parse(room.center_live_at || "");
+	return Number.isFinite(timestamp) && clock - timestamp <= 90_000;
   }
 
   function roomCombinedMonitorPhase(
@@ -2706,6 +2831,12 @@
       }
       if (monitor.live_status !== "live") return "实例已确认开播 · 等待红包检测";
     }
+	if (room.center_live_status === "live" && centerRoomEvidenceFresh(room, clock)) {
+		return `中心库确认开播 · ${formatMonitorTime(room.center_live_at, clock)}`;
+	}
+	if (room.source === "center" && !monitor) {
+		return `中心库同步 · ${formatMonitorTime(room.center_live_at || room.updated_at, clock)}`;
+	}
     return monitor ? roomMonitorPhase(monitor, status) : "红包监测未准备";
   }
 
@@ -3248,6 +3379,7 @@
       ]);
       browserInstances = instances;
       browserCapacity = capacity;
+	  browserInventoryLoaded = true;
 	  void loadBrowserParticipationContexts();
       void loadBrowserFollowingLives(instances);
       await tick();
@@ -3353,17 +3485,24 @@
     ) return;
     browserCookieSyncing = true;
     try {
-      const queue = visibleBrowserInstances.filter((instance) =>
-        browserWebviewMountedIds.includes(instance.id) &&
-        !browserWebviewReleasingIds.includes(instance.id)
-      );
+      const now = Date.now();
+      const queue = visibleBrowserInstances.filter((instance) => {
+        if (
+          !browserWebviewMountedIds.includes(instance.id) ||
+          browserWebviewReleasingIds.includes(instance.id)
+        ) return false;
+        const interval = browserCookieStatus(instance) === "valid" ? 60_000 : 5_000;
+        return now - (browserCookieCheckedAt.get(instance.id) || 0) >= interval;
+      });
       let accountUpdated = false;
       await Promise.all(
         Array.from({ length: Math.min(3, queue.length) }, async () => {
           while (queue.length > 0) {
             const instance = queue.shift();
             if (!instance) return;
-            if (!browserCookieCheckingIds.includes(instance.id)) {
+            const showIndicator = browserCookieStatus(instance) !== "valid";
+            browserCookieCheckedAt.set(instance.id, Date.now());
+            if (showIndicator && !browserCookieCheckingIds.includes(instance.id)) {
               browserCookieCheckingIds = [...browserCookieCheckingIds, instance.id];
             }
             const startedAt = performance.now();
@@ -3373,11 +3512,13 @@
               }).catch(() => false);
               accountUpdated ||= updated;
             } finally {
-              const remaining = 320 - (performance.now() - startedAt);
-              if (remaining > 0) {
+              const remaining = showIndicator ? 320 - (performance.now() - startedAt) : 0;
+              if (showIndicator && remaining > 0) {
                 await new Promise<void>((resolve) => window.setTimeout(resolve, remaining));
               }
-              browserCookieCheckingIds = browserCookieCheckingIds.filter((id) => id !== instance.id);
+              if (showIndicator) {
+                browserCookieCheckingIds = browserCookieCheckingIds.filter((id) => id !== instance.id);
+              }
             }
           }
         }),
@@ -3454,6 +3595,7 @@
       browserWebviewLoadingIds = browserWebviewLoadingIds.filter((id) => id !== instance.id);
       browserWebviewReadyIds = browserWebviewReadyIds.filter((id) => id !== instance.id);
       browserCookieCheckingIds = browserCookieCheckingIds.filter((id) => id !== instance.id);
+      browserCookieCheckedAt.delete(instance.id);
       browserFollowingLivePendingNativeIds = browserFollowingLivePendingNativeIds.filter((id) => id !== instance.id);
       browserRedPacketContextIds = browserRedPacketContextIds.filter((id) => id !== instance.id);
       browserPendingClose = null;
@@ -3495,6 +3637,7 @@
       // card WebView is destroyed so the independent Chrome window receives
       // the exact same canonical account session.
       if (isTauriDesktop()) {
+        browserCookieCheckedAt.set(instance.id, Date.now());
         const loginStateUpdated = await invoke<boolean>("sync_browser_account_cookie", {
           instanceId: instance.id,
           requireLoggedIn: true,
@@ -3907,7 +4050,11 @@
           browserWebviewReadyIds = [...browserWebviewReadyIds, instanceId];
         }
         const instance = browserInstances.find((item) => item.id === instanceId);
-        if (instance) void loadBrowserFollowingLive(instance, true);
+        if (instance) {
+          browserCookieCheckedAt.delete(instanceId);
+          void syncEmbeddedBrowserCookies();
+          void loadBrowserFollowingLive(instance, true);
+        }
         // The page can finish while a grid reflow is in progress. Reconcile
         // against the latest card bounds instead of trusting the geometry
         // captured when the child WebView was first created.
@@ -4737,7 +4884,7 @@
                       </span>
                       <div>
                         <strong>{event.title || "直播间红包"}</strong>
-                        <small>{event.packet_id || "红包事件"} · {event.source === "luckybox_api" ? "红包接口" : "实时检测"}</small>
+						<small>{event.packet_id || "红包事件"} · {event.data_source === "center" ? "来源于中心库" : event.source === "luckybox_api" ? "红包接口" : "实时检测"}</small>
                       </div>
                     </div>
                     <div class="red-packet-event-room">
@@ -4750,7 +4897,7 @@
 						<span>{event.room_name || event.streamer_name || `直播间 ${event.web_rid || event.room_id}`}</span>
 						<ArrowSquareOut size={11} />
 					  </button>
-					  <small>{event.streamer_name || "尚未读取主播"} · 账号 {event.account_name || event.account_id || "待解析"}</small>
+					  <small>{event.streamer_name || "尚未读取主播"} · {event.data_source === "center" ? "中心库同步" : `账号 ${event.account_name || event.account_id || "待解析"}`}</small>
                     </div>
 					<div class="red-packet-event-prize">
 					  <strong>{event.prize || "奖品待解析"}</strong>
@@ -5251,6 +5398,21 @@
 
       <p class="participation-settings-intro">以下限制按每个参与账号独立计算，填 0 表示不限制。</p>
       <div class="participation-settings-list">
+        <div class="participation-setting-row participation-packet-type-row">
+          <span><strong>参与红包类型</strong><small>只分配符合所选类型的红包，默认仅参与钻石红包</small></span>
+          <div class="participation-packet-type-options" role="radiogroup" aria-label="可以参与的红包类型">
+            {#each [["all", "不限"], ["gift", "礼物红包"], ["diamond", "钻石红包"]] as option}
+              <button
+                type="button"
+                role="radio"
+                aria-checked={participationSettings.packet_type === option[0]}
+                class:active={participationSettings.packet_type === option[0]}
+                disabled={participationSettingsBusy}
+                onclick={() => participationSettings.packet_type = option[0] as ParticipationPacketType}
+              >{option[1]}</button>
+            {/each}
+          </div>
+        </div>
         <label class="participation-setting-row">
           <span><strong>参与停止</strong><small>参与达到指定次数后，不再分配后续红包任务</small></span>
           <span class="number-field"><input type="number" min="0" max="100000" step="1" bind:value={participationSettings.stop_after_joins} /><em>次</em></span>
@@ -5444,7 +5606,7 @@
           <span class:professional={licenseStatus.state === "active"} class="modal-icon license-modal-icon"><ShieldCheck size={18} weight="bold" /></span>
           <h2 id="license-modal-title">授权管理</h2>
         </div>
-        <button class="icon-button" aria-label="关闭" disabled={licenseBusy} onclick={closeLicenseModal}><X size={17} /></button>
+        <button class="icon-button" aria-label="关闭" disabled={licenseBusy || remoteSyncBusy} onclick={closeLicenseModal}><X size={17} /></button>
       </div>
 
       <div class:professional={licenseStatus.state === "active"} class="license-summary">
@@ -5479,20 +5641,82 @@
         {#if licenseReplacing}<p class="license-replace-hint">新授权验证成功后才会替换当前授权。</p>{/if}
       {/if}
 
+      <section
+        class:connected={remoteSyncStatus.enabled && Boolean(remoteSyncStatus.active_endpoint)}
+        class:error={remoteSyncStatus.enabled && Boolean(remoteSyncStatus.last_error) && !remoteSyncStatus.active_endpoint}
+        class="remote-sync-panel"
+        aria-labelledby="remote-sync-title"
+      >
+        <div class="remote-sync-head">
+          <span class="remote-sync-icon"><CloudArrowUp size={15} weight="bold" /></span>
+          <div>
+            <strong id="remote-sync-title">远程同步</strong>
+            <small>仅同步直播间与红包数据</small>
+          </div>
+          <span class="remote-sync-state">{remoteSyncStateLabel(remoteSyncStatus)}</span>
+        </div>
+
+        <div class="remote-sync-details">
+          <span><small>当前线路</small><strong>{remoteSyncLineLabel(remoteSyncStatus)}</strong></span>
+          <span><small>待同步</small><strong>{remoteSyncStatus.pending} 条</strong></span>
+          <span><small>最近成功</small><strong>{formatLicenseDate(remoteSyncStatus.last_success_at, "暂无")}</strong></span>
+        </div>
+
+        {#if !remoteSyncStatus.configured || remoteSyncEditing}
+          <label class="field remote-sync-token-field">
+            <span>服务器注册令牌</span>
+            <input
+              type="password"
+              bind:value={remoteSyncToken}
+              placeholder="输入服务器安装完成后生成的注册令牌"
+              autocomplete="off"
+              spellcheck="false"
+              onkeydown={(event) => event.key === "Enter" && saveRemoteSyncToken()}
+            />
+          </label>
+          <p class="remote-sync-hint">令牌验证成功后会自动兑换成设备凭证，客户端不会再次显示明文。</p>
+          <div class="remote-sync-actions">
+            {#if remoteSyncEditing}
+              <button class="secondary-button" disabled={remoteSyncBusy} onclick={cancelRemoteSyncTokenChange}>取消</button>
+            {/if}
+            <button class="primary-action" disabled={remoteSyncBusy || !remoteSyncToken.trim()} onclick={saveRemoteSyncToken}>
+              {#if remoteSyncBusy}<ArrowClockwise class="spinning" size={13} />{:else}<CloudArrowUp size={13} />{/if}
+              {remoteSyncBusy ? "连接中…" : "保存并连接"}
+            </button>
+          </div>
+        {:else}
+          <div class="remote-sync-actions">
+            <button class="secondary-button" disabled={remoteSyncBusy} onclick={beginRemoteSyncTokenChange}><PencilSimple size={12} />更换令牌</button>
+            <button
+              class:danger={remoteSyncStatus.enabled}
+              class="secondary-button remote-sync-toggle"
+              disabled={remoteSyncBusy}
+              onclick={() => configureRemoteSync(!remoteSyncStatus.enabled)}
+            >{remoteSyncStatus.enabled ? "停用同步" : "启用同步"}</button>
+          </div>
+        {/if}
+
+        {#if remoteSyncError}
+          <div class="remote-sync-error"><WarningCircle size={13} />{remoteSyncError}</div>
+        {:else if remoteSyncStatus.enabled && remoteSyncStatus.last_error && !remoteSyncStatus.active_endpoint}
+          <div class="remote-sync-error"><WarningCircle size={13} />{remoteSyncStatus.last_error}</div>
+        {/if}
+      </section>
+
       {#if licenseError}<div class="license-error"><WarningCircle size={14} />{licenseError}</div>{/if}
       <div class="modal-actions">
-        <button class="secondary-button" disabled={licenseBusy} onclick={licenseReplacing ? cancelLicenseReplacement : closeLicenseModal}>{licenseReplacing ? "取消更换" : "关闭"}</button>
+        <button class="secondary-button" disabled={licenseBusy || remoteSyncBusy} onclick={licenseReplacing ? cancelLicenseReplacement : closeLicenseModal}>{licenseReplacing ? "取消更换" : "关闭"}</button>
         {#if licenseStatus.state === "active" && !licenseReplacing}
-          <button class="primary-action" disabled={licenseBusy} onclick={refreshLicense}>
+          <button class="primary-action" disabled={licenseBusy || remoteSyncBusy} onclick={refreshLicense}>
             <ArrowClockwise class={licenseBusy ? "spinning" : undefined} size={14} />{licenseBusy ? "刷新中…" : "刷新授权"}
           </button>
         {:else if licenseReplacing}
-          <button class="primary-action" disabled={licenseBusy || !licenseKey.trim()} onclick={activateLicense}>
+          <button class="primary-action" disabled={licenseBusy || remoteSyncBusy || !licenseKey.trim()} onclick={activateLicense}>
             {#if licenseBusy}<ArrowClockwise class="spinning" size={14} />{:else}<ShieldCheck size={14} />{/if}
             {licenseBusy ? "验证中…" : "确认更换"}
           </button>
         {:else}
-          <button class="primary-action" disabled={licenseBusy || !licenseKey.trim()} onclick={activateLicense}>
+          <button class="primary-action" disabled={licenseBusy || remoteSyncBusy || !licenseKey.trim()} onclick={activateLicense}>
             {#if licenseBusy}<ArrowClockwise class="spinning" size={14} />{:else}<ShieldCheck size={14} />{/if}
             {licenseBusy ? "激活中…" : "激活专业版"}
           </button>

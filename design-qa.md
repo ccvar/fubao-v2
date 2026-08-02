@@ -127,6 +127,44 @@
 
 final result: passed
 
+## Authorization-managed remote synchronization token
+
+### Evidence
+
+- Source visual truth: `/var/folders/hv/v_cz9tgs4b74bg3qdvssct_h0000gn/T/codex-clipboard-2cca8b82-b299-4a7f-88ba-ed87ca2efc4c.png` (1080 × 606 px).
+- Browser-rendered implementation: `artifacts/design-qa/remote-sync-license-modal.png` (1111 × 720 px at 1× browser density).
+- The reference and implementation captures were inspected together in one comparison input. The reference shows the professional-license state, while the standalone browser implementation necessarily shows the free-license state because it has no Tauri sidecar; fidelity judgment is scoped to the shared authorization-modal anatomy and the new remote-sync section.
+
+### Full-view and focused comparison
+
+- The authorization dialog retains the established white surface, compact header, quiet summary card, rounded fields, restrained green state color, 30 px footer actions, and blurred backdrop.
+- “远程同步” is an independent section below licensing rather than being confused with the professional-edition activation state.
+- The section exposes only safe operational metadata: connection state, active line, pending count, and most recent success time.
+- The enrollment-token field is password-masked. Supporting copy explains that successful validation exchanges it for a device credential and that plaintext will not be shown again.
+- The dialog remains fully visible at the 1111 × 720 validation viewport and gains internal vertical scrolling for shorter desktop viewports.
+
+### Interaction and runtime verification
+
+- The unique “服务器注册令牌” input enables “保存并连接” only while non-empty; keyboard clearing restores the disabled state.
+- No test token was submitted to the real server during visual verification.
+- The Go configuration test verifies successful registration, removal of the enrollment token from the private configuration file, retention of the device credential when sync is disabled, and preservation of a working registration when a replacement token fails.
+- The current Tauri development client was rebuilt and restarted from this repository on strict port 1437.
+
+### Required fidelity surfaces
+
+- Typography: existing system font, compact 9–12 px secondary hierarchy, and established weights are reused.
+- Spacing and layout: the section uses the same 11 px radius, quiet inset cards, 6–9 px gaps, and right-aligned modal actions as the license surface.
+- Colors and tokens: the existing neutral/green/error palette is reused; no new decorative palette was introduced.
+- Image and icon quality: the existing Phosphor cloud-upload, pencil, warning, shield, and refresh components are used; no placeholder or improvised artwork was added.
+- Copy and content: the new labels clearly separate licensing from remote data synchronization and do not expose raw credentials.
+
+### Findings
+
+- No actionable P0, P1, or P2 visual or interaction differences remain for the requested token configuration inside “授权管理”.
+- P3/expected difference: the standalone browser capture cannot display the native professional-license state or live Go sync status, both of which remain available in the actual Tauri client.
+
+final result: passed
+
 ## Windows topbar without sidebar collapsing
 
 ### Evidence

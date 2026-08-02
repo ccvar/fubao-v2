@@ -34,21 +34,105 @@ type FollowingLiveRoom struct {
 	StreamerName string
 }
 
+type CenterRoom struct {
+	WebRID          string
+	ActualRoomID    string
+	Title           string
+	StreamerName    string
+	LiveStatus      string
+	LiveStartedAt   string
+	LastSeenLiveAt  string
+	LastEventAt     string
+	CenterUpdatedAt string
+}
+
 type Room struct {
-	ID               string         `json:"id"`
-	WebRID           string         `json:"web_rid,omitempty"`
-	ActualRoomID     string         `json:"actual_room_id,omitempty"`
-	Name             string         `json:"name,omitempty"`
-	StreamerName     string         `json:"streamer_name,omitempty"`
-	MonitorStatus    string         `json:"monitor_status"`
-	ConnectionStatus string         `json:"connection_status"`
-	Enabled          bool           `json:"enabled"`
-	Source           string         `json:"source,omitempty"`
-	FollowSources    []FollowSource `json:"follow_sources,omitempty"`
-	FollowingLive    bool           `json:"following_live,omitempty"`
-	LastSeenLiveAt   string         `json:"last_seen_live_at,omitempty"`
-	CreatedAt        string         `json:"created_at"`
-	UpdatedAt        string         `json:"updated_at"`
+	ID                string         `json:"id"`
+	WebRID            string         `json:"web_rid,omitempty"`
+	ActualRoomID      string         `json:"actual_room_id,omitempty"`
+	Name              string         `json:"name,omitempty"`
+	StreamerName      string         `json:"streamer_name,omitempty"`
+	MonitorStatus     string         `json:"monitor_status"`
+	ConnectionStatus  string         `json:"connection_status"`
+	Enabled           bool           `json:"enabled"`
+	Source            string         `json:"source,omitempty"`
+	FollowSources     []FollowSource `json:"follow_sources,omitempty"`
+	FollowingLive     bool           `json:"following_live,omitempty"`
+	LastSeenLiveAt    string         `json:"last_seen_live_at,omitempty"`
+	CenterLiveStatus  string         `json:"center_live_status,omitempty"`
+	CenterLiveAt      string         `json:"center_live_at,omitempty"`
+	CenterLastEventAt string         `json:"center_last_event_at,omitempty"`
+	CreatedAt         string         `json:"created_at"`
+	UpdatedAt         string         `json:"updated_at"`
+}
+
+// MergeCenter adds safe room metadata learned from the shared center. A room
+// that already exists locally keeps its original source; only rows first
+// learned from the server are labeled as center data.
+func (s *Store) MergeCenter(items []CenterRoom) (MigrationResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := MigrationResult{}
+	changed := false
+	for _, item := range items {
+		webRID := strings.TrimSpace(item.WebRID)
+		if !validRoomID(webRID) {
+			result.Invalid++
+			continue
+		}
+		var room *Room
+		for _, candidate := range s.rooms {
+			if candidate.ID == webRID || candidate.WebRID == webRID || (item.ActualRoomID != "" && candidate.ActualRoomID == item.ActualRoomID) {
+				room = candidate
+				break
+			}
+		}
+		if room == nil {
+			createdAt := firstNonEmpty(item.CenterUpdatedAt, time.Now().Format(time.RFC3339Nano))
+			room = &Room{
+				ID: webRID, WebRID: webRID, ActualRoomID: strings.TrimSpace(item.ActualRoomID),
+				Name: strings.TrimSpace(item.Title), StreamerName: strings.TrimSpace(item.StreamerName),
+				MonitorStatus: "stopped", ConnectionStatus: "disconnected", Enabled: true,
+				Source: "center", CreatedAt: createdAt, UpdatedAt: createdAt,
+			}
+			s.rooms[room.ID] = room
+			result.Imported++
+			changed = true
+		} else {
+			result.Merged++
+		}
+		if value := strings.TrimSpace(item.ActualRoomID); value != "" && room.ActualRoomID == "" {
+			room.ActualRoomID = value
+			changed = true
+		}
+		if value := strings.TrimSpace(item.Title); value != "" && (room.Name == "" || room.Source == "center") && room.Name != value {
+			room.Name = value
+			changed = true
+		}
+		if value := strings.TrimSpace(item.StreamerName); value != "" && (room.StreamerName == "" || room.Source == "center") && room.StreamerName != value {
+			room.StreamerName = value
+			changed = true
+		}
+		centerLiveAt := firstNonEmpty(item.LastSeenLiveAt, item.LiveStartedAt, item.CenterUpdatedAt)
+		if room.CenterLiveStatus != item.LiveStatus || room.CenterLiveAt != centerLiveAt || room.CenterLastEventAt != item.LastEventAt {
+			room.CenterLiveStatus = strings.TrimSpace(item.LiveStatus)
+			room.CenterLiveAt = strings.TrimSpace(centerLiveAt)
+			room.CenterLastEventAt = strings.TrimSpace(item.LastEventAt)
+			changed = true
+		}
+		if room.Source == "center" && item.CenterUpdatedAt > room.UpdatedAt {
+			room.UpdatedAt = item.CenterUpdatedAt
+			changed = true
+		}
+	}
+	result.Total = len(s.rooms)
+	if !changed {
+		return result, nil
+	}
+	if err := s.saveLocked(); err != nil {
+		return MigrationResult{}, err
+	}
+	return result, nil
 }
 
 type MigrationResult struct {
@@ -249,6 +333,11 @@ func (s *Store) SyncFollowingLive(accountID, accountName string, items []Followi
 			roomChanged = true
 		} else {
 			result.Merged++
+			if room.Source == "center" {
+				room.Source = "following-live"
+				changed = true
+				roomChanged = true
+			}
 		}
 
 		if room.WebRID != webRID {
@@ -426,6 +515,10 @@ func (s *Store) ImportIDs(raw string) (MigrationResult, error) {
 			}
 		}
 		if existing != nil {
+			if existing.Source == "center" {
+				existing.Source = "manual"
+				existing.UpdatedAt = now
+			}
 			result.Merged++
 			continue
 		}

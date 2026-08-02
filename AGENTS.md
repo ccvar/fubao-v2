@@ -8,6 +8,8 @@ For Douyin browser instances, use the legacy 福宝/DY-KIRO Chrome 124 user agen
 
 Never enqueue full-account CK revalidation during account-list or browser-list rendering. The Go sidecar's interactive credential and browser-window requests must remain immediately responsive; use persisted CK health for list rendering and perform a fresh online check only for the account being explicitly rebound or otherwise acted on.
 
+Embedded browser Cookie polling is adaptive. Keep the lightweight scheduler at five seconds, but only unknown, expired, or actively logging-in mounted instances receive five-second native checks and the compact checking indicator. Once an instance is confirmed logged in, check it at most once per 60 seconds and do so silently. A completed first page load, explicit CK rebind, or “打开实例” action still forces an immediate check. Temporary inspection or network failures remain unknown and must never become CK expiry by timeout alone.
+
 In participation and monitoring account rows, keep CK health on the first line and role-specific statistics on the second line. When CK is expired, place a compact “重新绑定 CK” icon immediately after the expired badge. Rebinding opens an isolated native Douyin child WebView inside the rebind panel for that canonical account; do not create a second Tauri `WebviewWindow`, because that path blocks the macOS main run loop in this app. After the user confirms login completion, Rust reads the new Douyin cookies, sends them directly over the authenticated native channel to the Go store, forces CK validation, and refreshes account/browser health without exposing raw cookies to the frontend.
 
 The account status filter stays compact and exposes only “可用”, “CK 失效”, and “冷却中” in addition to “全部状态”. Account-row delete icons remain low-contrast by default and become prominent only on hover or keyboard focus.
@@ -54,7 +56,7 @@ The sidebar names its live counters section “数据概览”. A separate “�
 
 The sidebar recent-activity list displays the complete persisted history returned by the Go store (currently up to 100 newest entries) in its own scrollable region; never impose a smaller frontend-only item cap such as four rows.
 
-The recent-activity region uses a permanently reserved, thin Pilot-style internal scrollbar with a quiet light-gray track and rounded thumb. Keep its visible rail close to the sidebar divider with only a minimal inset while retaining a wider invisible hit area for dragging. Scrolling remains contained within recent activity so the data overview and fixed workspace footer do not move.
+The recent-activity region uses a permanently reserved, thin Pilot-style internal scrollbar with no visible track background and only a rounded gray thumb. Keep the visible thumb close to the sidebar divider with only a minimal inset while retaining a wider invisible hit area for dragging. Scrolling remains contained within recent activity so the data overview and fixed workspace footer do not move.
 
 Keep the “最近活动” section title fixed above its internal scroll viewport; only activity rows participate in scrolling, and the custom track begins below the title.
 
@@ -77,6 +79,8 @@ One participation account owns at most one browser instance. Repeated create/ope
 Successful login inside an independently opened browser instance must return changed Douyin cookies through an authenticated loopback-only channel, update and revalidate the canonical Go account, and refresh its mounted embedded preview. Raw CK must never enter frontend JavaScript.
 
 The compact sidebar footer gear opens 红包参与设置 rather than license management. Its global values are persisted by the Go red-packet store and enforced independently for each participation account: 参与停止 blocks future assignments after the configured joined count, 参与冷却 waits the configured seconds after an accepted join, and 中奖停止 blocks future assignments after the configured confirmed-win count; zero means unlimited. Each explicit browser-account start of red-packet participation appends a safe persistent “参与账号…启动了红包参与” entry to the sidebar recent-activity feed. License management remains available from the edition badge.
+
+红包参与设置包含持久化的参与红包类型规则：“不限 / 礼物红包 / 钻石红包”，默认“钻石红包”。该规则必须由 Go 引擎在创建参与任务前按红包事件的真实类型过滤；类型不明确的红包只能在“不限”时参与，不能只在前端做视觉筛选，且被过滤的红包不得产生请求记录或计入任务次数。
 
 The data-management screen is named “账号与直播间” and orders its tabs as “红包 / 直播间 / 参与账号 / 监测账号”. The red-packet monitor reuses 福宝’s signed `luckybox/box/list` request path (with `lottery_info` as a safe fallback) but must surface only explicit 红包 payloads; 福袋/lottery payloads are filtered out. Legacy room migration copies `rooms_config.json` into the Go engine’s permission-restricted local store and must never modify the old 福宝 data. The top-bar action is named “导入数据”, with “导入直播间” kept as a distinct first menu action.
 
@@ -189,3 +193,9 @@ On Windows, retain the native caption and system window controls. Keep the sideb
 浏览器实例页的标题副文案在“本机运行”后紧凑显示实时 CPU 与内存占用百分比；资源数据由 Go 原生层采样并随现有容量轮询刷新，详细内存用量使用共享暗色 Tooltip 展示。
 
 远程同步服务与桌面客户端保留在同一个仓库，但使用独立的 `fubao-sync-server` Go 二进制、`server-v*` 版本和 GitHub 构建发布流程。客户端默认只与 `https://fbv2.ccvar.com/api/v1` 通信，通过权限受限的 Go 私有配置保存设备令牌，并使用可恢复的本地 Outbox 非阻塞地同步直播间状态与红包事件。远程协议只允许经过白名单定义的安全字段；Cookie、签名、请求头、原始接口响应、参与账号凭证以及不必要的本地账号标识不得离开 Go 原生层。服务端由 systemd 运行、Caddy 终止 HTTPS、SQLite 持久化，并以幂等键处理客户端至少一次投递。
+
+远程同步客户端先以 `https://fbv2.ccvar.com/healthz` 验证标准入口；健康检查或后续服务请求不可用时，自动降级到 `https://fbv2.ccvar.com:8087/healthz` 与对应的 `/api/v1` 入口。备用入口稳定后短期保持使用，随后自动重试标准入口；鉴权或参数类 4xx 错误不得通过切换端口掩盖。服务端 Caddy 配置必须同时提供标准 HTTPS 和 HTTPS 8087，安装提示明确要求放行 TCP 8087。
+
+远程直播间/红包同步由用户在“授权管理”中配置。界面只接收服务端注册令牌并直接交给 Go 引擎；启用同步前必须先兑换为设备凭证，状态接口不得返回注册令牌或设备凭证，兑换成功后不得再次显示注册令牌明文。更换令牌验证失败时必须保留上一套可用设备注册。
+
+所有绑定中心服务的客户端共享直播间与红包业务数据。任一客户端的本地发现按稳定直播间/红包标识上传中心库，其他客户端使用持久化增量游标自动拉取并合并；本机产生的记录保留本地来源，仅从远端取得的记录在直播间和红包列表明确标记“来源于中心库”。客户端必须忽略自身中心变更并禁止把纯中心来源数据回传，避免循环同步；Cookie、账号、签名、请求上下文和参与数据仍不得同步。

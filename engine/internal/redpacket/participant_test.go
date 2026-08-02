@@ -167,7 +167,7 @@ func TestParticipantDeduplicatesAccountAndEvent(t *testing.T) {
 	}
 	poster := &fakePoster{responses: []*http.Response{jsonResponse(200, `{"status_code":0,"data":{"succeed":true}}`)}}
 	participant := newParticipant(store, 1, func(Event, accounts.RedPacketParticipationCredential) signedPoster { return poster }, recordStore)
-	event := Event{ID: "monitor:event-1", PacketID: "box-1", JoinBoxID: "box-1", ActualRoomID: "7001"}
+	event := Event{ID: "monitor:event-1", PacketID: "box-1", JoinBoxID: "box-1", ActualRoomID: "7001", Title: "钻石红包"}
 	participant.HandleEvent(event)
 	participant.HandleEvent(event)
 	select {
@@ -243,7 +243,7 @@ func TestParticipantMinimumDiamondsOnlyBlocksKnownBelowThreshold(t *testing.T) {
 
 	participant.HandleEvent(Event{
 		ID: "event-below-minimum", JoinBoxID: "10001", ActualRoomID: "7001",
-		TotalDiamonds: 20, ShareCount: 15,
+		Title: "钻石红包", TotalDiamonds: 20, ShareCount: 15,
 	})
 	time.Sleep(20 * time.Millisecond)
 	poster.mu.Lock()
@@ -257,7 +257,7 @@ func TestParticipantMinimumDiamondsOnlyBlocksKnownBelowThreshold(t *testing.T) {
 	}
 
 	participant.HandleEvent(Event{
-		ID: "event-unknown-amount", JoinBoxID: "10002", ActualRoomID: "7001", Prize: "红包金额待解析",
+		ID: "event-unknown-amount", JoinBoxID: "10002", ActualRoomID: "7001", Title: "钻石红包", Prize: "红包金额待解析",
 	})
 	select {
 	case <-store.notify:
@@ -276,6 +276,53 @@ func TestParticipantMinimumDiamondsOnlyBlocksKnownBelowThreshold(t *testing.T) {
 	}
 	if perShare, known := eventDiamondsPerShare(Event{Prize: "总40钻，15份红包"}); !known || perShare != 40.0/15.0 {
 		t.Fatalf("total/share prize not parsed: value=%v known=%v", perShare, known)
+	}
+}
+
+func TestParticipantFiltersConfiguredPacketTypeBeforeDispatch(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{PacketType: ParticipationPacketTypeGift}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationStarted("account-type", "类型账号"); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeParticipationStore{
+		credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-type", Cookie: "sessionid_ss=ok"}},
+		notify:      make(chan struct{}, 1),
+	}
+	poster := &fakePoster{responses: []*http.Response{jsonResponse(200, `{"status_code":0,"data":{"succeed":true}}`)}}
+	participant := newParticipant(store, 1, func(Event, accounts.RedPacketParticipationCredential) signedPoster { return poster }, recordStore)
+
+	participant.HandleEvent(Event{
+		ID: "event-diamond", JoinBoxID: "20001", ActualRoomID: "7001", Title: "钻石红包",
+	})
+	participant.HandleEvent(Event{
+		ID: "event-unknown", JoinBoxID: "20002", ActualRoomID: "7001", Title: "直播间红包",
+	})
+	time.Sleep(20 * time.Millisecond)
+	poster.mu.Lock()
+	blockedCalls := poster.calls
+	poster.mu.Unlock()
+	if blockedCalls != 0 {
+		t.Fatalf("non-gift and unknown packets must be filtered before dispatch, calls=%d", blockedCalls)
+	}
+
+	participant.HandleEvent(Event{
+		ID: "event-gift", JoinBoxID: "20003", ActualRoomID: "7001", Title: "礼物红包",
+	})
+	select {
+	case <-store.notify:
+	case <-time.After(time.Second):
+		t.Fatal("matching gift packet was not dispatched")
+	}
+	poster.mu.Lock()
+	defer poster.mu.Unlock()
+	if poster.calls != 1 {
+		t.Fatalf("matching gift packet should dispatch exactly once, calls=%d", poster.calls)
 	}
 }
 
@@ -347,7 +394,7 @@ func TestPageParticipantStoppedBeforeRequestReleasesReservation(t *testing.T) {
 	participant := NewPageParticipant(store, executor, recordStore)
 	event := Event{
 		ID: "monitor:stopped-event", WebRID: "7654321", ActualRoomID: "700001",
-		JoinBoxID: "7669047909329177395",
+		JoinBoxID: "7669047909329177395", Title: "钻石红包",
 	}
 	participant.HandleEvent(event)
 	deadline := time.Now().Add(time.Second)
@@ -461,7 +508,7 @@ func TestPageParticipantAutoFinishesLimitedTaskAndNextStartIsFresh(t *testing.T)
 		},
 	}
 	participant := NewPageParticipant(store, executor, recordStore)
-	participant.HandleEvent(Event{ID: "task-event", WebRID: "7654321", ActualRoomID: "700001", JoinBoxID: "7669047909329177395"})
+	participant.HandleEvent(Event{ID: "task-event", WebRID: "7654321", ActualRoomID: "700001", JoinBoxID: "7669047909329177395", Title: "钻石红包"})
 	select {
 	case <-store.notify:
 	case <-time.After(time.Second):

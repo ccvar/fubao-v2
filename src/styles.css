@@ -400,17 +400,6 @@ button {
   cursor: pointer;
 }
 
-.recent-activity-scrollbar::before {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  left: 5px;
-  width: 3px;
-  border-radius: 999px;
-  background: #efede9;
-  content: "";
-}
-
 .recent-activity-scrollbar > span {
   position: absolute;
   right: 0;
@@ -3774,7 +3763,9 @@ label.browser-column-control[data-tooltip]:focus-within {
 
 .license-modal {
   width: min(500px, 100%);
+  max-height: calc(100vh - 44px);
   padding: 18px;
+  overflow-y: auto;
 }
 
 .participation-settings-modal {
@@ -4208,6 +4199,54 @@ label.browser-column-control[data-tooltip]:focus-within {
   line-height: 1.45;
 }
 
+.participation-packet-type-row {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+}
+
+.participation-packet-type-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid #e2ded7;
+  border-radius: 9px;
+  background: #f4f1ec;
+}
+
+.participation-packet-type-options button {
+  min-width: 0;
+  height: 27px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #79736b;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.participation-packet-type-options button:hover:not(:disabled) {
+  color: #4e4942;
+}
+
+.participation-packet-type-options button.active {
+  background: #fff;
+  color: #b84f3e;
+  font-weight: 650;
+  box-shadow: 0 1px 3px rgb(59 48 36 / 10%);
+}
+
+.participation-packet-type-options button:focus-visible {
+  outline: 2px solid rgb(207 117 101 / 24%);
+  outline-offset: 1px;
+}
+
+.participation-packet-type-options button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
 .participation-setting-row .number-field {
   display: flex;
   width: 108px;
@@ -4480,6 +4519,160 @@ label.browser-column-control[data-tooltip]:focus-within {
   margin: 6px 0 0;
   color: #98938b;
   font-size: 9.5px;
+}
+
+.remote-sync-panel {
+  display: grid;
+  gap: 9px;
+  margin-top: 13px;
+  padding: 11px;
+  border: 1px solid #e4e1db;
+  border-radius: 11px;
+  background: #faf9f7;
+}
+
+.remote-sync-panel.connected {
+  border-color: #d6eadf;
+  background: #f5faf7;
+}
+
+.remote-sync-panel.error {
+  border-color: #efd8d2;
+  background: #fff8f6;
+}
+
+.remote-sync-head {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.remote-sync-icon {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  background: #e8f3ee;
+  color: #328566;
+  place-items: center;
+}
+
+.remote-sync-head > div {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.remote-sync-head strong {
+  color: #45413b;
+  font-size: 11.5px;
+}
+
+.remote-sync-head small,
+.remote-sync-details small {
+  color: #99948c;
+  font-size: 9px;
+}
+
+.remote-sync-state {
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: #ebe8e2;
+  color: #777168;
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.remote-sync-panel.connected .remote-sync-state {
+  background: #dcefe6;
+  color: #26795a;
+}
+
+.remote-sync-panel.error .remote-sync-state {
+  background: #f6dfda;
+  color: #b75243;
+}
+
+.remote-sync-details {
+  display: grid;
+  grid-template-columns: 1fr 0.7fr 1.25fr;
+  gap: 6px;
+}
+
+.remote-sync-details > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  padding: 7px 8px;
+  border-radius: 8px;
+  background: rgb(255 255 255 / 72%);
+}
+
+.remote-sync-details strong {
+  overflow: hidden;
+  color: #5b564f;
+  font-size: 9.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.remote-sync-token-field {
+  margin-top: 0;
+  gap: 5px;
+}
+
+.remote-sync-token-field input {
+  height: 34px;
+  border-radius: 8px;
+  font-size: 10.5px;
+}
+
+.remote-sync-hint {
+  margin: -2px 0 0;
+  color: #99948c;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.remote-sync-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.remote-sync-actions > button {
+  min-height: 30px;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 8px;
+  font-size: 10.5px;
+}
+
+.remote-sync-toggle.danger {
+  border-color: #ead6d1;
+  color: #b45243;
+}
+
+.remote-sync-toggle.danger:hover,
+.remote-sync-toggle.danger:focus-visible {
+  border-color: #ddbdb6;
+  background: #fff4f1;
+}
+
+.remote-sync-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  color: #bd493b;
+  font-size: 9.5px;
+  line-height: 1.4;
+}
+
+.remote-sync-error svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
 }
 
 .license-error {

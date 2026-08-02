@@ -13,6 +13,7 @@ const (
 	DefaultEndpoint         = "https://fbv2.ccvar.com/api/v1"
 	DefaultFallbackEndpoint = "https://fbv2.ccvar.com:8087/api/v1"
 	MaxBatchItems           = 200
+	MaxChanges              = 200
 )
 
 type ItemType string
@@ -57,6 +58,21 @@ type RegisterResponse struct {
 	Version     int    `json:"version"`
 	ClientID    string `json:"client_id"`
 	DeviceToken string `json:"device_token"`
+}
+
+type Change struct {
+	Cursor         int64           `json:"cursor"`
+	Type           ItemType        `json:"type"`
+	OriginClientID string          `json:"origin_client_id"`
+	ChangedAt      string          `json:"changed_at"`
+	Payload        json.RawMessage `json:"payload"`
+}
+
+type ChangesResponse struct {
+	Version    int      `json:"version"`
+	NextCursor int64    `json:"next_cursor"`
+	HasMore    bool     `json:"has_more"`
+	Changes    []Change `json:"changes"`
 }
 
 type RoomState struct {

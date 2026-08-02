@@ -26,6 +26,23 @@ curl -fsSL https://raw.githubusercontent.com/ccvar/fubao-v2-releases/main/instal
 
 首次连接成功后，客户端会用独立设备令牌替换注册令牌。两个令牌都只保存在权限为 `0600` 的 Go 数据文件中。
 
+## 原地升级
+
+服务器后续升级继续执行同一条一键安装命令：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ccvar/fubao-v2-releases/main/install-sync-server.sh | sudo sh
+```
+
+升级器会通过 SQLite 在线备份在 `/var/lib/fubao-sync/backups/` 创建升级前快照、保留现有数据库与注册令牌，原子替换二进制后明确重启 systemd 服务。新版本需要的数据库表会在首次启动时自动迁移，无需手工导入。
+
+升级后确认版本和服务状态：
+
+```sh
+curl -fsS https://fbv2.ccvar.com/healthz | python3 -m json.tool
+systemctl status fubao-sync --no-pager
+```
+
 ## 运维
 
 ```sh

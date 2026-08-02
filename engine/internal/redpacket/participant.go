@@ -204,12 +204,38 @@ func (p *Participant) HandleEvent(event Event) {
 		strings.TrimSpace(event.JoinBoxID) == "" || strings.TrimSpace(event.ActualRoomID) == "" {
 		return
 	}
+	if !p.matchesPacketType(event) {
+		return
+	}
 	if !p.meetsMinimumDiamonds(event) {
 		return
 	}
 	for _, credential := range p.store.RedPacketParticipationCredentials(time.Now()) {
 		p.dispatch(event, credential)
 	}
+}
+
+func (p *Participant) matchesPacketType(event Event) bool {
+	settingsStore, ok := p.recordStore.(participationSettingsStore)
+	if !ok {
+		return true
+	}
+	wanted := settingsStore.GetParticipationSettings().PacketType
+	if wanted == ParticipationPacketTypeAll {
+		return true
+	}
+	return eventParticipationPacketType(event) == wanted
+}
+
+func eventParticipationPacketType(event Event) string {
+	text := strings.ToLower(strings.TrimSpace(event.Title + " " + event.Prize))
+	if strings.Contains(text, "钻石") || strings.Contains(text, "diamond") {
+		return ParticipationPacketTypeDiamond
+	}
+	if strings.Contains(text, "礼物") || strings.Contains(text, "gift") {
+		return ParticipationPacketTypeGift
+	}
+	return ""
 }
 
 func (p *Participant) meetsMinimumDiamonds(event Event) bool {

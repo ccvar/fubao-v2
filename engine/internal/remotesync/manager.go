@@ -40,6 +40,7 @@ type Config struct {
 	FallbackEndpoint string `json:"fallback_endpoint"`
 	EnrollmentToken  string `json:"enrollment_token,omitempty"`
 	DeviceToken      string `json:"device_token,omitempty"`
+	PullCursor       int64  `json:"pull_cursor,omitempty"`
 }
 
 type Status struct {
@@ -62,6 +63,7 @@ type outboxFile struct {
 
 type Manager struct {
 	mu             sync.Mutex
+	connectMu      sync.Mutex
 	dataDir        string
 	configPath     string
 	outboxPath     string
@@ -209,9 +211,6 @@ func (m *Manager) Status() Status {
 }
 
 func (m *Manager) Run(ctx context.Context) {
-	if !m.enabled() {
-		return
-	}
 	m.attempt(ctx)
 	ticker := time.NewTicker(flushInterval)
 	defer ticker.Stop()
@@ -226,6 +225,9 @@ func (m *Manager) Run(ctx context.Context) {
 }
 
 func (m *Manager) attempt(ctx context.Context) {
+	if !m.enabled() {
+		return
+	}
 	if err := m.ensureRegistered(ctx); err != nil {
 		m.recordError(err)
 		return
@@ -244,6 +246,12 @@ func (m *Manager) attempt(ctx context.Context) {
 }
 
 func (m *Manager) ensureRegistered(ctx context.Context) error {
+	m.connectMu.Lock()
+	defer m.connectMu.Unlock()
+	return m.ensureRegisteredLocked(ctx)
+}
+
+func (m *Manager) ensureRegisteredLocked(ctx context.Context) error {
 	m.mu.Lock()
 	if m.config.DeviceToken != "" {
 		m.mu.Unlock()
@@ -273,6 +281,56 @@ func (m *Manager) ensureRegistered(ctx context.Context) error {
 	err := m.saveConfigLocked()
 	m.mu.Unlock()
 	return err
+}
+
+func (m *Manager) Configure(ctx context.Context, enabled bool, enrollmentToken string) (Status, error) {
+	m.connectMu.Lock()
+	defer m.connectMu.Unlock()
+
+	enrollmentToken = strings.TrimSpace(enrollmentToken)
+	if enrollmentToken != "" && len(enrollmentToken) < 32 {
+		return m.Status(), errors.New("服务器注册令牌至少需要 32 个字符")
+	}
+	m.mu.Lock()
+	previous := m.config
+	previousActiveEndpoint := m.activeEndpoint
+	previousActiveSince := m.activeSince
+	if enrollmentToken != "" {
+		m.config.EnrollmentToken = enrollmentToken
+		m.config.DeviceToken = ""
+		m.activeEndpoint = ""
+		m.activeSince = time.Time{}
+		m.config.PullCursor = 0
+	}
+	if enabled && m.config.DeviceToken == "" && m.config.EnrollmentToken == "" {
+		m.mu.Unlock()
+		return m.Status(), errors.New("请输入服务器安装时生成的注册令牌")
+	}
+	m.config.Enabled = enabled
+	if err := m.saveConfigLocked(); err != nil {
+		m.config = previous
+		m.mu.Unlock()
+		return m.Status(), err
+	}
+	m.mu.Unlock()
+	if !enabled {
+		return m.Status(), nil
+	}
+	if err := m.ensureRegisteredLocked(ctx); err != nil {
+		m.mu.Lock()
+		m.config = previous
+		m.activeEndpoint = previousActiveEndpoint
+		m.activeSince = previousActiveSince
+		restoreErr := m.saveConfigLocked()
+		m.mu.Unlock()
+		m.recordError(err)
+		if restoreErr != nil {
+			return m.Status(), fmt.Errorf("%v；恢复原远程同步配置失败: %w", err, restoreErr)
+		}
+		return m.Status(), err
+	}
+	m.recordSuccess()
+	return m.Status(), nil
 }
 
 func (m *Manager) flushOnce(ctx context.Context) (bool, error) {
@@ -383,6 +441,49 @@ func (m *Manager) postJSONTo(ctx context.Context, target, token string, body []b
 	return nil
 }
 
+func (m *Manager) getJSON(ctx context.Context, route, token string, output any) error {
+	var failures []string
+	for _, endpoint := range m.endpointCandidates() {
+		if err := m.probeHealth(ctx, endpoint); err != nil {
+			failures = append(failures, endpoint+": "+err.Error())
+			continue
+		}
+		err := m.getJSONFrom(ctx, endpoint+route, token, output)
+		if err == nil {
+			m.markEndpointActive(endpoint)
+			return nil
+		}
+		var statusErr *remoteStatusError
+		if errors.As(err, &statusErr) && statusErr.status >= 400 && statusErr.status < 500 {
+			return err
+		}
+		failures = append(failures, endpoint+": "+err.Error())
+	}
+	return fmt.Errorf("远程同步主备入口均不可用: %s", strings.Join(failures, "; "))
+}
+
+func (m *Manager) getJSONFrom(ctx context.Context, target, token string, output any) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("Authorization", "Bearer "+token)
+	request.Header.Set("User-Agent", "fubao-engine/0.1")
+	response, err := m.httpClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("远程同步连接失败: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		limited, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
+		return &remoteStatusError{status: response.StatusCode, message: strings.TrimSpace(string(limited))}
+	}
+	if err := json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(output); err != nil {
+		return fmt.Errorf("解析中心库增量响应失败: %w", err)
+	}
+	return nil
+}
+
 func (m *Manager) endpointCandidates() []string {
 	m.mu.Lock()
 	primary, fallback := m.config.Endpoint, m.config.FallbackEndpoint
@@ -462,6 +563,9 @@ func (m *Manager) SyncSnapshot(roomItems []rooms.Room, monitorItems []redpacket.
 		if monitor.ID == "" {
 			monitor = monitorsByRoom[webRID]
 		}
+		if room.Source == "center" && monitor.AccountID == "" && monitor.LastCheckedAt == "" {
+			continue
+		}
 		updatedAt := latestTime(room.UpdatedAt, monitor.UpdatedAt)
 		payload := syncprotocol.RoomState{
 			WebRID: webRID, ActualRoomID: firstNonEmpty(monitor.ActualRoomID, room.ActualRoomID),
@@ -491,7 +595,7 @@ func (m *Manager) SyncSnapshot(roomItems []rooms.Room, monitorItems []redpacket.
 }
 
 func (m *Manager) EnqueueEvent(event redpacket.Event) error {
-	if !m.enabled() {
+	if !m.enabled() || event.DataSource == "center" {
 		return nil
 	}
 	item, ok, err := redPacketItem(event)
@@ -502,6 +606,9 @@ func (m *Manager) EnqueueEvent(event redpacket.Event) error {
 }
 
 func redPacketItem(event redpacket.Event) (syncprotocol.BatchItem, bool, error) {
+	if event.DataSource == "center" {
+		return syncprotocol.BatchItem{}, false, nil
+	}
 	webRID, packetID := strings.TrimSpace(event.WebRID), strings.TrimSpace(event.PacketID)
 	if webRID == "" || packetID == "" {
 		return syncprotocol.BatchItem{}, false, nil
@@ -515,6 +622,89 @@ func redPacketItem(event redpacket.Event) (syncprotocol.BatchItem, bool, error) 
 	}
 	item, err := makeItem(syncprotocol.ItemRedPacket, "red_packet:"+webRID+":"+packetID, event.DetectedAt, payload)
 	return item, err == nil, err
+}
+
+func (m *Manager) PullOnce(ctx context.Context, roomStore *rooms.Store, redPacketStore *redpacket.Store) error {
+	if !m.enabled() || roomStore == nil || redPacketStore == nil {
+		return nil
+	}
+	if err := m.ensureRegistered(ctx); err != nil {
+		m.recordError(err)
+		return err
+	}
+	for page := 0; page < 8; page++ {
+		m.mu.Lock()
+		cursor, clientID, deviceToken := m.config.PullCursor, m.clientID, m.config.DeviceToken
+		m.mu.Unlock()
+		var response syncprotocol.ChangesResponse
+		route := fmt.Sprintf("/sync/changes?cursor=%d&limit=%d", cursor, syncprotocol.MaxChanges)
+		if err := m.getJSON(ctx, route, deviceToken, &response); err != nil {
+			m.recordError(err)
+			return err
+		}
+		if response.Version != syncprotocol.Version || response.NextCursor < cursor {
+			err := errors.New("中心库增量响应无效")
+			m.recordError(err)
+			return err
+		}
+		centerRooms := make([]rooms.CenterRoom, 0)
+		centerEvents := make([]redpacket.CenterEvent, 0)
+		for _, change := range response.Changes {
+			if change.Cursor <= cursor || change.OriginClientID == clientID {
+				continue
+			}
+			switch change.Type {
+			case syncprotocol.ItemRoomState:
+				var item syncprotocol.RoomState
+				if err := json.Unmarshal(change.Payload, &item); err != nil {
+					return fmt.Errorf("解析中心库直播间失败: %w", err)
+				}
+				centerRooms = append(centerRooms, rooms.CenterRoom{
+					WebRID: item.WebRID, ActualRoomID: item.ActualRoomID, Title: item.Title,
+					StreamerName: item.StreamerName, LiveStatus: item.LiveStatus,
+					LiveStartedAt: item.LiveStartedAt, LastSeenLiveAt: item.LastSeenLiveAt,
+					LastEventAt: item.LastEventAt, CenterUpdatedAt: item.UpdatedAt,
+				})
+			case syncprotocol.ItemRedPacket:
+				var item syncprotocol.RedPacket
+				if err := json.Unmarshal(change.Payload, &item); err != nil {
+					return fmt.Errorf("解析中心库红包失败: %w", err)
+				}
+				centerEvents = append(centerEvents, redpacket.CenterEvent{
+					WebRID: item.WebRID, PacketID: item.PacketID, RoomName: item.RoomName,
+					StreamerName: item.StreamerName, Title: item.Title, Prize: item.Prize,
+					Source: item.Source, DetectedAt: item.DetectedAt, DrawAt: item.DrawAt,
+					ExpiresAt: item.ExpiresAt, ParticipantCount: item.ParticipantCount,
+					TotalDiamonds: item.TotalDiamonds, ShareCount: item.ShareCount,
+				})
+			}
+		}
+		if _, err := roomStore.MergeCenter(centerRooms); err != nil {
+			return err
+		}
+		if _, err := redPacketStore.MergeCenter(centerEvents); err != nil {
+			return err
+		}
+		if len(centerRooms) > 0 {
+			if err := redPacketStore.SyncRooms(roomStore.List()); err != nil {
+				return err
+			}
+		}
+		m.mu.Lock()
+		if response.NextCursor > m.config.PullCursor {
+			m.config.PullCursor = response.NextCursor
+			if err := m.saveConfigLocked(); err != nil {
+				m.mu.Unlock()
+				return err
+			}
+		}
+		m.mu.Unlock()
+		m.recordSuccess()
+		if !response.HasMore || len(response.Changes) == 0 {
+			return nil
+		}
+	}
+	return nil
 }
 
 func (m *Manager) enqueue(items []syncprotocol.BatchItem) error {

@@ -60,6 +60,21 @@ func TestRegisterAndSyncBatch(t *testing.T) {
 	if stats.Devices != 1 || stats.Rooms != 1 || stats.RedPacket != 1 {
 		t.Fatalf("unexpected stats: %+v", stats)
 	}
+	var changes syncprotocol.ChangesResponse
+	requestJSON(t, httpServer.Client(), http.MethodGet, httpServer.URL+"/api/v1/sync/changes?cursor=0&limit=200", registration.DeviceToken, nil, http.StatusOK, &changes)
+	if changes.Version != syncprotocol.Version || changes.NextCursor == 0 || len(changes.Changes) != 2 {
+		t.Fatalf("unexpected center changes: %+v", changes)
+	}
+	if changes.Changes[0].OriginClientID != registration.ClientID || changes.Changes[1].OriginClientID != registration.ClientID {
+		t.Fatalf("change origin was not retained: %+v", changes.Changes)
+	}
+	batch.RequestID = "request-2"
+	requestJSON(t, httpServer.Client(), http.MethodPost, httpServer.URL+"/api/v1/sync/batch", registration.DeviceToken, batch, http.StatusOK, &first)
+	var unchanged syncprotocol.ChangesResponse
+	requestJSON(t, httpServer.Client(), http.MethodGet, httpServer.URL+"/api/v1/sync/changes?cursor=0&limit=200", registration.DeviceToken, nil, http.StatusOK, &unchanged)
+	if len(unchanged.Changes) != 2 {
+		t.Fatalf("unchanged snapshot created duplicate center changes: %+v", unchanged.Changes)
+	}
 }
 
 func TestSyncRejectsWrongDeviceToken(t *testing.T) {
@@ -90,9 +105,13 @@ func TestSafeTextPreservesUTF8(t *testing.T) {
 
 func requestJSON(t *testing.T, client *http.Client, method, target, token string, input any, expectedStatus int, output any) {
 	t.Helper()
-	body, err := json.Marshal(input)
-	if err != nil {
-		t.Fatal(err)
+	var body []byte
+	var err error
+	if input != nil {
+		body, err = json.Marshal(input)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	request, err := http.NewRequest(method, target, bytes.NewReader(body))
 	if err != nil {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,7 +38,42 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/healthz", s.health)
 	mux.HandleFunc("POST /api/v1/devices/register", s.register)
 	mux.HandleFunc("POST /api/v1/sync/batch", s.syncBatch)
+	mux.HandleFunc("GET /api/v1/sync/changes", s.syncChanges)
 	return securityHeaders(mux)
+}
+
+func (s *Server) syncChanges(writer http.ResponseWriter, request *http.Request) {
+	token := bearerToken(request)
+	if token == "" {
+		writeJSONError(writer, http.StatusUnauthorized, "missing_device_token", "缺少同步设备令牌")
+		return
+	}
+	clientID, err := s.store.AuthorizeDevice(request.Context(), token)
+	if err != nil {
+		writeJSONError(writer, http.StatusUnauthorized, "invalid_device_token", "同步设备令牌无效")
+		return
+	}
+	cursor, err := strconv.ParseInt(request.URL.Query().Get("cursor"), 10, 64)
+	if err != nil || cursor < 0 {
+		writeJSONError(writer, http.StatusBadRequest, "invalid_cursor", "同步游标无效")
+		return
+	}
+	limit := syncprotocol.MaxChanges
+	if value := strings.TrimSpace(request.URL.Query().Get("limit")); value != "" {
+		parsed, parseErr := strconv.Atoi(value)
+		if parseErr != nil || parsed <= 0 || parsed > syncprotocol.MaxChanges {
+			writeJSONError(writer, http.StatusBadRequest, "invalid_limit", "同步增量数量无效")
+			return
+		}
+		limit = parsed
+	}
+	result, err := s.store.GetChanges(request.Context(), cursor, limit)
+	if err != nil {
+		writeJSONError(writer, http.StatusServiceUnavailable, "changes_unavailable", "中心库增量暂不可用")
+		return
+	}
+	_ = s.store.TouchDevice(request.Context(), clientID)
+	writeJSON(writer, http.StatusOK, result)
 }
 
 func (s *Server) health(writer http.ResponseWriter, request *http.Request) {

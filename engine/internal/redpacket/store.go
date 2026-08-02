@@ -28,6 +28,10 @@ const (
 	offlineProbeInterval = 60 * time.Second
 	livePacketInterval   = 15 * time.Second
 	activePacketInterval = 5 * time.Second
+
+	ParticipationPacketTypeAll     = "all"
+	ParticipationPacketTypeGift    = "gift"
+	ParticipationPacketTypeDiamond = "diamond"
 )
 
 // Monitor is safe metadata returned to the frontend. Cookie values are never
@@ -74,6 +78,7 @@ type Event struct {
 	Title            string  `json:"title,omitempty"`
 	Prize            string  `json:"prize,omitempty"`
 	Source           string  `json:"source"`
+	DataSource       string  `json:"data_source,omitempty"`
 	DetectedAt       string  `json:"detected_at"`
 	DrawAt           string  `json:"draw_at,omitempty"`
 	ExpiresAt        string  `json:"expires_at,omitempty"`
@@ -86,6 +91,22 @@ type Event struct {
 	BoxType          string  `json:"-"`
 	SendTime         string  `json:"-"`
 	DelayTime        string  `json:"-"`
+}
+
+type CenterEvent struct {
+	WebRID           string
+	PacketID         string
+	RoomName         string
+	StreamerName     string
+	Title            string
+	Prize            string
+	Source           string
+	DetectedAt       string
+	DrawAt           string
+	ExpiresAt        string
+	ParticipantCount int
+	TotalDiamonds    float64
+	ShareCount       int
 }
 
 // ParticipationRecord is safe audit metadata for one account/event attempt.
@@ -167,11 +188,12 @@ type ParticipationTrace struct {
 // ParticipationSettings are safe global limits applied independently to each
 // participation account. Zero keeps the corresponding limit disabled.
 type ParticipationSettings struct {
-	StopAfterJoins           int `json:"stop_after_joins"`
-	CooldownSeconds          int `json:"cooldown_seconds"`
-	StopAfterWins            int `json:"stop_after_wins"`
-	DrawResultTimeoutSeconds int `json:"draw_result_timeout_seconds"`
-	MinimumDiamonds          int `json:"minimum_diamonds"`
+	StopAfterJoins           int    `json:"stop_after_joins"`
+	CooldownSeconds          int    `json:"cooldown_seconds"`
+	StopAfterWins            int    `json:"stop_after_wins"`
+	DrawResultTimeoutSeconds int    `json:"draw_result_timeout_seconds"`
+	MinimumDiamonds          int    `json:"minimum_diamonds"`
+	PacketType               string `json:"packet_type"`
 }
 
 // Activity is safe sidebar history. It never contains credentials, request
@@ -513,6 +535,16 @@ func (s *Store) CompleteParticipation(eventID, accountID, endpoint, status, mess
 }
 
 func normalizeParticipationSettings(settings ParticipationSettings) ParticipationSettings {
+	switch strings.ToLower(strings.TrimSpace(settings.PacketType)) {
+	case ParticipationPacketTypeAll:
+		settings.PacketType = ParticipationPacketTypeAll
+	case ParticipationPacketTypeGift:
+		settings.PacketType = ParticipationPacketTypeGift
+	case ParticipationPacketTypeDiamond:
+		settings.PacketType = ParticipationPacketTypeDiamond
+	default:
+		settings.PacketType = ParticipationPacketTypeDiamond
+	}
 	if settings.StopAfterJoins < 0 {
 		settings.StopAfterJoins = 0
 	}
@@ -1089,6 +1121,76 @@ func (s *Store) EventsAll() []Event {
 	return items
 }
 
+// MergeCenter persists safe red-packet events learned from the shared center.
+// It deliberately does not invoke the participation handler: downloaded rows
+// contain no native page context or private request metadata.
+func (s *Store) MergeCenter(items []CenterEvent) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	imported := 0
+	for _, item := range items {
+		webRID, packetID := strings.TrimSpace(item.WebRID), strings.TrimSpace(item.PacketID)
+		if webRID == "" || packetID == "" {
+			continue
+		}
+		existing := s.findEventByIdentityLocked(webRID, packetID)
+		if existing == nil {
+			sum := sha256.Sum256([]byte(webRID + "\x00" + packetID))
+			existing = &Event{
+				ID: "center:" + hex.EncodeToString(sum[:16]), RoomID: webRID, WebRID: webRID,
+				PacketID: packetID, Source: firstNonEmpty(item.Source, "center_sync"), DataSource: "center",
+				DetectedAt: firstNonEmpty(item.DetectedAt, time.Now().Format(time.RFC3339Nano)),
+			}
+			s.events[existing.ID] = existing
+			changed = true
+			imported++
+		}
+		centerOwned := existing.DataSource == "center"
+		if centerOwned || existing.RoomName == "" {
+			existing.RoomName = firstNonEmpty(item.RoomName, existing.RoomName)
+		}
+		if centerOwned || existing.StreamerName == "" {
+			existing.StreamerName = firstNonEmpty(item.StreamerName, existing.StreamerName)
+		}
+		if centerOwned || existing.Title == "" {
+			existing.Title = firstNonEmpty(item.Title, existing.Title)
+		}
+		if centerOwned || existing.Prize == "" {
+			existing.Prize = firstNonEmpty(normalizePacketPrize(item.Prize), existing.Prize)
+		}
+		if centerOwned {
+			existing.Source = firstNonEmpty(item.Source, existing.Source, "center_sync")
+			existing.DetectedAt = firstNonEmpty(item.DetectedAt, existing.DetectedAt)
+			existing.DrawAt = firstNonEmpty(item.DrawAt, existing.DrawAt)
+			existing.ExpiresAt = firstNonEmpty(item.ExpiresAt, existing.ExpiresAt)
+			if item.ParticipantCount > existing.ParticipantCount {
+				existing.ParticipantCount = item.ParticipantCount
+			}
+			if item.TotalDiamonds > existing.TotalDiamonds {
+				existing.TotalDiamonds = item.TotalDiamonds
+			}
+			if item.ShareCount > existing.ShareCount {
+				existing.ShareCount = item.ShareCount
+			}
+		}
+		changed = true
+	}
+	if !changed {
+		return imported, nil
+	}
+	return imported, s.saveLocked()
+}
+
+func (s *Store) findEventByIdentityLocked(webRID, packetID string) *Event {
+	for _, event := range s.events {
+		if strings.TrimSpace(firstNonEmpty(event.WebRID, event.RoomID)) == webRID && strings.TrimSpace(event.PacketID) == packetID {
+			return event
+		}
+	}
+	return nil
+}
+
 // StartAll is retained for callers that deliberately pin every room to one
 // account. Bulk desktop monitoring should use StartAllPool instead.
 func (s *Store) StartAll(accountID, accountName, cookie string) (int, error) {
@@ -1576,7 +1678,17 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 		}
 		packetID := firstNonEmpty(packet.id, stableID(snapshot.Data))
 		eventID := id + ":" + packetID
-		if existing := s.events[eventID]; existing != nil {
+		existing := s.events[eventID]
+		if existing == nil {
+			existing = s.findEventByIdentityLocked(firstNonEmpty(monitor.WebRID, monitor.RoomID), packetID)
+		}
+		if existing != nil {
+			if existing.DataSource == "center" {
+				existing.DataSource = ""
+				existing.MonitorID = id
+				existing.AccountID, existing.AccountName = monitor.AccountID, monitor.AccountName
+				existing.RoomID = monitor.RoomID
+			}
 			// The same activity remains in the luckybox list while it is active.
 			// Use later snapshots to enrich legacy/incomplete rows after the
 			// grouped 福宝 prize parser has enough box records.

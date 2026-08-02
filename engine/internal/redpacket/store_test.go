@@ -104,7 +104,7 @@ func TestParticipationSettingsPolicyAndActivityPersist(t *testing.T) {
 		t.Fatal(err)
 	}
 	settings, err := store.SetParticipationSettings(ParticipationSettings{
-		StopAfterJoins: 2, CooldownSeconds: 30, StopAfterWins: 1,
+		StopAfterJoins: 2, CooldownSeconds: 30, StopAfterWins: 1, PacketType: ParticipationPacketTypeGift,
 	})
 	if err != nil || settings.CooldownSeconds != 30 {
 		t.Fatalf("unexpected saved settings: %+v err=%v", settings, err)
@@ -158,6 +158,9 @@ func TestParticipationSettingsDefaultDrawTimeoutAndSafeTrace(t *testing.T) {
 	}
 	if got := store.GetParticipationSettings().MinimumDiamonds; got != 1 {
 		t.Fatalf("default minimum diamonds=%d, want 1", got)
+	}
+	if got := store.GetParticipationSettings().PacketType; got != ParticipationPacketTypeDiamond {
+		t.Fatalf("default packet type=%q, want %q", got, ParticipationPacketTypeDiamond)
 	}
 	if err := store.RecordParticipationStarted("account-log", "日志账号"); err != nil {
 		t.Fatal(err)

@@ -203,6 +203,27 @@ func main() {
 				continue
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: remoteSyncManager.Status()})
+		case "remote_sync.configure":
+			if remoteSyncManagerErr != nil {
+				writeError(encoder, req.ID, "remote_sync_unavailable", remoteSyncManagerErr.Error())
+				continue
+			}
+			var params struct {
+				Enabled         bool   `json:"enabled"`
+				EnrollmentToken string `json:"enrollment_token"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "远程同步配置参数无效")
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			result, err := remoteSyncManager.Configure(ctx, params.Enabled, params.EnrollmentToken)
+			cancel()
+			if err != nil {
+				writeError(encoder, req.ID, "remote_sync_configure_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
 		case "license.status":
 			if licenseManagerErr != nil {
 				writeError(encoder, req.ID, "license_unavailable", licenseManagerErr.Error())
@@ -1405,6 +1426,9 @@ func runRemoteSyncSnapshots(ctx context.Context, manager *remotesync.Manager, ro
 	}
 	syncSnapshot := func() {
 		_ = manager.SyncSnapshot(roomStore.List(), redPacketStore.List(), redPacketStore.EventsAll())
+		pullCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		_ = manager.PullOnce(pullCtx, roomStore, redPacketStore)
+		cancel()
 	}
 	syncSnapshot()
 	ticker := time.NewTicker(10 * time.Second)
