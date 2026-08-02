@@ -28,8 +28,38 @@ env:
   RELEASE_REPOSITORY: ccvar/fubao-v2-releases
 
 jobs:
+  test:
+    name: Verify desktop sources
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: engine/go.mod
+          cache-dependency-path: engine/go.sum
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Check frontend
+        run: npm run check
+
+      - name: Test Go engine
+        working-directory: engine
+        run: go test -count=1 ./...
+
   build:
     name: Build ${{ matrix.label }}
+    needs: test
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
@@ -76,13 +106,6 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
-
-      - name: Check frontend
-        run: npm run check
-
-      - name: Test Go engine
-        working-directory: engine
-        run: go test ./...
 
       - name: Build desktop client
         env:
