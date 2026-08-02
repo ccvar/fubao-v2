@@ -69,6 +69,21 @@ func TestDisabledManagerDoesNotQueue(t *testing.T) {
 	}
 }
 
+func TestExistingConfigReceivesDefaultFallbackEndpoint(t *testing.T) {
+	dataDir := t.TempDir()
+	content := []byte(`{"version":1,"enabled":true,"endpoint":"https://fbv2.ccvar.com/api/v1","device_token":"device-test-token"}`)
+	if err := os.WriteFile(filepath.Join(dataDir, "remote_sync.json"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.Status().FallbackEndpoint; got != syncprotocol.DefaultFallbackEndpoint {
+		t.Fatalf("fallback endpoint = %q, want %q", got, syncprotocol.DefaultFallbackEndpoint)
+	}
+}
+
 func TestUnchangedSnapshotKeepsStableOutboxPayload(t *testing.T) {
 	dataDir := t.TempDir()
 	config := Config{Version: configVersion, Enabled: true, Endpoint: syncprotocol.DefaultEndpoint, DeviceToken: "device-test-token"}
@@ -150,5 +165,53 @@ func TestManagerRegistersAndFlushesToServer(t *testing.T) {
 	}
 	if strings.Contains(string(configContent), enrollmentToken) || !strings.Contains(string(configContent), "device_token") {
 		t.Fatalf("enrollment token was not replaced with a device token: %s", configContent)
+	}
+}
+
+func TestManagerFallsBackWhenPrimaryHealthIsUnavailable(t *testing.T) {
+	store, err := syncserver.OpenStore(filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	enrollmentToken := "0123456789abcdef0123456789abcdef"
+	service, err := syncserver.New(store, enrollmentToken, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fallbackServer := httptest.NewTLSServer(service.Handler())
+	defer fallbackServer.Close()
+
+	dataDir := t.TempDir()
+	config := Config{
+		Version: configVersion, Enabled: true,
+		Endpoint: "https://127.0.0.1:1/api/v1", FallbackEndpoint: fallbackServer.URL + "/api/v1",
+		EnrollmentToken: enrollmentToken,
+	}
+	content, _ := json.Marshal(config)
+	if err := os.WriteFile(filepath.Join(dataDir, "remote_sync.json"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.httpClient = fallbackServer.Client()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := manager.EnqueueEvent(redpacket.Event{WebRID: "654321", PacketID: "fallback-packet", DetectedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	manager.attempt(context.Background())
+	status := manager.Status()
+	wantEndpoint := fallbackServer.URL + "/api/v1"
+	if status.ActiveEndpoint != wantEndpoint || status.Pending != 0 || status.LastError != "" {
+		t.Fatalf("manager did not switch to fallback endpoint: %+v", status)
+	}
+	stats, err := store.Stats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Devices != 1 || stats.RedPacket != 1 {
+		t.Fatalf("fallback server did not receive the batch: %+v", stats)
 	}
 }

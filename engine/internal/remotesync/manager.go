@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -25,28 +26,33 @@ import (
 )
 
 const (
-	configVersion = 1
-	flushInterval = 3 * time.Second
-	maxRoomQueue  = 20_000
+	configVersion      = 1
+	flushInterval      = 3 * time.Second
+	maxRoomQueue       = 20_000
+	healthProbeTimeout = 5 * time.Second
+	fallbackHold       = time.Minute
 )
 
 type Config struct {
-	Version         int    `json:"version"`
-	Enabled         bool   `json:"enabled"`
-	Endpoint        string `json:"endpoint"`
-	EnrollmentToken string `json:"enrollment_token,omitempty"`
-	DeviceToken     string `json:"device_token,omitempty"`
+	Version          int    `json:"version"`
+	Enabled          bool   `json:"enabled"`
+	Endpoint         string `json:"endpoint"`
+	FallbackEndpoint string `json:"fallback_endpoint"`
+	EnrollmentToken  string `json:"enrollment_token,omitempty"`
+	DeviceToken      string `json:"device_token,omitempty"`
 }
 
 type Status struct {
-	Enabled       bool   `json:"enabled"`
-	Configured    bool   `json:"configured"`
-	Endpoint      string `json:"endpoint"`
-	Pending       int    `json:"pending"`
-	ClientID      string `json:"client_id"`
-	LastSuccessAt string `json:"last_success_at,omitempty"`
-	LastError     string `json:"last_error,omitempty"`
-	LastErrorAt   string `json:"last_error_at,omitempty"`
+	Enabled          bool   `json:"enabled"`
+	Configured       bool   `json:"configured"`
+	Endpoint         string `json:"endpoint"`
+	FallbackEndpoint string `json:"fallback_endpoint"`
+	ActiveEndpoint   string `json:"active_endpoint,omitempty"`
+	Pending          int    `json:"pending"`
+	ClientID         string `json:"client_id"`
+	LastSuccessAt    string `json:"last_success_at,omitempty"`
+	LastError        string `json:"last_error,omitempty"`
+	LastErrorAt      string `json:"last_error_at,omitempty"`
 }
 
 type outboxFile struct {
@@ -55,20 +61,22 @@ type outboxFile struct {
 }
 
 type Manager struct {
-	mu            sync.Mutex
-	dataDir       string
-	configPath    string
-	outboxPath    string
-	clientIDPath  string
-	config        Config
-	clientID      string
-	clientName    string
-	httpClient    *http.Client
-	outbox        []syncprotocol.BatchItem
-	lastHashes    map[string]string
-	lastSuccessAt string
-	lastError     string
-	lastErrorAt   string
+	mu             sync.Mutex
+	dataDir        string
+	configPath     string
+	outboxPath     string
+	clientIDPath   string
+	config         Config
+	clientID       string
+	clientName     string
+	httpClient     *http.Client
+	outbox         []syncprotocol.BatchItem
+	lastHashes     map[string]string
+	lastSuccessAt  string
+	lastError      string
+	lastErrorAt    string
+	activeEndpoint string
+	activeSince    time.Time
 }
 
 func New(dataDir string) (*Manager, error) {
@@ -101,7 +109,10 @@ func New(dataDir string) (*Manager, error) {
 }
 
 func (m *Manager) loadConfig() error {
-	m.config = Config{Version: configVersion, Endpoint: syncprotocol.DefaultEndpoint}
+	m.config = Config{
+		Version: configVersion, Endpoint: syncprotocol.DefaultEndpoint,
+		FallbackEndpoint: syncprotocol.DefaultFallbackEndpoint,
+	}
 	content, err := os.ReadFile(m.configPath)
 	if err == nil {
 		if err := json.Unmarshal(content, &m.config); err != nil {
@@ -112,6 +123,12 @@ func (m *Manager) loadConfig() error {
 	}
 	if endpoint := strings.TrimSpace(os.Getenv("FUBAO_SYNC_ENDPOINT")); endpoint != "" {
 		m.config.Endpoint = endpoint
+	}
+	if endpoint := strings.TrimSpace(os.Getenv("FUBAO_SYNC_FALLBACK_ENDPOINT")); endpoint != "" {
+		m.config.FallbackEndpoint = endpoint
+	}
+	if strings.TrimSpace(m.config.FallbackEndpoint) == "" {
+		m.config.FallbackEndpoint = syncprotocol.DefaultFallbackEndpoint
 	}
 	if token := strings.TrimSpace(os.Getenv("FUBAO_SYNC_ENROLLMENT_TOKEN")); token != "" {
 		m.config.EnrollmentToken = token
@@ -125,8 +142,13 @@ func (m *Manager) loadConfig() error {
 	if err != nil {
 		return err
 	}
+	fallbackEndpoint, err := syncprotocol.NormalizeEndpoint(m.config.FallbackEndpoint)
+	if err != nil {
+		return err
+	}
 	m.config.Version = configVersion
 	m.config.Endpoint = endpoint
+	m.config.FallbackEndpoint = fallbackEndpoint
 	return m.saveConfigLocked()
 }
 
@@ -173,14 +195,16 @@ func (m *Manager) Status() Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return Status{
-		Enabled:       m.config.Enabled,
-		Configured:    m.config.DeviceToken != "" || m.config.EnrollmentToken != "",
-		Endpoint:      m.config.Endpoint,
-		Pending:       len(m.outbox),
-		ClientID:      m.clientID,
-		LastSuccessAt: m.lastSuccessAt,
-		LastError:     m.lastError,
-		LastErrorAt:   m.lastErrorAt,
+		Enabled:          m.config.Enabled,
+		Configured:       m.config.DeviceToken != "" || m.config.EnrollmentToken != "",
+		Endpoint:         m.config.Endpoint,
+		FallbackEndpoint: m.config.FallbackEndpoint,
+		ActiveEndpoint:   m.activeEndpoint,
+		Pending:          len(m.outbox),
+		ClientID:         m.clientID,
+		LastSuccessAt:    m.lastSuccessAt,
+		LastError:        m.lastError,
+		LastErrorAt:      m.lastErrorAt,
 	}
 }
 
@@ -225,7 +249,6 @@ func (m *Manager) ensureRegistered(ctx context.Context) error {
 		m.mu.Unlock()
 		return nil
 	}
-	endpoint := m.config.Endpoint
 	enrollmentToken := m.config.EnrollmentToken
 	clientID := m.clientID
 	clientName := m.clientName
@@ -238,7 +261,7 @@ func (m *Manager) ensureRegistered(ctx context.Context) error {
 		Platform: runtime.GOOS + "/" + runtime.GOARCH, AppVersion: "0.1.0",
 	}
 	var response syncprotocol.RegisterResponse
-	if err := m.postJSON(ctx, endpoint+"/devices/register", enrollmentToken, payload, &response); err != nil {
+	if err := m.postJSON(ctx, "/devices/register", enrollmentToken, payload, &response); err != nil {
 		return err
 	}
 	if response.Version != syncprotocol.Version || response.ClientID != clientID || strings.TrimSpace(response.DeviceToken) == "" {
@@ -263,7 +286,7 @@ func (m *Manager) flushOnce(ctx context.Context) (bool, error) {
 		limit = syncprotocol.MaxBatchItems
 	}
 	items := append([]syncprotocol.BatchItem(nil), m.outbox[:limit]...)
-	endpoint, deviceToken, clientID := m.config.Endpoint, m.config.DeviceToken, m.clientID
+	deviceToken, clientID := m.config.DeviceToken, m.clientID
 	m.mu.Unlock()
 	requestID, err := randomID()
 	if err != nil {
@@ -274,7 +297,7 @@ func (m *Manager) flushOnce(ctx context.Context) (bool, error) {
 		SentAt: time.Now().UTC().Format(time.RFC3339Nano), Items: items,
 	}
 	var response syncprotocol.BatchResponse
-	if err := m.postJSON(ctx, endpoint+"/sync/batch", deviceToken, payload, &response); err != nil {
+	if err := m.postJSON(ctx, "/sync/batch", deviceToken, payload, &response); err != nil {
 		return false, err
 	}
 	if response.Version != syncprotocol.Version || response.RequestID != requestID {
@@ -303,11 +326,41 @@ func (m *Manager) flushOnce(ctx context.Context) (bool, error) {
 	return true, err
 }
 
-func (m *Manager) postJSON(ctx context.Context, target, token string, input, output any) error {
+type remoteStatusError struct {
+	status  int
+	message string
+}
+
+func (e *remoteStatusError) Error() string {
+	return fmt.Sprintf("远程同步返回 %d: %s", e.status, e.message)
+}
+
+func (m *Manager) postJSON(ctx context.Context, route, token string, input, output any) error {
 	body, err := json.Marshal(input)
 	if err != nil {
 		return err
 	}
+	var failures []string
+	for _, endpoint := range m.endpointCandidates() {
+		if err := m.probeHealth(ctx, endpoint); err != nil {
+			failures = append(failures, endpoint+": "+err.Error())
+			continue
+		}
+		err := m.postJSONTo(ctx, endpoint+route, token, body, output)
+		if err == nil {
+			m.markEndpointActive(endpoint)
+			return nil
+		}
+		var statusErr *remoteStatusError
+		if errors.As(err, &statusErr) && statusErr.status >= 400 && statusErr.status < 500 {
+			return err
+		}
+		failures = append(failures, endpoint+": "+err.Error())
+	}
+	return fmt.Errorf("远程同步主备入口均不可用: %s", strings.Join(failures, "; "))
+}
+
+func (m *Manager) postJSONTo(ctx context.Context, target, token string, body []byte, output any) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -322,12 +375,70 @@ func (m *Manager) postJSON(ctx context.Context, target, token string, input, out
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		limited, _ := io.ReadAll(io.LimitReader(response.Body, 1024))
-		return fmt.Errorf("远程同步返回 %d: %s", response.StatusCode, strings.TrimSpace(string(limited)))
+		return &remoteStatusError{status: response.StatusCode, message: strings.TrimSpace(string(limited))}
 	}
 	if err := json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(output); err != nil {
 		return fmt.Errorf("解析远程同步响应失败: %w", err)
 	}
 	return nil
+}
+
+func (m *Manager) endpointCandidates() []string {
+	m.mu.Lock()
+	primary, fallback := m.config.Endpoint, m.config.FallbackEndpoint
+	active, activeSince := m.activeEndpoint, m.activeSince
+	m.mu.Unlock()
+	values := make([]string, 0, 2)
+	if active != "" && active != primary && time.Since(activeSince) < fallbackHold {
+		values = append(values, active)
+	}
+	values = append(values, primary, fallback)
+	result := values[:0]
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		value = strings.TrimRight(strings.TrimSpace(value), "/")
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
+}
+
+func (m *Manager) probeHealth(ctx context.Context, endpoint string) error {
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return errors.New("健康检查地址无效")
+	}
+	parsed.Path, parsed.RawPath, parsed.RawQuery, parsed.Fragment = "/healthz", "", "", ""
+	probeCtx, cancel := context.WithTimeout(ctx, healthProbeTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(probeCtx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return err
+	}
+	request.Header.Set("User-Agent", "fubao-engine/0.1")
+	response, err := m.httpClient.Do(request)
+	if err != nil {
+		return fmt.Errorf("健康检查失败: %w", err)
+	}
+	defer response.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4<<10))
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("健康检查返回 %d", response.StatusCode)
+	}
+	return nil
+}
+
+func (m *Manager) markEndpointActive(endpoint string) {
+	m.mu.Lock()
+	m.activeEndpoint = endpoint
+	m.activeSince = time.Now()
+	m.mu.Unlock()
 }
 
 func (m *Manager) SyncSnapshot(roomItems []rooms.Room, monitorItems []redpacket.Monitor, events []redpacket.Event) error {

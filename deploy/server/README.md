@@ -10,7 +10,7 @@
 curl -fsSL https://raw.githubusercontent.com/ccvar/fubao-v2-releases/main/install-sync-server.sh | sudo sh
 ```
 
-安装器会安装服务端、官方 Caddy 软件包、systemd 单元和 `fbv2.ccvar.com` 反向代理。安装前需要把域名 A/AAAA 记录指向服务器，并开放 TCP 80、443。
+安装器会安装服务端、官方 Caddy 软件包、systemd 单元和 `fbv2.ccvar.com` 反向代理。安装前需要把域名 A/AAAA 记录指向服务器，并开放 TCP 80、443、8087。标准 HTTPS 入口不可用时，客户端会通过健康检查自动降级到 HTTPS 8087 入口。
 
 安装完成后终端会输出一次客户端注册令牌。客户端 Go 数据目录中的 `remote_sync.json` 使用以下结构：
 
@@ -19,6 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/ccvar/fubao-v2-releases/main/instal
   "version": 1,
   "enabled": true,
   "endpoint": "https://fbv2.ccvar.com/api/v1",
+  "fallback_endpoint": "https://fbv2.ccvar.com:8087/api/v1",
   "enrollment_token": "安装器输出的注册令牌"
 }
 ```
@@ -31,6 +32,29 @@ curl -fsSL https://raw.githubusercontent.com/ccvar/fubao-v2-releases/main/instal
 systemctl status fubao-sync
 journalctl -u fubao-sync -f
 curl https://fbv2.ccvar.com/healthz
+curl https://fbv2.ccvar.com:8087/healthz
 ```
 
 SQLite 数据库位于 `/var/lib/fubao-sync/fubao-sync.db`，Caddy 配置片段位于 `/etc/caddy/conf.d/fbv2.caddy`。
+
+查看同步概况：
+
+```sh
+curl -s https://fbv2.ccvar.com/healthz | python3 -m json.tool
+```
+
+查看最近更新的直播间：
+
+```sh
+sqlite3 -header -column /var/lib/fubao-sync/fubao-sync.db \
+  "SELECT web_rid, streamer_name, title, live_status, monitor_status, updated_at FROM rooms ORDER BY updated_at DESC LIMIT 30;"
+```
+
+查看最近同步的红包：
+
+```sh
+sqlite3 -header -column /var/lib/fubao-sync/fubao-sync.db \
+  "SELECT web_rid, packet_id, title, prize, detected_at, expires_at FROM red_packet_events ORDER BY detected_at DESC LIMIT 30;"
+```
+
+明细数据库只允许在服务器本机读取。不要把 SQLite 文件、设备令牌或注册令牌放到公开下载目录。

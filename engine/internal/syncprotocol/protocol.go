@@ -9,9 +9,10 @@ import (
 )
 
 const (
-	Version         = 1
-	DefaultEndpoint = "https://fbv2.ccvar.com/api/v1"
-	MaxBatchItems   = 200
+	Version                 = 1
+	DefaultEndpoint         = "https://fbv2.ccvar.com/api/v1"
+	DefaultFallbackEndpoint = "https://fbv2.ccvar.com:8087/api/v1"
+	MaxBatchItems           = 200
 )
 
 type ItemType string

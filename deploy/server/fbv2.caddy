@@ -6,3 +6,12 @@ fbv2.ccvar.com {
 		health_timeout 3s
 	}
 }
+
+https://fbv2.ccvar.com:8087 {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:8788 {
+		health_uri /healthz
+		health_interval 30s
+		health_timeout 3s
+	}
+}
