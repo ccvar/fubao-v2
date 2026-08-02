@@ -71,6 +71,7 @@
   type RemoteSyncStatus = {
     enabled: boolean;
     configured: boolean;
+	upload_only?: boolean;
     endpoint: string;
     fallback_endpoint: string;
     active_endpoint?: string;
@@ -1326,7 +1327,8 @@
 
   function remoteSyncStateLabel(status: RemoteSyncStatus) {
     if (remoteSyncBusy) return "连接中";
-    if (!status.enabled) return status.configured ? "已停用" : "未配置";
+    if (status.upload_only) return status.active_endpoint ? "仅上传" : "上传连接中";
+    if (!status.enabled) return status.configured ? "接收已停用" : "未配置";
     if (status.active_endpoint) return "已连接";
     if (status.last_error) return "连接异常";
     return "等待连接";
@@ -1352,7 +1354,7 @@
       });
       remoteSyncToken = "";
       remoteSyncEditing = false;
-      toast = enabled ? "远程同步已连接" : "远程同步已停用";
+      toast = enabled ? "中心数据接收已启用" : "中心数据接收已停用，本机数据仍会上传";
       window.setTimeout(() => (toast = ""), 2200);
     } catch (error) {
       remoteSyncError = error instanceof Error ? error.message : String(error);
@@ -5642,8 +5644,8 @@
       {/if}
 
       <section
-        class:connected={remoteSyncStatus.enabled && Boolean(remoteSyncStatus.active_endpoint)}
-        class:error={remoteSyncStatus.enabled && Boolean(remoteSyncStatus.last_error) && !remoteSyncStatus.active_endpoint}
+        class:connected={Boolean(remoteSyncStatus.active_endpoint)}
+        class:error={Boolean(remoteSyncStatus.last_error) && !remoteSyncStatus.active_endpoint}
         class="remote-sync-panel"
         aria-labelledby="remote-sync-title"
       >
@@ -5674,7 +5676,7 @@
               onkeydown={(event) => event.key === "Enter" && saveRemoteSyncToken()}
             />
           </label>
-          <p class="remote-sync-hint">令牌验证成功后会自动兑换成设备凭证，客户端不会再次显示明文。</p>
+          <p class="remote-sync-hint">未绑定 KEY 时仅上传本机发现的数据；令牌验证成功后会兑换成完整设备凭证，并按授权范围接收中心数据。</p>
           <div class="remote-sync-actions">
             {#if remoteSyncEditing}
               <button class="secondary-button" disabled={remoteSyncBusy} onclick={cancelRemoteSyncTokenChange}>取消</button>
@@ -5692,13 +5694,13 @@
               class="secondary-button remote-sync-toggle"
               disabled={remoteSyncBusy}
               onclick={() => configureRemoteSync(!remoteSyncStatus.enabled)}
-            >{remoteSyncStatus.enabled ? "停用同步" : "启用同步"}</button>
+            >{remoteSyncStatus.enabled ? "停用接收" : "启用接收"}</button>
           </div>
         {/if}
 
         {#if remoteSyncError}
           <div class="remote-sync-error"><WarningCircle size={13} />{remoteSyncError}</div>
-        {:else if remoteSyncStatus.enabled && remoteSyncStatus.last_error && !remoteSyncStatus.active_endpoint}
+        {:else if remoteSyncStatus.last_error && !remoteSyncStatus.active_endpoint}
           <div class="remote-sync-error"><WarningCircle size={13} />{remoteSyncStatus.last_error}</div>
         {/if}
       </section>

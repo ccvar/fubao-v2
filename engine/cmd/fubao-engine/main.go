@@ -143,7 +143,7 @@ func main() {
 	if remoteSyncManagerErr == nil {
 		go remoteSyncManager.Run(backgroundCtx)
 		if roomStoreErr == nil && redPacketStoreErr == nil {
-			go runRemoteSyncSnapshots(backgroundCtx, remoteSyncManager, roomStore, redPacketStore)
+			go runRemoteSyncSnapshots(backgroundCtx, remoteSyncManager, roomStore, redPacketStore, licenseManager)
 		}
 	}
 
@@ -1420,14 +1420,14 @@ func runFollowingLiveSync(ctx context.Context, accountStore *accounts.Store, bro
 	}
 }
 
-func runRemoteSyncSnapshots(ctx context.Context, manager *remotesync.Manager, roomStore *rooms.Store, redPacketStore *redpacket.Store) {
+func runRemoteSyncSnapshots(ctx context.Context, manager *remotesync.Manager, roomStore *rooms.Store, redPacketStore *redpacket.Store, licenseManager *license.Manager) {
 	if manager == nil || roomStore == nil || redPacketStore == nil {
 		return
 	}
 	syncSnapshot := func() {
 		_ = manager.SyncSnapshot(roomStore.List(), redPacketStore.List(), redPacketStore.EventsAll())
 		pullCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		_ = manager.PullOnce(pullCtx, roomStore, redPacketStore)
+		_ = manager.PullOnceScoped(pullCtx, roomStore, redPacketStore, remoteSyncPullScope(licenseManager))
 		cancel()
 	}
 	syncSnapshot()
@@ -1441,4 +1441,18 @@ func runRemoteSyncSnapshots(ctx context.Context, manager *remotesync.Manager, ro
 			syncSnapshot()
 		}
 	}
+}
+
+func remoteSyncPullScope(manager *license.Manager) remotesync.PullScope {
+	if manager == nil {
+		return remotesync.PullNone
+	}
+	status := manager.Status()
+	if status.State != "active" {
+		return remotesync.PullNone
+	}
+	if strings.TrimSpace(status.ExpiresAt) == "" {
+		return remotesync.PullAll
+	}
+	return remotesync.PullRedPackets
 }

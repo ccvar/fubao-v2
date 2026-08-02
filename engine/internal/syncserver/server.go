@@ -5,20 +5,32 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"fubao.ccvar.com/engine/internal/syncprotocol"
 )
 
-const maxRequestBody = 2 << 20
+const (
+	maxRequestBody          = 2 << 20
+	uploadRegistrationLimit = 120
+)
+
+type registrationWindow struct {
+	startedAt time.Time
+	count     int
+}
 
 type Server struct {
 	store           *Store
 	enrollmentToken string
 	version         string
+	registrationMu  sync.Mutex
+	registrations   map[string]registrationWindow
 }
 
 func New(store *Store, enrollmentToken, version string) (*Server, error) {
@@ -29,7 +41,7 @@ func New(store *Store, enrollmentToken, version string) (*Server, error) {
 	if len(enrollmentToken) < 32 {
 		return nil, errors.New("设备注册令牌至少需要 32 个字符")
 	}
-	return &Server{store: store, enrollmentToken: enrollmentToken, version: version}, nil
+	return &Server{store: store, enrollmentToken: enrollmentToken, version: version, registrations: map[string]registrationWindow{}}, nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -37,6 +49,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /healthz", s.health)
 	mux.HandleFunc("GET /api/v1/healthz", s.health)
 	mux.HandleFunc("POST /api/v1/devices/register", s.register)
+	mux.HandleFunc("POST /api/v1/devices/register-upload", s.registerUpload)
 	mux.HandleFunc("POST /api/v1/sync/batch", s.syncBatch)
 	mux.HandleFunc("GET /api/v1/sync/changes", s.syncChanges)
 	return securityHeaders(mux)
@@ -48,9 +61,13 @@ func (s *Server) syncChanges(writer http.ResponseWriter, request *http.Request) 
 		writeJSONError(writer, http.StatusUnauthorized, "missing_device_token", "缺少同步设备令牌")
 		return
 	}
-	clientID, err := s.store.AuthorizeDevice(request.Context(), token)
+	authorization, err := s.store.AuthorizeDevice(request.Context(), token)
 	if err != nil {
 		writeJSONError(writer, http.StatusUnauthorized, "invalid_device_token", "同步设备令牌无效")
+		return
+	}
+	if authorization.AccessMode != syncprotocol.DeviceAccessFull {
+		writeJSONError(writer, http.StatusForbidden, "pull_not_allowed", "当前设备仅允许上传中心库数据")
 		return
 	}
 	cursor, err := strconv.ParseInt(request.URL.Query().Get("cursor"), 10, 64)
@@ -67,12 +84,20 @@ func (s *Server) syncChanges(writer http.ResponseWriter, request *http.Request) 
 		}
 		limit = parsed
 	}
-	result, err := s.store.GetChanges(request.Context(), cursor, limit)
+	var itemType syncprotocol.ItemType
+	if value := strings.TrimSpace(request.URL.Query().Get("type")); value != "" {
+		itemType = syncprotocol.ItemType(value)
+		if itemType != syncprotocol.ItemRoomState && itemType != syncprotocol.ItemRedPacket {
+			writeJSONError(writer, http.StatusBadRequest, "invalid_change_type", "同步增量类型无效")
+			return
+		}
+	}
+	result, err := s.store.GetChangesByType(request.Context(), cursor, limit, itemType)
 	if err != nil {
 		writeJSONError(writer, http.StatusServiceUnavailable, "changes_unavailable", "中心库增量暂不可用")
 		return
 	}
-	_ = s.store.TouchDevice(request.Context(), clientID)
+	_ = s.store.TouchDevice(request.Context(), authorization.ClientID)
 	writeJSON(writer, http.StatusOK, result)
 }
 
@@ -92,6 +117,49 @@ func (s *Server) register(writer http.ResponseWriter, request *http.Request) {
 		writeJSONError(writer, http.StatusUnauthorized, "invalid_enrollment_token", "设备注册令牌无效")
 		return
 	}
+	s.registerDevice(writer, request, false)
+}
+
+func (s *Server) registerUpload(writer http.ResponseWriter, request *http.Request) {
+	if !s.allowUploadRegistration(request) {
+		writeJSONError(writer, http.StatusTooManyRequests, "registration_rate_limited", "自动上传设备注册过于频繁")
+		return
+	}
+	s.registerDevice(writer, request, true)
+}
+
+func (s *Server) allowUploadRegistration(request *http.Request) bool {
+	address := request.RemoteAddr
+	host, _, err := net.SplitHostPort(address)
+	if err == nil {
+		address = host
+	}
+	if ip := net.ParseIP(address); ip != nil && ip.IsLoopback() {
+		forwardedFor := strings.Split(request.Header.Get("X-Forwarded-For"), ",")
+		for index := len(forwardedFor) - 1; index >= 0; index-- {
+			forwarded := strings.TrimSpace(forwardedFor[index])
+			if net.ParseIP(forwarded) != nil {
+				address = forwarded
+				break
+			}
+		}
+	}
+	now := time.Now()
+	s.registrationMu.Lock()
+	defer s.registrationMu.Unlock()
+	window := s.registrations[address]
+	if window.startedAt.IsZero() || now.Sub(window.startedAt) >= time.Hour {
+		window = registrationWindow{startedAt: now}
+	}
+	if window.count >= uploadRegistrationLimit {
+		return false
+	}
+	window.count++
+	s.registrations[address] = window
+	return true
+}
+
+func (s *Server) registerDevice(writer http.ResponseWriter, request *http.Request, uploadOnly bool) {
 	var input syncprotocol.RegisterRequest
 	if err := decodeJSON(writer, request, &input); err != nil {
 		writeJSONError(writer, http.StatusBadRequest, "invalid_json", err.Error())
@@ -101,7 +169,13 @@ func (s *Server) register(writer http.ResponseWriter, request *http.Request) {
 		writeJSONError(writer, http.StatusBadRequest, "protocol_mismatch", "同步协议版本不兼容")
 		return
 	}
-	result, err := s.store.RegisterDevice(request.Context(), input)
+	var result syncprotocol.RegisterResponse
+	var err error
+	if uploadOnly {
+		result, err = s.store.RegisterUploadDevice(request.Context(), input)
+	} else {
+		result, err = s.store.RegisterDevice(request.Context(), input)
+	}
 	if err != nil {
 		writeJSONError(writer, http.StatusBadRequest, "registration_failed", err.Error())
 		return
@@ -115,7 +189,7 @@ func (s *Server) syncBatch(writer http.ResponseWriter, request *http.Request) {
 		writeJSONError(writer, http.StatusUnauthorized, "missing_device_token", "缺少同步设备令牌")
 		return
 	}
-	clientID, err := s.store.AuthorizeDevice(request.Context(), token)
+	authorization, err := s.store.AuthorizeDevice(request.Context(), token)
 	if err != nil {
 		writeJSONError(writer, http.StatusUnauthorized, "invalid_device_token", "同步设备令牌无效")
 		return
@@ -125,7 +199,7 @@ func (s *Server) syncBatch(writer http.ResponseWriter, request *http.Request) {
 		writeJSONError(writer, http.StatusBadRequest, "invalid_json", err.Error())
 		return
 	}
-	result, err := s.store.ApplyBatch(request.Context(), clientID, input)
+	result, err := s.store.ApplyBatch(request.Context(), authorization.ClientID, input)
 	if err != nil {
 		writeJSONError(writer, http.StatusBadRequest, "sync_failed", err.Error())
 		return

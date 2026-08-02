@@ -14,6 +14,8 @@ const (
 	DefaultFallbackEndpoint = "https://fbv2.ccvar.com:8087/api/v1"
 	MaxBatchItems           = 200
 	MaxChanges              = 200
+	DeviceAccessUploadOnly  = "upload_only"
+	DeviceAccessFull        = "full"
 )
 
 type ItemType string
@@ -58,6 +60,7 @@ type RegisterResponse struct {
 	Version     int    `json:"version"`
 	ClientID    string `json:"client_id"`
 	DeviceToken string `json:"device_token"`
+	AccessMode  string `json:"access_mode"`
 }
 
 type Change struct {

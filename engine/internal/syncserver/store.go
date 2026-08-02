@@ -30,6 +30,11 @@ type Stats struct {
 	RedPacket int `json:"red_packets"`
 }
 
+type DeviceAuthorization struct {
+	ClientID   string
+	AccessMode string
+}
+
 func OpenStore(path string) (*Store, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -66,6 +71,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			platform TEXT NOT NULL DEFAULT '',
 			app_version TEXT NOT NULL DEFAULT '',
 			token_hash TEXT NOT NULL UNIQUE,
+			access_mode TEXT NOT NULL DEFAULT 'full',
 			created_at TEXT NOT NULL,
 			last_seen_at TEXT NOT NULL
 		)`,
@@ -130,10 +136,50 @@ func (s *Store) migrate(ctx context.Context) error {
 			return fmt.Errorf("初始化同步数据库失败: %w", err)
 		}
 	}
+	if err := s.ensureColumn(ctx, "devices", "access_mode", "TEXT NOT NULL DEFAULT 'full'"); err != nil {
+		return err
+	}
 	return s.backfillChanges(ctx)
 }
 
+func (s *Store) ensureColumn(ctx context.Context, table, column, definition string) error {
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, primaryKey int
+		var name, dataType string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+definition); err != nil {
+		return fmt.Errorf("升级同步数据库字段失败: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) RegisterDevice(ctx context.Context, req syncprotocol.RegisterRequest) (syncprotocol.RegisterResponse, error) {
+	return s.registerDevice(ctx, req, syncprotocol.DeviceAccessFull, true)
+}
+
+func (s *Store) RegisterUploadDevice(ctx context.Context, req syncprotocol.RegisterRequest) (syncprotocol.RegisterResponse, error) {
+	if !strings.HasPrefix(strings.TrimSpace(req.ClientID), "desktop_") {
+		return syncprotocol.RegisterResponse{}, errors.New("自动上传客户端标识无效")
+	}
+	return s.registerDevice(ctx, req, syncprotocol.DeviceAccessUploadOnly, false)
+}
+
+func (s *Store) registerDevice(ctx context.Context, req syncprotocol.RegisterRequest, accessMode string, replace bool) (syncprotocol.RegisterResponse, error) {
 	clientID := strings.TrimSpace(req.ClientID)
 	if clientID == "" || len(clientID) > 128 {
 		return syncprotocol.RegisterResponse{}, errors.New("客户端标识无效")
@@ -143,32 +189,52 @@ func (s *Store) RegisterDevice(ctx context.Context, req syncprotocol.RegisterReq
 		return syncprotocol.RegisterResponse{}, err
 	}
 	now := s.now().UTC().Format(time.RFC3339Nano)
-	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO devices(client_id, client_name, platform, app_version, token_hash, created_at, last_seen_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(client_id) DO UPDATE SET
-			client_name=excluded.client_name,
-			platform=excluded.platform,
-			app_version=excluded.app_version,
-			token_hash=excluded.token_hash,
-			last_seen_at=excluded.last_seen_at`,
-		clientID, safeText(req.ClientName, 160), safeText(req.Platform, 80), safeText(req.AppVersion, 40), tokenHash(token), now, now)
+	query := `
+		INSERT INTO devices(client_id, client_name, platform, app_version, token_hash, access_mode, created_at, last_seen_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(client_id) DO NOTHING`
+	if replace {
+		query = `
+			INSERT INTO devices(client_id, client_name, platform, app_version, token_hash, access_mode, created_at, last_seen_at)
+			VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(client_id) DO UPDATE SET
+				client_name=excluded.client_name,
+				platform=excluded.platform,
+				app_version=excluded.app_version,
+				token_hash=excluded.token_hash,
+				access_mode=excluded.access_mode,
+				last_seen_at=excluded.last_seen_at`
+	}
+	result, err := s.db.ExecContext(ctx, query,
+		clientID, safeText(req.ClientName, 160), safeText(req.Platform, 80), safeText(req.AppVersion, 40), tokenHash(token), accessMode, now, now)
 	if err != nil {
 		return syncprotocol.RegisterResponse{}, fmt.Errorf("注册同步设备失败: %w", err)
 	}
-	return syncprotocol.RegisterResponse{Version: syncprotocol.Version, ClientID: clientID, DeviceToken: token}, nil
+	if !replace {
+		inserted, err := result.RowsAffected()
+		if err != nil {
+			return syncprotocol.RegisterResponse{}, err
+		}
+		if inserted == 0 {
+			return syncprotocol.RegisterResponse{}, errors.New("上传设备已经注册，请绑定同步 KEY 恢复完整设备身份")
+		}
+	}
+	return syncprotocol.RegisterResponse{Version: syncprotocol.Version, ClientID: clientID, DeviceToken: token, AccessMode: accessMode}, nil
 }
 
-func (s *Store) AuthorizeDevice(ctx context.Context, token string) (string, error) {
-	var clientID string
-	err := s.db.QueryRowContext(ctx, `SELECT client_id FROM devices WHERE token_hash = ?`, tokenHash(token)).Scan(&clientID)
+func (s *Store) AuthorizeDevice(ctx context.Context, token string) (DeviceAuthorization, error) {
+	var result DeviceAuthorization
+	err := s.db.QueryRowContext(ctx, `SELECT client_id, access_mode FROM devices WHERE token_hash = ?`, tokenHash(token)).Scan(&result.ClientID, &result.AccessMode)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", errors.New("同步设备令牌无效")
+		return DeviceAuthorization{}, errors.New("同步设备令牌无效")
 	}
 	if err != nil {
-		return "", fmt.Errorf("读取同步设备失败: %w", err)
+		return DeviceAuthorization{}, fmt.Errorf("读取同步设备失败: %w", err)
 	}
-	return clientID, nil
+	if result.AccessMode == "" {
+		result.AccessMode = syncprotocol.DeviceAccessFull
+	}
+	return result, nil
 }
 
 func (s *Store) ApplyBatch(ctx context.Context, clientID string, req syncprotocol.BatchRequest) (syncprotocol.BatchResponse, error) {
@@ -352,15 +418,28 @@ func upsertRedPacket(ctx context.Context, tx *sql.Tx, clientID string, packet sy
 }
 
 func (s *Store) GetChanges(ctx context.Context, cursor int64, limit int) (syncprotocol.ChangesResponse, error) {
+	return s.GetChangesByType(ctx, cursor, limit, "")
+}
+
+func (s *Store) GetChangesByType(ctx context.Context, cursor int64, limit int, itemType syncprotocol.ItemType) (syncprotocol.ChangesResponse, error) {
 	if cursor < 0 {
 		return syncprotocol.ChangesResponse{}, errors.New("同步游标无效")
 	}
 	if limit <= 0 || limit > syncprotocol.MaxChanges {
 		limit = syncprotocol.MaxChanges
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT seq, item_type, origin_client_id, changed_at, payload_json
-		FROM sync_changes WHERE seq > ? ORDER BY seq ASC LIMIT ?`, cursor, limit+1)
+	query := `SELECT seq, item_type, origin_client_id, changed_at, payload_json
+		FROM sync_changes WHERE seq > ? ORDER BY seq ASC LIMIT ?`
+	args := []any{cursor, limit + 1}
+	if itemType != "" {
+		if itemType != syncprotocol.ItemRoomState && itemType != syncprotocol.ItemRedPacket {
+			return syncprotocol.ChangesResponse{}, errors.New("中心库增量类型无效")
+		}
+		query = `SELECT seq, item_type, origin_client_id, changed_at, payload_json
+			FROM sync_changes WHERE seq > ? AND item_type = ? ORDER BY seq ASC LIMIT ?`
+		args = []any{cursor, itemType, limit + 1}
+	}
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return syncprotocol.ChangesResponse{}, fmt.Errorf("读取中心库增量失败: %w", err)
 	}

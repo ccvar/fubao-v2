@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -66,6 +67,7 @@ type Operation struct {
 }
 
 type Manager struct {
+	mu          sync.RWMutex
 	path        string
 	config      Config
 	client      *http.Client
@@ -106,6 +108,12 @@ func New(dataDir, appVersion string, cfg Config) (*Manager, error) {
 }
 
 func (m *Manager) Status() Status {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.statusLocked()
+}
+
+func (m *Manager) statusLocked() Status {
 	now := m.now().UTC()
 	if m.state.LicenseKey == "" {
 		return m.status("inactive", "免费版", "免费版", "neutral", "输入激活码可升级为专业版。")
@@ -123,28 +131,30 @@ func (m *Manager) Status() Status {
 }
 
 func (m *Manager) Activate(ctx context.Context, key, machineName string) Operation {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	key = strings.TrimSpace(key)
 	if key == "" {
-		return Operation{false, "请输入激活码。", m.Status()}
+		return Operation{false, "请输入激活码。", m.statusLocked()}
 	}
 	fp := m.machineFingerprint()
 	validation := m.validate(ctx, key, fp)
 	if validation.HTTP && validation.Valid {
 		m.saveValidation(key, validation, result{})
-		return Operation{true, "授权已激活。", m.Status()}
+		return Operation{true, "授权已激活。", m.statusLocked()}
 	}
 	if validation.Code == "PRODUCT_SCOPE_MISMATCH" {
-		return Operation{false, validation.message("激活码不属于当前产品。"), m.Status()}
+		return Operation{false, validation.message("激活码不属于当前产品。"), m.statusLocked()}
 	}
 	if validation.LicenseID == "" {
-		return Operation{false, validation.message("激活码无效。"), m.Status()}
+		return Operation{false, validation.message("激活码无效。"), m.statusLocked()}
 	}
 	activation := m.activateMachine(ctx, key, validation.LicenseID, fp, machineName)
 	if !activation.HTTP {
 		follow := m.validate(ctx, key, fp)
 		if follow.HTTP && follow.Valid {
 			m.saveValidation(key, follow, activation)
-			return Operation{true, "授权已激活。", m.Status()}
+			return Operation{true, "授权已激活。", m.statusLocked()}
 		}
 		// Some legacy Keygen policies deliberately disallow license-key
 		// authentication for machine creation.  The original 福宝 client
@@ -153,26 +163,28 @@ func (m *Manager) Activate(ctx context.Context, key, machineName string) Operati
 		simple := m.validate(ctx, key, "")
 		if simple.HTTP && simple.Valid {
 			m.saveValidation(key, simple, result{})
-			return Operation{true, "授权已激活。", m.Status()}
+			return Operation{true, "授权已激活。", m.statusLocked()}
 		}
-		return Operation{false, activation.message("设备激活失败。"), m.Status()}
+		return Operation{false, activation.message("设备激活失败。"), m.statusLocked()}
 	}
 	validation = m.validate(ctx, key, fp)
 	if validation.HTTP && validation.Valid {
 		m.saveValidation(key, validation, activation)
-		return Operation{true, "授权已激活。", m.Status()}
+		return Operation{true, "授权已激活。", m.statusLocked()}
 	}
 	simple := m.validate(ctx, key, "")
 	if simple.HTTP && simple.Valid {
 		m.saveValidation(key, simple, result{})
-		return Operation{true, "授权已激活。", m.Status()}
+		return Operation{true, "授权已激活。", m.statusLocked()}
 	}
-	return Operation{false, validation.message("设备已提交，但授权校验未通过。"), m.Status()}
+	return Operation{false, validation.message("设备已提交，但授权校验未通过。"), m.statusLocked()}
 }
 
 func (m *Manager) Refresh(ctx context.Context) Operation {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.state.LicenseKey == "" {
-		return Operation{false, "当前没有已保存的激活码。", m.Status()}
+		return Operation{false, "当前没有已保存的激活码。", m.statusLocked()}
 	}
 	fingerprint := ""
 	if m.state.MachineID != "" {
@@ -180,29 +192,31 @@ func (m *Manager) Refresh(ctx context.Context) Operation {
 	}
 	r := m.validate(ctx, m.state.LicenseKey, fingerprint)
 	if !r.HTTP || !r.Valid {
-		return Operation{false, r.message("授权刷新失败。"), m.Status()}
+		return Operation{false, r.message("授权刷新失败。"), m.statusLocked()}
 	}
 	m.saveValidation(m.state.LicenseKey, r, result{})
-	return Operation{true, "授权状态已刷新。", m.Status()}
+	return Operation{true, "授权状态已刷新。", m.statusLocked()}
 }
 
 func (m *Manager) Deactivate(ctx context.Context) Operation {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.state.LicenseKey != "" && m.state.MachineID != "" {
 		req, _ := http.NewRequestWithContext(ctx, http.MethodDelete, m.url("/machines/"+m.state.MachineID), nil)
 		req.Header.Set("Accept", "application/vnd.api+json")
 		req.Header.Set("Authorization", "License "+m.state.LicenseKey)
 		resp, err := m.client.Do(req)
 		if err != nil {
-			return Operation{false, "解绑失败：" + err.Error(), m.Status()}
+			return Operation{false, "解绑失败：" + err.Error(), m.statusLocked()}
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != 200 && resp.StatusCode != 202 && resp.StatusCode != 204 && resp.StatusCode != 404 {
-			return Operation{false, fmt.Sprintf("解绑失败：HTTP %d", resp.StatusCode), m.Status()}
+			return Operation{false, fmt.Sprintf("解绑失败：HTTP %d", resp.StatusCode), m.statusLocked()}
 		}
 	}
 	m.state = State{}
 	_ = m.persist()
-	return Operation{true, "当前设备已解绑。", m.Status()}
+	return Operation{true, "当前设备已解绑。", m.statusLocked()}
 }
 
 type result struct {

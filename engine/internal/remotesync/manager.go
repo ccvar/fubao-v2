@@ -33,6 +33,14 @@ const (
 	fallbackHold       = time.Minute
 )
 
+type PullScope string
+
+const (
+	PullNone       PullScope = "none"
+	PullRedPackets PullScope = "red_packets"
+	PullAll        PullScope = "all"
+)
+
 type Config struct {
 	Version          int    `json:"version"`
 	Enabled          bool   `json:"enabled"`
@@ -40,12 +48,16 @@ type Config struct {
 	FallbackEndpoint string `json:"fallback_endpoint"`
 	EnrollmentToken  string `json:"enrollment_token,omitempty"`
 	DeviceToken      string `json:"device_token,omitempty"`
+	DeviceAccess     string `json:"device_access,omitempty"`
 	PullCursor       int64  `json:"pull_cursor,omitempty"`
+	RoomPullCursor   int64  `json:"room_pull_cursor,omitempty"`
+	PacketPullCursor int64  `json:"packet_pull_cursor,omitempty"`
 }
 
 type Status struct {
 	Enabled          bool   `json:"enabled"`
 	Configured       bool   `json:"configured"`
+	UploadOnly       bool   `json:"upload_only"`
 	Endpoint         string `json:"endpoint"`
 	FallbackEndpoint string `json:"fallback_endpoint"`
 	ActiveEndpoint   string `json:"active_endpoint,omitempty"`
@@ -138,6 +150,7 @@ func (m *Manager) loadConfig() error {
 	}
 	if token := strings.TrimSpace(os.Getenv("FUBAO_SYNC_DEVICE_TOKEN")); token != "" {
 		m.config.DeviceToken = token
+		m.config.DeviceAccess = syncprotocol.DeviceAccessFull
 		m.config.Enabled = true
 	}
 	endpoint, err := syncprotocol.NormalizeEndpoint(m.config.Endpoint)
@@ -151,6 +164,13 @@ func (m *Manager) loadConfig() error {
 	m.config.Version = configVersion
 	m.config.Endpoint = endpoint
 	m.config.FallbackEndpoint = fallbackEndpoint
+	if m.config.DeviceToken != "" && m.config.DeviceAccess == "" {
+		m.config.DeviceAccess = syncprotocol.DeviceAccessFull
+	}
+	if m.config.PullCursor > 0 && m.config.RoomPullCursor == 0 && m.config.PacketPullCursor == 0 {
+		m.config.RoomPullCursor = m.config.PullCursor
+		m.config.PacketPullCursor = m.config.PullCursor
+	}
 	return m.saveConfigLocked()
 }
 
@@ -196,9 +216,11 @@ func (m *Manager) loadOutbox() error {
 func (m *Manager) Status() Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	accessMode := m.deviceAccessLocked()
 	return Status{
-		Enabled:          m.config.Enabled,
-		Configured:       m.config.DeviceToken != "" || m.config.EnrollmentToken != "",
+		Enabled:          m.config.Enabled && accessMode == syncprotocol.DeviceAccessFull,
+		Configured:       m.config.EnrollmentToken != "" || accessMode == syncprotocol.DeviceAccessFull,
+		UploadOnly:       accessMode == syncprotocol.DeviceAccessUploadOnly,
 		Endpoint:         m.config.Endpoint,
 		FallbackEndpoint: m.config.FallbackEndpoint,
 		ActiveEndpoint:   m.activeEndpoint,
@@ -225,9 +247,6 @@ func (m *Manager) Run(ctx context.Context) {
 }
 
 func (m *Manager) attempt(ctx context.Context) {
-	if !m.enabled() {
-		return
-	}
 	if err := m.ensureRegistered(ctx); err != nil {
 		m.recordError(err)
 		return
@@ -261,22 +280,26 @@ func (m *Manager) ensureRegisteredLocked(ctx context.Context) error {
 	clientID := m.clientID
 	clientName := m.clientName
 	m.mu.Unlock()
-	if enrollmentToken == "" {
-		return errors.New("远程同步尚未配置设备注册令牌")
-	}
 	payload := syncprotocol.RegisterRequest{
 		Version: syncprotocol.Version, ClientID: clientID, ClientName: clientName,
 		Platform: runtime.GOOS + "/" + runtime.GOARCH, AppVersion: "0.1.0",
 	}
 	var response syncprotocol.RegisterResponse
-	if err := m.postJSON(ctx, "/devices/register", enrollmentToken, payload, &response); err != nil {
+	route := "/devices/register"
+	accessMode := syncprotocol.DeviceAccessFull
+	if enrollmentToken == "" {
+		route = "/devices/register-upload"
+		accessMode = syncprotocol.DeviceAccessUploadOnly
+	}
+	if err := m.postJSON(ctx, route, enrollmentToken, payload, &response); err != nil {
 		return err
 	}
-	if response.Version != syncprotocol.Version || response.ClientID != clientID || strings.TrimSpace(response.DeviceToken) == "" {
+	if response.Version != syncprotocol.Version || response.ClientID != clientID || strings.TrimSpace(response.DeviceToken) == "" || response.AccessMode != accessMode {
 		return errors.New("远程同步设备注册响应无效")
 	}
 	m.mu.Lock()
 	m.config.DeviceToken = strings.TrimSpace(response.DeviceToken)
+	m.config.DeviceAccess = response.AccessMode
 	m.config.EnrollmentToken = ""
 	err := m.saveConfigLocked()
 	m.mu.Unlock()
@@ -298,11 +321,14 @@ func (m *Manager) Configure(ctx context.Context, enabled bool, enrollmentToken s
 	if enrollmentToken != "" {
 		m.config.EnrollmentToken = enrollmentToken
 		m.config.DeviceToken = ""
+		m.config.DeviceAccess = ""
 		m.activeEndpoint = ""
 		m.activeSince = time.Time{}
 		m.config.PullCursor = 0
+		m.config.RoomPullCursor = 0
+		m.config.PacketPullCursor = 0
 	}
-	if enabled && m.config.DeviceToken == "" && m.config.EnrollmentToken == "" {
+	if enabled && m.config.EnrollmentToken == "" && m.deviceAccessLocked() != syncprotocol.DeviceAccessFull {
 		m.mu.Unlock()
 		return m.Status(), errors.New("请输入服务器安装时生成的注册令牌")
 	}
@@ -423,7 +449,9 @@ func (m *Manager) postJSONTo(ctx context.Context, target, token string, body []b
 	if err != nil {
 		return err
 	}
-	request.Header.Set("Authorization", "Bearer "+token)
+	if strings.TrimSpace(token) != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("User-Agent", "fubao-engine/0.1")
 	response, err := m.httpClient.Do(request)
@@ -543,9 +571,6 @@ func (m *Manager) markEndpointActive(endpoint string) {
 }
 
 func (m *Manager) SyncSnapshot(roomItems []rooms.Room, monitorItems []redpacket.Monitor, events []redpacket.Event) error {
-	if !m.enabled() {
-		return nil
-	}
 	monitorsByRoom := make(map[string]redpacket.Monitor, len(monitorItems)*2)
 	for _, monitor := range monitorItems {
 		monitorsByRoom[monitor.RoomID] = monitor
@@ -595,7 +620,7 @@ func (m *Manager) SyncSnapshot(roomItems []rooms.Room, monitorItems []redpacket.
 }
 
 func (m *Manager) EnqueueEvent(event redpacket.Event) error {
-	if !m.enabled() || event.DataSource == "center" {
+	if event.DataSource == "center" {
 		return nil
 	}
 	item, ok, err := redPacketItem(event)
@@ -625,19 +650,45 @@ func redPacketItem(event redpacket.Event) (syncprotocol.BatchItem, bool, error) 
 }
 
 func (m *Manager) PullOnce(ctx context.Context, roomStore *rooms.Store, redPacketStore *redpacket.Store) error {
-	if !m.enabled() || roomStore == nil || redPacketStore == nil {
+	return m.PullOnceScoped(ctx, roomStore, redPacketStore, PullAll)
+}
+
+func (m *Manager) PullOnceScoped(ctx context.Context, roomStore *rooms.Store, redPacketStore *redpacket.Store, scope PullScope) error {
+	if scope == PullNone || roomStore == nil || redPacketStore == nil {
+		return nil
+	}
+	m.mu.Lock()
+	pullEnabled := m.config.Enabled && m.deviceAccessLocked() == syncprotocol.DeviceAccessFull
+	m.mu.Unlock()
+	if !pullEnabled {
 		return nil
 	}
 	if err := m.ensureRegistered(ctx); err != nil {
 		m.recordError(err)
 		return err
 	}
+	if scope == PullAll {
+		if err := m.pullType(ctx, roomStore, redPacketStore, syncprotocol.ItemRoomState); err != nil {
+			return err
+		}
+	}
+	if scope == PullAll || scope == PullRedPackets {
+		return m.pullType(ctx, roomStore, redPacketStore, syncprotocol.ItemRedPacket)
+	}
+	return nil
+}
+
+func (m *Manager) pullType(ctx context.Context, roomStore *rooms.Store, redPacketStore *redpacket.Store, itemType syncprotocol.ItemType) error {
 	for page := 0; page < 8; page++ {
 		m.mu.Lock()
-		cursor, clientID, deviceToken := m.config.PullCursor, m.clientID, m.config.DeviceToken
+		cursor := m.config.PacketPullCursor
+		if itemType == syncprotocol.ItemRoomState {
+			cursor = m.config.RoomPullCursor
+		}
+		clientID, deviceToken := m.clientID, m.config.DeviceToken
 		m.mu.Unlock()
 		var response syncprotocol.ChangesResponse
-		route := fmt.Sprintf("/sync/changes?cursor=%d&limit=%d", cursor, syncprotocol.MaxChanges)
+		route := fmt.Sprintf("/sync/changes?cursor=%d&limit=%d&type=%s", cursor, syncprotocol.MaxChanges, url.QueryEscape(string(itemType)))
 		if err := m.getJSON(ctx, route, deviceToken, &response); err != nil {
 			m.recordError(err)
 			return err
@@ -650,7 +701,7 @@ func (m *Manager) PullOnce(ctx context.Context, roomStore *rooms.Store, redPacke
 		centerRooms := make([]rooms.CenterRoom, 0)
 		centerEvents := make([]redpacket.CenterEvent, 0)
 		for _, change := range response.Changes {
-			if change.Cursor <= cursor || change.OriginClientID == clientID {
+			if change.Cursor <= cursor || change.OriginClientID == clientID || change.Type != itemType {
 				continue
 			}
 			switch change.Type {
@@ -691,8 +742,16 @@ func (m *Manager) PullOnce(ctx context.Context, roomStore *rooms.Store, redPacke
 			}
 		}
 		m.mu.Lock()
-		if response.NextCursor > m.config.PullCursor {
-			m.config.PullCursor = response.NextCursor
+		changedCursor := false
+		if itemType == syncprotocol.ItemRoomState && response.NextCursor > m.config.RoomPullCursor {
+			m.config.RoomPullCursor = response.NextCursor
+			changedCursor = true
+		}
+		if itemType == syncprotocol.ItemRedPacket && response.NextCursor > m.config.PacketPullCursor {
+			m.config.PacketPullCursor = response.NextCursor
+			changedCursor = true
+		}
+		if changedCursor {
 			if err := m.saveConfigLocked(); err != nil {
 				m.mu.Unlock()
 				return err
@@ -710,9 +769,6 @@ func (m *Manager) PullOnce(ctx context.Context, roomStore *rooms.Store, redPacke
 func (m *Manager) enqueue(items []syncprotocol.BatchItem) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if !m.config.Enabled {
-		return nil
-	}
 	index := make(map[string]int, len(m.outbox))
 	roomCount := 0
 	for i, item := range m.outbox {
@@ -749,10 +805,14 @@ func (m *Manager) enqueue(items []syncprotocol.BatchItem) error {
 	return m.saveOutboxLocked()
 }
 
-func (m *Manager) enabled() bool {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.config.Enabled
+func (m *Manager) deviceAccessLocked() string {
+	if m.config.DeviceToken == "" {
+		return ""
+	}
+	if m.config.DeviceAccess == "" {
+		return syncprotocol.DeviceAccessFull
+	}
+	return m.config.DeviceAccess
 }
 
 func (m *Manager) recordError(err error) {

@@ -55,7 +55,7 @@ func TestSnapshotOutboxContainsOnlySafeRoomAndPacketData(t *testing.T) {
 	}
 }
 
-func TestDisabledManagerDoesNotQueue(t *testing.T) {
+func TestUnconfiguredManagerStillQueuesSafeUploads(t *testing.T) {
 	manager, err := New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -64,8 +64,8 @@ func TestDisabledManagerDoesNotQueue(t *testing.T) {
 	if err := manager.EnqueueEvent(redpacket.Event{WebRID: "123456", PacketID: "packet", DetectedAt: now}); err != nil {
 		t.Fatal(err)
 	}
-	if manager.Status().Pending != 0 {
-		t.Fatal("disabled remote sync queued an event")
+	if manager.Status().Pending != 1 {
+		t.Fatal("unconfigured remote sync did not queue its safe upload")
 	}
 }
 
@@ -165,6 +165,61 @@ func TestManagerRegistersAndFlushesToServer(t *testing.T) {
 	}
 	if strings.Contains(string(configContent), enrollmentToken) || !strings.Contains(string(configContent), "device_token") {
 		t.Fatalf("enrollment token was not replaced with a device token: %s", configContent)
+	}
+}
+
+func TestManagerAutoRegistersUploadOnlyWithoutSyncKey(t *testing.T) {
+	store, err := syncserver.OpenStore(filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service, err := syncserver.New(store, "0123456789abcdef0123456789abcdef", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewTLSServer(service.Handler())
+	defer server.Close()
+
+	dataDir := t.TempDir()
+	content, _ := json.Marshal(Config{Version: configVersion, Endpoint: server.URL + "/api/v1", FallbackEndpoint: server.URL + "/api/v1"})
+	if err := os.WriteFile(filepath.Join(dataDir, "remote_sync.json"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.httpClient = server.Client()
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	if err := manager.EnqueueEvent(redpacket.Event{WebRID: "987654", PacketID: "upload-only", Title: "钻石红包", DetectedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	manager.attempt(context.Background())
+	status := manager.Status()
+	if status.Pending != 0 || !status.UploadOnly || status.Configured || status.Enabled || status.ActiveEndpoint == "" {
+		t.Fatalf("unexpected upload-only status: %+v", status)
+	}
+	stats, err := store.Stats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Devices != 1 || stats.RedPacket != 1 {
+		t.Fatalf("automatic upload did not reach center: %+v", stats)
+	}
+	roomStore, err := rooms.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	packetStore, err := redpacket.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.PullOnceScoped(context.Background(), roomStore, packetStore, PullAll); err != nil {
+		t.Fatal(err)
+	}
+	if len(roomStore.List()) != 0 || len(packetStore.EventsAll()) != 0 {
+		t.Fatal("upload-only device received center data")
 	}
 }
 
@@ -353,14 +408,24 @@ func TestPullOnceImportsOtherClientDataWithoutEchoingIt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := managerB.PullOnce(context.Background(), roomStoreB, redPacketStoreB); err != nil {
+	if err := managerB.PullOnceScoped(context.Background(), roomStoreB, redPacketStoreB, PullRedPackets); err != nil {
+		t.Fatal(err)
+	}
+	if roomsB := roomStoreB.List(); len(roomsB) != 0 {
+		t.Fatalf("finite-license pull imported center rooms: %+v", roomsB)
+	}
+	eventsB := redPacketStoreB.EventsAll()
+	if len(eventsB) != 1 || eventsB[0].DataSource != "center" || eventsB[0].PacketID != "packet-center" {
+		t.Fatalf("finite-license pull did not import center packet: %+v", eventsB)
+	}
+	if err := managerB.PullOnceScoped(context.Background(), roomStoreB, redPacketStoreB, PullAll); err != nil {
 		t.Fatal(err)
 	}
 	roomsB := roomStoreB.List()
 	if len(roomsB) != 1 || roomsB[0].Source != "center" {
 		t.Fatalf("other-client room was not marked as center data: %+v", roomsB)
 	}
-	eventsB := redPacketStoreB.EventsAll()
+	eventsB = redPacketStoreB.EventsAll()
 	if len(eventsB) != 1 || eventsB[0].DataSource != "center" || eventsB[0].PacketID != "packet-center" {
 		t.Fatalf("other-client packet was not marked as center data: %+v", eventsB)
 	}

@@ -29,7 +29,7 @@ func TestRegisterAndSyncBatch(t *testing.T) {
 	register := syncprotocol.RegisterRequest{Version: syncprotocol.Version, ClientID: "desktop-test", ClientName: "测试客户端", Platform: "darwin/arm64"}
 	var registration syncprotocol.RegisterResponse
 	requestJSON(t, httpServer.Client(), http.MethodPost, httpServer.URL+"/api/v1/devices/register", "0123456789abcdef0123456789abcdef", register, http.StatusCreated, &registration)
-	if registration.DeviceToken == "" {
+	if registration.DeviceToken == "" || registration.AccessMode != syncprotocol.DeviceAccessFull {
 		t.Fatal("device token was empty")
 	}
 
@@ -74,6 +74,77 @@ func TestRegisterAndSyncBatch(t *testing.T) {
 	requestJSON(t, httpServer.Client(), http.MethodGet, httpServer.URL+"/api/v1/sync/changes?cursor=0&limit=200", registration.DeviceToken, nil, http.StatusOK, &unchanged)
 	if len(unchanged.Changes) != 2 {
 		t.Fatalf("unchanged snapshot created duplicate center changes: %+v", unchanged.Changes)
+	}
+}
+
+func TestUploadOnlyRegistrationCanWriteButCannotReadChanges(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service, err := New(store, "0123456789abcdef0123456789abcdef", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(service.Handler())
+	defer httpServer.Close()
+
+	register := syncprotocol.RegisterRequest{Version: syncprotocol.Version, ClientID: "desktop_upload_test", ClientName: "仅上传客户端"}
+	var registration syncprotocol.RegisterResponse
+	requestJSON(t, httpServer.Client(), http.MethodPost, httpServer.URL+"/api/v1/devices/register-upload", "", register, http.StatusCreated, &registration)
+	if registration.AccessMode != syncprotocol.DeviceAccessUploadOnly || registration.DeviceToken == "" {
+		t.Fatalf("unexpected upload registration: %+v", registration)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	packetPayload, _ := json.Marshal(syncprotocol.RedPacket{WebRID: "654321", PacketID: "packet-upload", DetectedAt: now})
+	batch := syncprotocol.BatchRequest{
+		Version: syncprotocol.Version, RequestID: "upload-request", ClientID: registration.ClientID, SentAt: now,
+		Items: []syncprotocol.BatchItem{{Type: syncprotocol.ItemRedPacket, IdempotencyKey: "red_packet:654321:packet-upload", OccurredAt: now, Payload: packetPayload}},
+	}
+	var batchResponse syncprotocol.BatchResponse
+	requestJSON(t, httpServer.Client(), http.MethodPost, httpServer.URL+"/api/v1/sync/batch", registration.DeviceToken, batch, http.StatusOK, &batchResponse)
+	var denied map[string]any
+	requestJSON(t, httpServer.Client(), http.MethodGet, httpServer.URL+"/api/v1/sync/changes?cursor=0&limit=200", registration.DeviceToken, nil, http.StatusForbidden, &denied)
+	stats, err := store.Stats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Devices != 1 || stats.RedPacket != 1 {
+		t.Fatalf("upload-only batch was not persisted: %+v", stats)
+	}
+}
+
+func TestFullRegistrationUpgradesUploadOnlyDevice(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	enrollmentToken := "0123456789abcdef0123456789abcdef"
+	service, err := New(store, enrollmentToken, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(service.Handler())
+	defer httpServer.Close()
+
+	register := syncprotocol.RegisterRequest{Version: syncprotocol.Version, ClientID: "desktop_upgrade_test", ClientName: "升级测试客户端"}
+	var uploadOnly syncprotocol.RegisterResponse
+	requestJSON(t, httpServer.Client(), http.MethodPost, httpServer.URL+"/api/v1/devices/register-upload", "", register, http.StatusCreated, &uploadOnly)
+
+	var full syncprotocol.RegisterResponse
+	requestJSON(t, httpServer.Client(), http.MethodPost, httpServer.URL+"/api/v1/devices/register", enrollmentToken, register, http.StatusCreated, &full)
+	if full.AccessMode != syncprotocol.DeviceAccessFull || full.DeviceToken == "" || full.DeviceToken == uploadOnly.DeviceToken {
+		t.Fatalf("unexpected upgraded registration: upload=%+v full=%+v", uploadOnly, full)
+	}
+
+	var rejected map[string]any
+	requestJSON(t, httpServer.Client(), http.MethodGet, httpServer.URL+"/api/v1/sync/changes?cursor=0&limit=200", uploadOnly.DeviceToken, nil, http.StatusUnauthorized, &rejected)
+	var changes syncprotocol.ChangesResponse
+	requestJSON(t, httpServer.Client(), http.MethodGet, httpServer.URL+"/api/v1/sync/changes?cursor=0&limit=200", full.DeviceToken, nil, http.StatusOK, &changes)
+	if changes.Version != syncprotocol.Version {
+		t.Fatalf("unexpected changes response after upgrade: %+v", changes)
 	}
 }
 
