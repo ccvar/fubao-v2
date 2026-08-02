@@ -1272,6 +1272,26 @@ fn build_login_webview(label: String) -> WebviewBuilder<tauri::Wry> {
         })
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn webview_data_root(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    {
+        // WebView2 user-data folders are machine-local runtime state. Keeping
+        // them out of roaming AppData avoids Windows profile synchronization
+        // and environment-lock stalls while a child WebView is being created.
+        return app
+            .path()
+            .app_local_data_dir()
+            .map_err(|error| format!("读取本机浏览器数据目录失败：{error}"));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        app.path()
+            .app_data_dir()
+            .map_err(|error| format!("读取浏览器数据目录失败：{error}"))
+    }
+}
+
 #[tauri::command]
 async fn open_account_rebind(
     app: tauri::AppHandle,
@@ -1334,10 +1354,7 @@ async fn open_account_rebind(
     }
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
-        let data_dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| format!("读取登录数据目录失败：{error}"))?
+        let data_dir = webview_data_root(&app)?
             .join("embedded-browser")
             .join(&account_id);
         std::fs::create_dir_all(&data_dir)
@@ -1434,7 +1451,7 @@ fn cancel_account_rebind(
 }
 
 #[tauri::command]
-fn open_account_create(
+async fn open_account_create(
     app: tauri::AppHandle,
     window: tauri::Window,
     session_id: String,
@@ -1469,10 +1486,7 @@ fn open_account_create(
     }
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
-        let data_dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| format!("读取登录数据目录失败：{error}"))?
+        let data_dir = webview_data_root(&app)?
             .join("account-create")
             .join(&session_id);
         std::fs::create_dir_all(&data_dir)
@@ -1782,10 +1796,7 @@ async fn ensure_browser_webview(
     }
     #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
-        let data_dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| format!("读取实例数据目录失败：{error}"))?
+        let data_dir = webview_data_root(&app)?
             .join("embedded-browser")
             .join(&credential.account_id);
         std::fs::create_dir_all(&data_dir)
