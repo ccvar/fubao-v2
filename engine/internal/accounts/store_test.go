@@ -376,6 +376,59 @@ func TestUpsertAuthenticatedCookieCreatesAndDeduplicates(t *testing.T) {
 	}
 }
 
+func TestParticipationGroupsPersistAndRemainRoleScoped(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	group, err := store.CreateParticipationGroup("主力账号")
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, created, err := store.UpsertImportedCookieWithGroup(
+		"sessionid_ss=grouped-account",
+		"分组账号",
+		"20001",
+		"sec-20001",
+		RoleParticipation,
+		group.ID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || view.Participation == nil || view.Participation.GroupID != group.ID {
+		t.Fatalf("participation group was not assigned: created=%v view=%+v", created, view)
+	}
+	view, _, err = store.UpsertImportedCookie("sessionid_ss=grouped-account", "分组账号", "20001", "sec-20001", RoleMonitoring)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Monitoring == nil || view.Participation == nil || view.Participation.GroupID != group.ID {
+		t.Fatalf("adding monitoring role changed participation grouping: %+v", view)
+	}
+
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	groups := reloaded.ListParticipationGroups()
+	if len(groups) != 1 || groups[0].ID != group.ID || groups[0].Name != group.Name {
+		t.Fatalf("participation groups did not persist: %+v", groups)
+	}
+	accounts := reloaded.List(RoleParticipation)
+	if len(accounts) != 1 || accounts[0].Participation == nil || accounts[0].Participation.GroupID != group.ID {
+		t.Fatalf("account group did not persist: %+v", accounts)
+	}
+	ungrouped, err := reloaded.SetParticipationGroup(accounts[0].ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ungrouped.Participation == nil || ungrouped.Participation.GroupID != "" {
+		t.Fatalf("account was not moved to ungrouped: %+v", ungrouped)
+	}
+}
+
 func hasRoleInView(account AccountView, role Role) bool {
 	for _, item := range account.Roles {
 		if item == role {

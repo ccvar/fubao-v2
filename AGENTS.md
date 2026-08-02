@@ -18,6 +18,8 @@ Account sorting lives beside the “状态与数据” table heading and follows
 
 账号导入入口必须明确显示当前目标分类，避免让用户猜测账号会进入“参与账号”还是“监测账号”。“粘贴 Cookie / 扫码登录 / 批量导入文件 / 批量导入文件夹”都添加到当前明确显示的目标分类；同一账号再次导入到另一分类时只补充分配，不移除原分类。批量导入兼容旧福宝账号 JSON、浏览器 Cookie JSON、原始 Cookie 或 Cookie Header、cURL、Netscape cookie.txt，以及逐行 Cookie 文本。
 
+只有参与账号拥有一个由 Go 账号存储持久化的分组，监测账号不显示也不保存分组。参与账号页在状态筛选旁提供分组筛选与新建分组，列表提供独立分组列并允许修改归属；“粘贴 Cookie / 扫码登录 / 批量导入文件 / 批量导入文件夹”四种参与账号导入方式都必须明确选择目标分组，浏览器实例创建弹窗也必须支持按参与账号分组筛选。
+
 All hover help in the desktop UI uses the shared dark in-app Tooltip (`data-tooltip` plus an edge-safe placement), never the browser-native `title` tooltip. Keep `aria-label` on icon-only controls.
 
 Top-bar dropdowns and other floating menus must always render above the scrollbars of the business tables beneath them. Native table scrollbar thumbs must never bleed through or visually cover an open menu; hiding only the underlying thumb while a menu is open is acceptable and must not change table scroll position or behavior.

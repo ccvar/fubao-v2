@@ -299,6 +299,49 @@ func main() {
 				OK:      true,
 				Result:  accountStore.List(params.Role),
 			})
+		case "account.participation_group.list":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: accountStore.ListParticipationGroups()})
+		case "account.participation_group.create":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			var params struct {
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "参与账号分组参数无效")
+				continue
+			}
+			group, err := accountStore.CreateParticipationGroup(params.Name)
+			if err != nil {
+				writeError(encoder, req.ID, "participation_group_create_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: group})
+		case "account.participation_group.set":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			var params struct {
+				AccountID string `json:"account_id"`
+				GroupID   string `json:"group_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.AccountID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "参与账号改组参数无效")
+				continue
+			}
+			account, err := accountStore.SetParticipationGroup(params.AccountID, params.GroupID)
+			if err != nil {
+				writeError(encoder, req.ID, "participation_group_set_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: account})
 		case "account.migrate_legacy":
 			if accountStoreErr != nil {
 				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
@@ -331,6 +374,7 @@ func main() {
 			}
 			var params struct {
 				Role    accounts.Role           `json:"role"`
+				GroupID string                  `json:"group_id"`
 				Sources []accounts.ImportSource `json:"sources"`
 			}
 			if err := json.Unmarshal(req.Params, &params); err != nil || (params.Role != accounts.RoleMonitoring && params.Role != accounts.RoleParticipation) {
@@ -357,7 +401,7 @@ func main() {
 						record.SecUID = identity.SecUID
 					}
 				}
-				_, created, err := accountStore.UpsertImportedCookie(record.Cookie, record.Nickname, record.UserID, record.SecUID, params.Role)
+				_, created, err := accountStore.UpsertImportedCookieWithGroup(record.Cookie, record.Nickname, record.UserID, record.SecUID, params.Role, params.GroupID)
 				if err != nil {
 					failedCount++
 					continue
@@ -572,9 +616,10 @@ func main() {
 				continue
 			}
 			var params struct {
-				Cookie string        `json:"cookie"`
-				Role   accounts.Role `json:"role"`
-				Secret string        `json:"secret"`
+				Cookie  string        `json:"cookie"`
+				Role    accounts.Role `json:"role"`
+				GroupID string        `json:"group_id"`
+				Secret  string        `json:"secret"`
 			}
 			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.Cookie) == "" {
 				writeError(encoder, req.ID, "invalid_params", "新增扫码账号参数无效")
@@ -592,7 +637,7 @@ func main() {
 				writeError(encoder, req.ID, "account_identity_failed", err.Error())
 				continue
 			}
-			account, created, err := accountStore.UpsertAuthenticatedCookie(params.Cookie, identity.Nickname, identity.UserID, identity.SecUID, params.Role)
+			account, created, err := accountStore.UpsertAuthenticatedCookieWithGroup(params.Cookie, identity.Nickname, identity.UserID, identity.SecUID, params.Role, params.GroupID)
 			if err != nil {
 				writeError(encoder, req.ID, "account_create_failed", err.Error())
 				continue

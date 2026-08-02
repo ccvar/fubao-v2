@@ -19,7 +19,7 @@ import (
 // explicit user choice in this client.
 // The legacy app's counters describe a different runtime, so carrying them
 // across makes the current desktop numbers misleading.
-const storeVersion = 3
+const storeVersion = 4
 
 type Role string
 
@@ -56,6 +56,13 @@ type ParticipationProfile struct {
 	ProxyID                int      `json:"proxy_id"`
 	FingerprintProfileID   int      `json:"fingerprint_profile_id"`
 	Tags                   []string `json:"tags,omitempty"`
+	GroupID                string   `json:"group_id,omitempty"`
+}
+
+type ParticipationGroup struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	CreatedAt string `json:"created_at"`
 }
 
 // RedPacketParticipationCredential is private engine-only data used by the Go
@@ -85,8 +92,9 @@ type Account struct {
 }
 
 type accountFile struct {
-	Version  int        `json:"version"`
-	Accounts []*Account `json:"accounts"`
+	Version             int                   `json:"version"`
+	Accounts            []*Account            `json:"accounts"`
+	ParticipationGroups []*ParticipationGroup `json:"participation_groups,omitempty"`
 }
 
 type AccountView struct {
@@ -124,6 +132,7 @@ type Store struct {
 	mu                            sync.Mutex
 	path                          string
 	accounts                      map[string]*Account
+	participationGroups           map[string]*ParticipationGroup
 	monitoringUsageDirty          bool
 	monitoringUsageFlushScheduled bool
 }
@@ -151,8 +160,9 @@ func NewStore(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("创建账号数据目录失败: %w", err)
 	}
 	store := &Store{
-		path:     filepath.Join(dataDir, "accounts.json"),
-		accounts: map[string]*Account{},
+		path:                filepath.Join(dataDir, "accounts.json"),
+		accounts:            map[string]*Account{},
+		participationGroups: map[string]*ParticipationGroup{},
 	}
 	if err := store.load(); err != nil {
 		return nil, err
@@ -190,6 +200,14 @@ func (s *Store) load() error {
 			account.Monitoring.TodayRequestCount = 0
 		}
 		s.accounts[account.ID] = account
+	}
+	for _, group := range file.ParticipationGroups {
+		if group == nil || strings.TrimSpace(group.ID) == "" || strings.TrimSpace(group.Name) == "" {
+			continue
+		}
+		copy := *group
+		copy.Name = strings.TrimSpace(copy.Name)
+		s.participationGroups[copy.ID] = &copy
 	}
 	if needsUpgrade {
 		if err := s.saveLocked(); err != nil {
@@ -273,7 +291,12 @@ func (s *Store) saveLocked() error {
 	sort.Slice(items, func(i, j int) bool {
 		return items[i].CreatedAt < items[j].CreatedAt
 	})
-	payload, err := json.MarshalIndent(accountFile{Version: storeVersion, Accounts: items}, "", "  ")
+	groups := make([]*ParticipationGroup, 0, len(s.participationGroups))
+	for _, group := range s.participationGroups {
+		groups = append(groups, group)
+	}
+	sort.Slice(groups, func(i, j int) bool { return groups[i].CreatedAt < groups[j].CreatedAt })
+	payload, err := json.MarshalIndent(accountFile{Version: storeVersion, Accounts: items, ParticipationGroups: groups}, "", "  ")
 	if err != nil {
 		return fmt.Errorf("序列化账号数据失败: %w", err)
 	}
@@ -309,6 +332,70 @@ func (s *Store) List(role Role) []AccountView {
 		return items[i].Name < items[j].Name
 	})
 	return items
+}
+
+func (s *Store) ListParticipationGroups() []ParticipationGroup {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := make([]ParticipationGroup, 0, len(s.participationGroups))
+	for _, group := range s.participationGroups {
+		items = append(items, *group)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].CreatedAt == items[j].CreatedAt {
+			return items[i].Name < items[j].Name
+		}
+		return items[i].CreatedAt < items[j].CreatedAt
+	})
+	return items
+}
+
+func (s *Store) CreateParticipationGroup(name string) (ParticipationGroup, error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return ParticipationGroup{}, errors.New("分组名称不能为空")
+	}
+	if len([]rune(name)) > 24 {
+		return ParticipationGroup{}, errors.New("分组名称最多 24 个字")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, group := range s.participationGroups {
+		if strings.EqualFold(group.Name, name) {
+			return *group, nil
+		}
+	}
+	now := time.Now().Format(time.RFC3339Nano)
+	sum := sha256.Sum256([]byte("participation-group:" + name + ":" + now))
+	group := &ParticipationGroup{ID: hex.EncodeToString(sum[:8]), Name: name, CreatedAt: now}
+	s.participationGroups[group.ID] = group
+	if err := s.saveLocked(); err != nil {
+		delete(s.participationGroups, group.ID)
+		return ParticipationGroup{}, err
+	}
+	return *group, nil
+}
+
+func (s *Store) SetParticipationGroup(accountID, groupID string) (AccountView, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account := s.accounts[strings.TrimSpace(accountID)]
+	if account == nil {
+		return AccountView{}, errors.New("账号不存在")
+	}
+	if !hasRole(account, RoleParticipation) || account.Participation == nil {
+		return AccountView{}, errors.New("只有参与账号可以设置分组")
+	}
+	groupID = strings.TrimSpace(groupID)
+	if groupID != "" && s.participationGroups[groupID] == nil {
+		return AccountView{}, errors.New("参与账号分组不存在")
+	}
+	account.Participation.GroupID = groupID
+	account.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+	if err := s.saveLocked(); err != nil {
+		return AccountView{}, err
+	}
+	return safeView(account), nil
 }
 
 func (s *Store) ParticipationCredential(accountID string) (BrowserCredential, error) {
@@ -496,17 +583,25 @@ func (s *Store) Credential(accountID string) (BrowserCredential, error) {
 // or refreshes the existing canonical account when the same Douyin identity
 // is already present. Raw Cookie data never leaves the Go store.
 func (s *Store) UpsertAuthenticatedCookie(rawCookie, nickname, userID, secUID string, role Role) (AccountView, bool, error) {
-	return s.upsertCookie(rawCookie, nickname, userID, secUID, role, "qr-login", true)
+	return s.UpsertAuthenticatedCookieWithGroup(rawCookie, nickname, userID, secUID, role, "")
+}
+
+func (s *Store) UpsertAuthenticatedCookieWithGroup(rawCookie, nickname, userID, secUID string, role Role, groupID string) (AccountView, bool, error) {
+	return s.upsertCookie(rawCookie, nickname, userID, secUID, role, groupID, "qr-login", true)
 }
 
 // UpsertImportedCookie stores an explicitly imported Cookie in the selected
 // role without claiming it has already passed an online check. The safe view
 // never exposes the imported Cookie.
 func (s *Store) UpsertImportedCookie(rawCookie, nickname, userID, secUID string, role Role) (AccountView, bool, error) {
-	return s.upsertCookie(rawCookie, nickname, userID, secUID, role, "manual-import", false)
+	return s.UpsertImportedCookieWithGroup(rawCookie, nickname, userID, secUID, role, "")
 }
 
-func (s *Store) upsertCookie(rawCookie, nickname, userID, secUID string, role Role, source string, authenticated bool) (AccountView, bool, error) {
+func (s *Store) UpsertImportedCookieWithGroup(rawCookie, nickname, userID, secUID string, role Role, groupID string) (AccountView, bool, error) {
+	return s.upsertCookie(rawCookie, nickname, userID, secUID, role, groupID, "manual-import", false)
+}
+
+func (s *Store) upsertCookie(rawCookie, nickname, userID, secUID string, role Role, groupID, source string, authenticated bool) (AccountView, bool, error) {
 	rawCookie = strings.TrimSpace(rawCookie)
 	if rawCookie == "" {
 		return AccountView{}, false, errors.New("没有读取到可导入的 Cookie")
@@ -516,6 +611,10 @@ func (s *Store) upsertCookie(rawCookie, nickname, userID, secUID string, role Ro
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	groupID = strings.TrimSpace(groupID)
+	if role == RoleParticipation && groupID != "" && s.participationGroups[groupID] == nil {
+		return AccountView{}, false, errors.New("参与账号分组不存在")
+	}
 	identityIndex := map[string]*Account{}
 	for _, item := range s.accounts {
 		indexIdentity(identityIndex, item)
@@ -536,6 +635,9 @@ func (s *Store) upsertCookie(rawCookie, nickname, userID, secUID string, role Ro
 	}
 	if role == RoleParticipation && account.Participation == nil {
 		account.Participation = &ParticipationProfile{Enabled: true}
+	}
+	if role == RoleParticipation {
+		account.Participation.GroupID = groupID
 	}
 	if authenticated {
 		account.CookieStatus = cookieStatusValid

@@ -54,6 +54,7 @@
   type AccountRole = "monitoring" | "participation";
   type ManagementTab = "redpackets" | "rooms" | "participation-records" | AccountRole;
   type AccountStatusFilter = "all" | "available" | "expired" | "cooldown";
+  type ParticipationGroupFilter = "all" | "ungrouped" | string;
   type RoomSortMode = "default" | "instance-first" | "live-first" | "recent-live" | "recent-redpacket";
   type MonitoringAccountSortMode = "default" | "total-requests" | "today-requests" | "last-request" | "created-at";
   type ParticipationAccountSortMode = "default" | "available-first" | "join-count" | "win-count" | "created-at";
@@ -131,6 +132,13 @@
     proxy_id?: number;
     fingerprint_profile_id?: number;
     tags?: string[];
+    group_id?: string;
+  };
+
+  type ParticipationGroup = {
+    id: string;
+    name: string;
+    created_at: string;
   };
 
   type AccountItem = {
@@ -609,6 +617,7 @@
   let browserLayoutRevision = 0;
   let browserLayoutChanging = false;
   let selectedParticipationAccountIds: string[] = [];
+  let instanceParticipationGroupFilter: ParticipationGroupFilter = "all";
   let instanceAccountsRefreshing = false;
   let managementTab: ManagementTab = "rooms";
   let rooms: RoomItem[] = [];
@@ -650,10 +659,19 @@
   let monitorRuntimeLogs: MonitorRuntimeLog[] = [];
   let accountRole: AccountRole = "participation";
   let accounts: AccountItem[] = [];
+  let participationGroups: ParticipationGroup[] = [];
   let accountsLoading = false;
   let accountsMigrating = false;
   let accountError = "";
   let accountStatusFilter: AccountStatusFilter = "all";
+  let participationGroupFilter: ParticipationGroupFilter = "all";
+  let participationGroupMenuOpen = false;
+  let participationGroupDraft = "";
+  let participationGroupCreating = false;
+  let accountGroupMenuId = "";
+  let importParticipationGroupId = "";
+  let importGroupMenuOpen = false;
+  let accountCreateGroupId = "";
   let statusMenuOpen = false;
   let accountSortMenuOpen = false;
   let monitoringAccountSortMode: MonitoringAccountSortMode = "default";
@@ -838,10 +856,13 @@
     .map((instance) => instance.id)
     .join(",")}`;
   $: if (browserWebviewLayoutKey) scheduleEmbeddedBrowserSync();
-  $: selectableParticipationAccounts = participationAccounts.filter(
+  $: eligibleParticipationAccounts = participationAccounts.filter(
     (account) =>
       account.participation?.enabled &&
       !browserInstances.some((instance) => instance.account_id === account.id),
+  );
+  $: selectableParticipationAccounts = eligibleParticipationAccounts.filter((account) =>
+    participationGroupMatches(account, instanceParticipationGroupFilter),
   );
   $: visibleAccounts = (accountRole === "monitoring" ? monitoringAccounts : participationAccounts)
     .filter((account) => {
@@ -853,7 +874,8 @@
         (accountStatusFilter === "available" && status === "可用") ||
         (accountStatusFilter === "expired" && status === "CK 失效") ||
         (accountStatusFilter === "cooldown" && status === "冷却中");
-      return searchMatches && statusMatches;
+      const groupMatches = accountRole !== "participation" || participationGroupMatches(account, participationGroupFilter);
+      return searchMatches && statusMatches && groupMatches;
     })
     .map((account, index) => ({ account, index }))
     .sort((left, right) => accountSortDifference(left.account, right.account) || left.index - right.index)
@@ -2613,9 +2635,10 @@
 
   function toggleAllParticipationAccounts() {
     if (licenseStatus.state !== "active" || browserCreating) return;
+    const visibleIds = new Set(selectableParticipationAccounts.map((account) => account.id));
     selectedParticipationAccountIds = allSelectableParticipationAccountsSelected()
-      ? []
-      : selectableParticipationAccounts.map((account) => account.id);
+      ? selectedParticipationAccountIds.filter((id) => !visibleIds.has(id))
+      : [...new Set([...selectedParticipationAccountIds, ...visibleIds])];
   }
 
   function selectManagementTab(tab: ManagementTab) {
@@ -2623,6 +2646,8 @@
     accountSortMenuOpen = false;
     roomSortMenuOpen = false;
     statusMenuOpen = false;
+    participationGroupMenuOpen = false;
+    accountGroupMenuId = "";
     query = "";
     roomRenderLimit = 300;
     redPacketRenderLimit = 300;
@@ -2721,6 +2746,58 @@
     return "全部状态";
   }
 
+  function participationGroupName(groupId?: string) {
+    if (!groupId) return "未分组";
+    return participationGroups.find((group) => group.id === groupId)?.name || "未分组";
+  }
+
+  function participationGroupFilterLabel(filter: ParticipationGroupFilter) {
+    if (filter === "all") return "全部分组";
+    if (filter === "ungrouped") return "未分组";
+    return participationGroupName(filter);
+  }
+
+  function participationGroupMatches(account: AccountItem, filter: ParticipationGroupFilter) {
+    if (filter === "all") return true;
+    const groupId = account.participation?.group_id || "";
+    return filter === "ungrouped" ? !groupId : groupId === filter;
+  }
+
+  async function createParticipationGroup(target: "filter" | "import" | "instance" = "filter") {
+    const name = participationGroupDraft.trim();
+    if (!name || participationGroupCreating) return;
+    participationGroupCreating = true;
+    try {
+      const group = await engineRequest<ParticipationGroup>("account.participation_group.create", { name });
+      participationGroups = await engineRequest<ParticipationGroup[]>("account.participation_group.list");
+      participationGroupDraft = "";
+      if (target === "filter") participationGroupFilter = group.id;
+      if (target === "import") {
+        importParticipationGroupId = group.id;
+        importGroupMenuOpen = false;
+      }
+      if (target === "instance") instanceParticipationGroupFilter = group.id;
+      showToast(`已新建分组「${group.name}」`);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error));
+    } finally {
+      participationGroupCreating = false;
+    }
+  }
+
+  async function setAccountParticipationGroup(account: AccountItem, groupId: string) {
+    try {
+      const updated = await engineRequest<AccountItem>("account.participation_group.set", {
+        account_id: account.id,
+        group_id: groupId,
+      });
+      accounts = accounts.map((item) => item.id === updated.id ? updated : item);
+      accountGroupMenuId = "";
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   function selectAccountStatus(filter: AccountStatusFilter) {
     accountStatusFilter = filter;
     statusMenuOpen = false;
@@ -2728,8 +2805,10 @@
 
   function toggleImportMenu() {
     importMenuOpen = !importMenuOpen;
+    importGroupMenuOpen = false;
     statusMenuOpen = false;
     accountSortMenuOpen = false;
+	participationGroupMenuOpen = false;
 	void closeParticipationTaskMenu();
   }
 
@@ -2737,6 +2816,7 @@
     statusMenuOpen = !statusMenuOpen;
     importMenuOpen = false;
     accountSortMenuOpen = false;
+	participationGroupMenuOpen = false;
 	void closeParticipationTaskMenu();
   }
 
@@ -2748,8 +2828,11 @@
     if (!target.closest(".menu-anchor")) {
       statusMenuOpen = false;
       importMenuOpen = false;
+      importGroupMenuOpen = false;
       roomSortMenuOpen = false;
       accountSortMenuOpen = false;
+	  participationGroupMenuOpen = false;
+	  accountGroupMenuId = "";
 	  participationScheduleUnitMenuOpen = false;
 	  void closeParticipationTaskMenu();
     }
@@ -2886,7 +2969,11 @@
         failed: number;
         invalid_sources: number;
         total: number;
-      }>("account.import_cookies", { role, sources });
+      }>("account.import_cookies", {
+        role,
+        sources,
+        group_id: role === "participation" ? importParticipationGroupId : "",
+      });
       await loadAccounts(false);
       managementTab = role;
       accountRole = role;
@@ -2912,6 +2999,7 @@
     }
     if (accountRebindOpeningId || accountRebindCompleting) return;
     accountCreateRole = managementTab === "monitoring" || managementTab === "participation" ? managementTab : accountRole;
+    accountCreateGroupId = accountCreateRole === "participation" ? importParticipationGroupId : "";
     const sessionId = crypto.randomUUID();
     accountCreateSessionId = sessionId;
     accountRebinding = null;
@@ -3593,8 +3681,12 @@
     accountsLoading = true;
     accountError = "";
     try {
-      const items = await engineRequest<AccountItem[]>("account.list");
+      const [items, groups] = await Promise.all([
+        engineRequest<AccountItem[]>("account.list"),
+        engineRequest<ParticipationGroup[]>("account.participation_group.list"),
+      ]);
       accounts = items;
+      participationGroups = groups;
       // The Go sidecar reads RPC messages serially. Revalidating every imported
       // account here can occupy that queue for minutes and block interactive
       // actions such as opening the native CK rebind window. The list already
@@ -3673,6 +3765,7 @@
       // The native child must be hidden before its HTML mount disappears.
       accountRebinding = null;
       accountCreateSessionId = "";
+      accountCreateGroupId = "";
       void tick().then(scheduleEmbeddedBrowserSync);
     } catch (error) {
       // Keep the modal in place so a failed native close never exposes an
@@ -3703,8 +3796,10 @@
         const result = await invoke<{ created: boolean; account: AccountItem }>("complete_account_create", {
           sessionId: createSessionId,
           role: accountCreateRole,
+          groupId: accountCreateGroupId,
         });
         accountCreateSessionId = "";
+        accountCreateGroupId = "";
         await loadAccounts(false);
         managementTab = accountCreateRole;
         accountRole = accountCreateRole;
@@ -3932,6 +4027,7 @@
 
   async function openInstanceModal() {
     selectedParticipationAccountIds = [];
+    instanceParticipationGroupFilter = "all";
     if (!engineListenerReady) {
       browserError = "Go 引擎尚未连接";
       return;
@@ -4963,6 +5059,34 @@
                 </button>
                 <span class="menu-divider"></span>
                 <span class="import-target-label">账号添加到 <strong>{roleLabel(currentAccountImportRole())}</strong></span>
+                {#if currentAccountImportRole() === "participation"}
+                  <div class="import-group-picker">
+                    <button type="button" class="import-group-trigger" aria-haspopup="menu" aria-expanded={importGroupMenuOpen} onclick={() => (importGroupMenuOpen = !importGroupMenuOpen)}>
+                      <FolderOpen size={15} />
+                      <span>{participationGroupName(importParticipationGroupId)}</span>
+                      <CaretDown size={11} />
+                    </button>
+                    {#if importGroupMenuOpen}
+                      <div class="import-group-options" role="menu" aria-label="选择参与账号导入分组">
+                        <button class:active={!importParticipationGroupId} role="menuitemradio" aria-checked={!importParticipationGroupId} onclick={() => {
+                          importParticipationGroupId = "";
+                          importGroupMenuOpen = false;
+                        }}><span>未分组</span>{#if !importParticipationGroupId}<CheckCircle size={13} weight="fill" />{/if}</button>
+                        {#each participationGroups as group}
+                          <button class:active={importParticipationGroupId === group.id} role="menuitemradio" aria-checked={importParticipationGroupId === group.id} onclick={() => {
+                            importParticipationGroupId = group.id;
+                            importGroupMenuOpen = false;
+                          }}><span>{group.name}</span>{#if importParticipationGroupId === group.id}<CheckCircle size={13} weight="fill" />{/if}</button>
+                        {/each}
+                        <span class="menu-divider"></span>
+                        <div class="group-create-row">
+                          <input bind:value={participationGroupDraft} maxlength="24" placeholder="新建分组" aria-label="新分组名称" onkeydown={(event) => event.key === "Enter" && createParticipationGroup("import")} />
+                          <button type="button" aria-label="新增分组" disabled={!participationGroupDraft.trim() || participationGroupCreating} onclick={() => createParticipationGroup("import")}><Plus size={14} /></button>
+                        </div>
+                      </div>
+                    {/if}
+                  </div>
+                {/if}
                 <button role="menuitem" disabled={accountImportBusy} onclick={pasteAccountCookie}><ClipboardText size={17} /><span>粘贴 Cookie</span></button>
                 <button role="menuitem" disabled={accountImportBusy} onclick={startQrLogin}><QrCode size={17} /><span>扫码登录并添加</span></button>
                 <button role="menuitem" disabled={accountImportBusy} onclick={() => chooseAccountFiles(false)}><FileArrowUp size={17} /><span>批量导入文件</span></button>
@@ -5011,7 +5135,11 @@
       </div>
     </header>
 
-    <section class:account-content={activeView === "accounts"} class="content">
+    <section
+      class:account-content={activeView === "accounts"}
+      class:import-popover-open={activeView === "accounts" && importMenuOpen}
+      class="content"
+    >
       {#if activeView === "browsers"}
         {#if browserError}
           <div class="account-notice error browser-notice">
@@ -5333,6 +5461,37 @@
               </button>
             </div>
           {:else if managementTab === "participation" || managementTab === "monitoring"}
+            <div class="account-tab-filters">
+            {#if managementTab === "participation"}
+              <div class="menu-anchor filter-anchor group-filter-anchor">
+                <button class="filter-button" aria-haspopup="menu" aria-expanded={participationGroupMenuOpen} onclick={() => {
+                  participationGroupMenuOpen = !participationGroupMenuOpen;
+                  statusMenuOpen = false;
+                }}>
+                  <FolderOpen size={15} />
+                  <span>{participationGroupFilterLabel(participationGroupFilter)}</span>
+                  <CaretDown size={12} />
+                </button>
+                {#if participationGroupMenuOpen}
+                  <div class="floating-menu group-filter-menu" role="menu">
+                    {#each [["all", "全部分组"], ["ungrouped", "未分组"], ...participationGroups.map((group) => [group.id, group.name])] as option}
+                      <button class:active={participationGroupFilter === option[0]} role="menuitemradio" aria-checked={participationGroupFilter === option[0]} onclick={() => {
+                        participationGroupFilter = option[0];
+                        participationGroupMenuOpen = false;
+                      }}>
+                        <span>{option[1]}</span>
+                        {#if participationGroupFilter === option[0]}<CheckCircle size={14} weight="fill" />{/if}
+                      </button>
+                    {/each}
+                    <span class="menu-divider"></span>
+                    <div class="group-create-row">
+                      <input bind:value={participationGroupDraft} maxlength="24" placeholder="新建分组" aria-label="新分组名称" onkeydown={(event) => event.key === "Enter" && createParticipationGroup("filter")} />
+                      <button type="button" aria-label="新增分组" disabled={!participationGroupDraft.trim() || participationGroupCreating} onclick={() => createParticipationGroup("filter")}><Plus size={14} /></button>
+                    </div>
+                  </div>
+                {/if}
+              </div>
+            {/if}
             <div class="menu-anchor filter-anchor account-filter-anchor">
               <button
                 class="filter-button"
@@ -5364,6 +5523,7 @@
                   {/each}
                 </div>
               {/if}
+            </div>
             </div>
           {/if}
         </div>
@@ -5674,9 +5834,10 @@
             </div>
           {:else}
             <div class="account-list">
-              <div class="account-list-head">
+              <div class:participation-grid={accountRole === "participation"} class="account-list-head">
                 <span>账号</span>
                 <span>分类</span>
+                {#if accountRole === "participation"}<span>分组</span>{/if}
                 <span class="account-list-status-head menu-anchor">
                   <span>状态与数据</span>
                   <button
@@ -5710,7 +5871,7 @@
                 <span>操作</span>
               </div>
               {#each visibleAccounts as account}
-                <article class="account-row">
+                <article class:participation-grid={accountRole === "participation"} class="account-row">
                   <div class="account-identity">
                     <span class="account-avatar"><UserCircle size={20} weight="fill" /></span>
                     <div>
@@ -5755,6 +5916,23 @@
                       ><Plus size={10} weight="bold" /></button>
                     {/if}
                   </div>
+                  {#if accountRole === "participation"}
+                    <div class="account-group-cell menu-anchor">
+                      <button type="button" class="account-group-button" aria-haspopup="menu" aria-expanded={accountGroupMenuId === account.id} onclick={() => (accountGroupMenuId = accountGroupMenuId === account.id ? "" : account.id)}>
+                        <FolderOpen size={13} />
+                        <span>{participationGroupName(account.participation?.group_id)}</span>
+                        <CaretDown size={10} />
+                      </button>
+                      {#if accountGroupMenuId === account.id}
+                        <div class="floating-menu account-group-menu" role="menu">
+                          <button class:active={!account.participation?.group_id} role="menuitemradio" aria-checked={!account.participation?.group_id} onclick={() => setAccountParticipationGroup(account, "")}><span>未分组</span>{#if !account.participation?.group_id}<CheckCircle size={13} weight="fill" />{/if}</button>
+                          {#each participationGroups as group}
+                            <button class:active={account.participation?.group_id === group.id} role="menuitemradio" aria-checked={account.participation?.group_id === group.id} onclick={() => setAccountParticipationGroup(account, group.id)}><span>{group.name}</span>{#if account.participation?.group_id === group.id}<CheckCircle size={13} weight="fill" />{/if}</button>
+                          {/each}
+                        </div>
+                      {/if}
+                    </div>
+                  {/if}
                   <div class="account-health">
                     <div class="account-health-status">
 					  <span class:warning={accountStatus(account, redPacketClock) === "冷却中"} class:expired={accountStatus(account, redPacketClock) === "CK 失效"} class="status-pill" data-tooltip={accountCookieMessage(account, accountRole) || undefined} data-tooltip-placement="top">
@@ -6379,7 +6557,18 @@
       </p>
 
       <div class="instance-account-heading">
-        <strong>选择参与账号</strong>
+        <span class="instance-account-heading-title">
+          <strong>选择参与账号</strong>
+          <label class="instance-group-filter">
+            <FolderOpen size={13} />
+            <select bind:value={instanceParticipationGroupFilter} aria-label="按参与账号分组筛选">
+              <option value="all">全部分组</option>
+              <option value="ungrouped">未分组</option>
+              {#each participationGroups as group}<option value={group.id}>{group.name}</option>{/each}
+            </select>
+            <CaretDown size={10} />
+          </label>
+        </span>
         <span class="instance-account-heading-actions">
           <span>{selectedParticipationAccountIds.length > 0 ? `${selectedParticipationAccountIds.length} 个已选 · ` : ""}{selectableParticipationAccounts.length} 个可创建</span>
           {#if licenseStatus.state === "active" && selectableParticipationAccounts.length > 0}
@@ -6399,8 +6588,8 @@
       {:else if selectableParticipationAccounts.length === 0}
         <div class="instance-account-empty">
           <UserFocus size={24} />
-          <strong>没有可用的参与账号</strong>
-          <span>已有实例的账号不会重复显示</span>
+          <strong>{eligibleParticipationAccounts.length > 0 ? "当前分组没有可用账号" : "没有可用的参与账号"}</strong>
+          <span>{eligibleParticipationAccounts.length > 0 ? "切换其他分组后再试" : "已有实例的账号不会重复显示"}</span>
           <button
             class="secondary-button"
             onclick={() => {
@@ -6423,7 +6612,7 @@
               <span class="account-avatar"><UserCircle size={20} weight="fill" /></span>
               <span class="instance-account-copy">
                 <strong>{account.nickname || account.name}</strong>
-                <small>{account.user_id ? `抖音号 ${account.user_id}` : "尚未读取抖音号"}</small>
+                <small>{account.user_id ? `抖音号 ${account.user_id}` : "尚未读取抖音号"} · {participationGroupName(account.participation?.group_id)}</small>
               </span>
               <span class="instance-account-state">
                 <span class="status-pill"><span></span>可用</span>

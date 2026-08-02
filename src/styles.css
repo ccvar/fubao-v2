@@ -1506,16 +1506,19 @@ label.browser-column-control[data-tooltip]:focus-within {
   transform: translateZ(0);
 }
 
-/* WebKit may composite a nested table scrollbar above a sibling popover.
-   While the import popover is open, keep the table fully scrollable but make
-   its native thumb visually stay beneath the opaque popover layer. */
-.main-panel:has(.import-menu) .content * {
-  scrollbar-color: transparent transparent;
-}
-
-.main-panel:has(.import-menu) .content *::-webkit-scrollbar-thumb {
-  border-color: transparent;
-  background: transparent;
+/* WebView2/macOS WebKit can composite a table's overlay scrollbar above a
+   sibling popover. Merely making the thumb transparent is unreliable on
+   Windows, so pause the underlying table scroller while this menu is open.
+   Closing the menu restores the original overflow immediately. */
+.content.import-popover-open :is(
+  .account-list,
+  .room-list,
+  .red-packet-monitor-list,
+  .red-packet-event-list,
+  .participation-record-list
+) {
+  overflow-y: hidden;
+  scrollbar-gutter: auto;
 }
 
 .import-target-label {
@@ -1534,6 +1537,91 @@ label.browser-column-control[data-tooltip]:focus-within {
   font-size: 10px;
   font-weight: 650;
 }
+
+.instance-group-filter select {
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: #4e4a43;
+  font: inherit;
+  font-weight: 650;
+  appearance: none;
+}
+
+.import-group-picker {
+  position: relative;
+  margin: 0 0 3px;
+}
+
+.floating-menu .import-group-trigger {
+  min-height: 26px;
+  gap: 6px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #68635c;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.floating-menu .import-group-trigger:hover,
+.floating-menu .import-group-trigger:focus-visible {
+  outline: 0;
+  background: transparent;
+  color: #3f7f6a;
+}
+
+.floating-menu .import-group-trigger > svg:last-child {
+  margin-left: auto;
+  color: currentColor;
+}
+
+.import-group-options {
+  position: absolute;
+  z-index: 4;
+  top: calc(100% + 3px);
+  right: 5px;
+  left: 5px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  box-shadow: 0 12px 28px rgb(45 39 31 / 16%), 0 2px 7px rgb(45 39 31 / 8%);
+}
+
+.group-create-row {
+  display: flex;
+  gap: 4px;
+  padding: 3px 7px 5px;
+}
+
+.group-create-row input {
+  width: 112px;
+  min-width: 0;
+  height: 24px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  outline: 0;
+  font-size: 10px;
+}
+
+.group-create-row input:focus { border-color: #8ca8ef; }
+.floating-menu .group-create-row button {
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
+  min-height: 24px;
+  flex: 0 0 24px;
+  justify-content: center;
+  gap: 0;
+  padding: 0;
+  border-radius: 6px;
+}
+
+.floating-menu .group-create-row button > svg:last-child { margin-left: 0; }
 
 .status-menu {
   top: calc(100% + 4px);
@@ -2599,9 +2687,14 @@ label.browser-column-control[data-tooltip]:focus-within {
   padding-inline: 0;
 }
 
-.account-filter-anchor {
+.account-tab-filters {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   margin-left: auto;
 }
+
+.group-filter-menu { top: calc(100% + 4px); right: 0; min-width: 148px; }
 
 .room-monitor-bulk-actions {
   display: inline-flex;
@@ -2850,6 +2943,11 @@ label.browser-column-control[data-tooltip]:focus-within {
   align-items: center;
   column-gap: 18px;
   padding-inline: var(--management-inline-padding);
+}
+
+.account-list-head.participation-grid,
+.account-row.participation-grid {
+  grid-template-columns: minmax(190px, 1.1fr) minmax(90px, .48fr) minmax(120px, .55fr) minmax(220px, 1.08fr) minmax(170px, auto);
 }
 
 .room-list-head,
@@ -3610,6 +3708,33 @@ label.browser-column-control[data-tooltip]:focus-within {
 .account-row:hover {
   background: #fcfbf9;
 }
+
+.account-group-cell { min-width: 0; }
+
+.account-group-button {
+  display: inline-flex;
+  max-width: 100%;
+  height: 22px;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: #716c64;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.account-group-button:hover,
+.account-group-button:focus-visible {
+  outline: 0;
+  background: transparent;
+  color: #3f7f6a;
+}
+
+.account-group-button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.account-group-menu { top: calc(100% + 3px); left: 0; min-width: 132px; }
 
 .account-identity {
   display: flex;
@@ -5307,6 +5432,25 @@ label.browser-column-control[data-tooltip]:focus-within {
   font-size: 12px;
 }
 
+.instance-account-heading-title,
+.instance-group-filter {
+  display: inline-flex;
+  align-items: center;
+}
+
+.instance-account-heading-title { gap: 8px; }
+
+.instance-group-filter {
+  height: 23px;
+  gap: 4px;
+  padding: 0 7px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #faf9f7;
+  color: #777169;
+  font-size: 10px;
+}
+
 .instance-account-heading-actions {
   display: inline-flex;
   align-items: center;
@@ -5640,6 +5784,11 @@ label.browser-column-control[data-tooltip]:focus-within {
     column-gap: 12px;
   }
 
+  .account-list-head.participation-grid,
+  .account-row.participation-grid {
+    grid-template-columns: minmax(150px, 1fr) minmax(72px, .42fr) minmax(100px, .5fr) minmax(170px, .95fr) minmax(140px, auto);
+  }
+
   .participation-record-head,
   .participation-record-row {
     grid-template-columns: minmax(145px, .85fr) minmax(190px, 1.2fr) minmax(155px, .95fr) 82px 72px;
@@ -5690,6 +5839,11 @@ label.browser-column-control[data-tooltip]:focus-within {
   .account-row {
     grid-template-columns: minmax(160px, 1.2fr) minmax(70px, 0.55fr) minmax(150px, 1fr) 54px;
     column-gap: 12px;
+  }
+
+  .account-list-head.participation-grid,
+  .account-row.participation-grid {
+    grid-template-columns: minmax(145px, 1fr) minmax(62px, .4fr) minmax(90px, .48fr) minmax(140px, .9fr) 54px;
   }
 
   .participation-record-head,

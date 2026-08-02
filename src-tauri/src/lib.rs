@@ -1576,6 +1576,7 @@ async fn complete_account_create(
     runtime: tauri::State<'_, Arc<EngineRuntime>>,
     session_id: String,
     role: String,
+    group_id: Option<String>,
 ) -> Result<Value, String> {
     let label = create_account_webview_label(session_id.trim(), window.label());
     let webview = app
@@ -1586,7 +1587,12 @@ async fn complete_account_create(
     let result = native_engine_request(
         runtime.clone(),
         "account.native_create_from_cookie",
-        json!({ "cookie": raw_cookie, "role": role, "secret": runtime.native_secret }),
+        json!({
+            "cookie": raw_cookie,
+            "role": role,
+            "group_id": group_id.unwrap_or_default(),
+            "secret": runtime.native_secret
+        }),
     )
     .await?;
     webview
