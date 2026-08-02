@@ -16,6 +16,7 @@ import (
 	"fubao.ccvar.com/engine/internal/followinglive"
 	"fubao.ccvar.com/engine/internal/license"
 	"fubao.ccvar.com/engine/internal/redpacket"
+	"fubao.ccvar.com/engine/internal/remotesync"
 	"fubao.ccvar.com/engine/internal/rooms"
 )
 
@@ -99,7 +100,21 @@ func main() {
 	if redPacketStoreErr == nil && accountStoreErr == nil && browserStoreErr == nil {
 		pageParticipation = newPageParticipationBroker(browserStore)
 		redPacketParticipant = redpacket.NewPageParticipant(accountStore, pageParticipation, redPacketStore)
-		redPacketStore.SetEventHandler(redPacketParticipant.HandleEvent)
+	}
+	var remoteSyncManager *remotesync.Manager
+	remoteSyncManagerErr := dataDirErr
+	if remoteSyncManagerErr == nil {
+		remoteSyncManager, remoteSyncManagerErr = remotesync.New(dataDir)
+	}
+	if redPacketStoreErr == nil && (redPacketParticipant != nil || remoteSyncManager != nil) {
+		redPacketStore.SetEventHandler(func(event redpacket.Event) {
+			if redPacketParticipant != nil {
+				redPacketParticipant.HandleEvent(event)
+			}
+			if remoteSyncManager != nil {
+				_ = remoteSyncManager.EnqueueEvent(event)
+			}
+		})
 	}
 	var licenseManager *license.Manager
 	licenseManagerErr := dataDirErr
@@ -124,6 +139,12 @@ func main() {
 	defer stopBackground()
 	if accountStoreErr == nil && browserStoreErr == nil && roomStoreErr == nil {
 		go runFollowingLiveSync(backgroundCtx, accountStore, browserStore, followingLiveService, roomStore, redPacketStore)
+	}
+	if remoteSyncManagerErr == nil {
+		go remoteSyncManager.Run(backgroundCtx)
+		if roomStoreErr == nil && redPacketStoreErr == nil {
+			go runRemoteSyncSnapshots(backgroundCtx, remoteSyncManager, roomStore, redPacketStore)
+		}
 	}
 
 	scanner := bufio.NewScanner(os.Stdin)
@@ -176,6 +197,12 @@ func main() {
 					Protocol:  protocolVersion,
 				},
 			})
+		case "remote_sync.status":
+			if remoteSyncManagerErr != nil {
+				writeError(encoder, req.ID, "remote_sync_unavailable", remoteSyncManagerErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: remoteSyncManager.Status()})
 		case "license.status":
 			if licenseManagerErr != nil {
 				writeError(encoder, req.ID, "license_unavailable", licenseManagerErr.Error())
@@ -1368,6 +1395,26 @@ func runFollowingLiveSync(ctx context.Context, accountStore *accounts.Store, bro
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+		}
+	}
+}
+
+func runRemoteSyncSnapshots(ctx context.Context, manager *remotesync.Manager, roomStore *rooms.Store, redPacketStore *redpacket.Store) {
+	if manager == nil || roomStore == nil || redPacketStore == nil {
+		return
+	}
+	syncSnapshot := func() {
+		_ = manager.SyncSnapshot(roomStore.List(), redPacketStore.List(), redPacketStore.EventsAll())
+	}
+	syncSnapshot()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			syncSnapshot()
 		}
 	}
 }

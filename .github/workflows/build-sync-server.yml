@@ -1,0 +1,183 @@
+name: Build Sync Server
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Server release version without the server-v prefix."
+        required: true
+        default: "1.0.0"
+        type: string
+      publish:
+        description: "Publish to ccvar/fubao-v2-releases."
+        required: true
+        default: true
+        type: boolean
+  push:
+    tags:
+      - "server-v*"
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_REPOSITORY: ccvar/fubao-v2-releases
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: engine/go.mod
+          cache-dependency-path: engine/go.sum
+      - name: Test Go packages
+        working-directory: engine
+        run: go test ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            asset_key: linux-amd64
+          - goarch: arm64
+            asset_key: linux-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: engine/go.mod
+          cache-dependency-path: engine/go.sum
+      - name: Resolve version
+        id: version
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#server-v}"
+          else
+            VERSION="${VERSION_INPUT#server-v}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Build static server
+        working-directory: engine
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p ../release-assets
+          go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o ../release-assets/fubao-sync-server ./cmd/fubao-sync-server
+          tar -C ../release-assets -czf "../release-assets/fubao-sync-server-${VERSION}-${{ matrix.asset_key }}.tar.gz" fubao-sync-server
+          rm ../release-assets/fubao-sync-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sync-server-${{ matrix.asset_key }}
+          path: release-assets/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/server-v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Prepare release manifest
+        id: metadata
+        shell: bash
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            VERSION="${GITHUB_REF_NAME#server-v}"
+          else
+            VERSION="${VERSION_INPUT#server-v}"
+          fi
+          TAG="server-v${VERSION}"
+          export VERSION TAG
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path("release-assets")
+          repository = os.environ["RELEASE_REPOSITORY"]
+          tag = os.environ["TAG"]
+          version = os.environ["VERSION"]
+          assets = {}
+          for key in ("linux-amd64", "linux-arm64"):
+              filename = f"fubao-sync-server-{version}-{key}.tar.gz"
+              path = root / filename
+              if not path.is_file():
+                  raise SystemExit(f"missing release asset: {filename}")
+              assets[key] = {
+                  "url": f"https://github.com/{repository}/releases/download/{tag}/{filename}",
+                  "filename": filename,
+                  "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                  "size": path.stat().st_size,
+              }
+          (root / "server-latest.json").write_text(
+              json.dumps({"version": version, "tag": tag, "assets": assets}, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          cp deploy/server/install.sh release-assets/install-sync-server.sh
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+      - name: Publish server release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.FUBAO_V2_RELEASES_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.metadata.outputs.tag }}"
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "Missing required secret: FUBAO_V2_RELEASES_TOKEN" >&2
+            exit 1
+          fi
+          if ! gh release view "$TAG" --repo "$RELEASE_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$RELEASE_REPOSITORY" --title "福宝同步服务 $TAG" --notes "福宝直播间与红包远程同步服务。" --latest=false
+          fi
+          gh release upload "$TAG" release-assets/*.tar.gz release-assets/server-latest.json release-assets/install-sync-server.sh --repo "$RELEASE_REPOSITORY" --clobber
+          gh release edit "$TAG" --repo "$RELEASE_REPOSITORY" --draft=false --latest=false
+      - name: Update stable installer files
+        shell: bash
+        env:
+          RELEASE_TOKEN: ${{ secrets.FUBAO_V2_RELEASES_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${RELEASE_TOKEN}" ]]; then
+            echo "Missing required secret: FUBAO_V2_RELEASES_TOKEN" >&2
+            exit 1
+          fi
+          git clone "https://x-access-token:${RELEASE_TOKEN}@github.com/${RELEASE_REPOSITORY}.git" release-repo
+          cd release-repo
+          git checkout -B main
+          cp ../release-assets/server-latest.json server-latest.json
+          cp ../release-assets/install-sync-server.sh install-sync-server.sh
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server-latest.json install-sync-server.sh
+          if ! git diff --cached --quiet; then
+            git commit -m "release: update sync server ${{ steps.metadata.outputs.tag }}"
+            git push origin HEAD:main
+          fi
