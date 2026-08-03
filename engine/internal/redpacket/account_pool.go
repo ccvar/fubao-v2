@@ -122,12 +122,7 @@ func newAccountPool(credentials []AccountCredential) (*accountPool, error) {
 }
 
 func newAccountPoolWithConfig(credentials []AccountCredential, config poolConfig) (*accountPool, error) {
-	if config.globalParallel < 1 {
-		config.globalParallel = 1
-	}
-	if config.accountParallel < 1 {
-		config.accountParallel = 1
-	}
+	config = normalizedPoolConfig(config)
 	pool := &accountPool{
 		accounts:    map[string]*poolAccount{},
 		assignments: map[string]string{},
@@ -149,6 +144,22 @@ func newAccountPoolWithConfig(credentials []AccountCredential, config poolConfig
 		return pool.ordered[i].credential.AccountID < pool.ordered[j].credential.AccountID
 	})
 	return pool, nil
+}
+
+func normalizedPoolConfig(config poolConfig) poolConfig {
+	if config.globalInterval < 0 {
+		config.globalInterval = 0
+	}
+	if config.accountInterval < 0 {
+		config.accountInterval = 0
+	}
+	if config.globalParallel < 1 {
+		config.globalParallel = 1
+	}
+	if config.accountParallel < 1 {
+		config.accountParallel = 1
+	}
+	return config
 }
 
 func normalizedAccountCredentials(credentials []AccountCredential) []AccountCredential {
@@ -225,6 +236,31 @@ func (p *accountPool) syncCredentials(credentials []AccountCredential) PoolRefre
 		p.assignments = make(map[string]string, len(p.assignments))
 	}
 	return result
+}
+
+// applyConfig replaces the gates used by future requests. Existing account
+// pointers and gates remain alive for already-issued calls, so changing a
+// monitoring setting never interrupts or mis-releases an in-flight request.
+func (p *accountPool) applyConfig(config poolConfig) {
+	config = normalizedPoolConfig(config)
+	p.mu.Lock()
+	nextAccounts := make(map[string]*poolAccount, len(p.accounts))
+	nextOrdered := make([]*poolAccount, 0, len(p.ordered))
+	for _, account := range p.ordered {
+		replacement := &poolAccount{
+			credential:    account.credential,
+			gate:          newRequestGate(config.accountInterval, config.accountParallel),
+			cooldownUntil: account.cooldownUntil,
+			failureStreak: account.failureStreak,
+		}
+		nextAccounts[replacement.credential.AccountID] = replacement
+		nextOrdered = append(nextOrdered, replacement)
+	}
+	p.accounts = nextAccounts
+	p.ordered = nextOrdered
+	p.globalGate = newRequestGate(config.globalInterval, config.globalParallel)
+	p.config = config
+	p.mu.Unlock()
 }
 
 func newRequestGate(interval time.Duration, parallel int) *requestGate {
@@ -390,6 +426,7 @@ func (p *accountPool) withPermit(ctx context.Context, accountID string, request 
 		p.mu.Unlock()
 		return errMonitoringAccountCooling
 	}
+	globalGate := p.globalGate
 	p.mu.Unlock()
 
 	releaseAccount, err := account.gate.acquire(ctx)
@@ -397,7 +434,7 @@ func (p *accountPool) withPermit(ctx context.Context, accountID string, request 
 		return err
 	}
 	defer releaseAccount()
-	releaseGlobal, err := p.globalGate.acquire(ctx)
+	releaseGlobal, err := globalGate.acquire(ctx)
 	if err != nil {
 		return err
 	}

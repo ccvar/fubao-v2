@@ -157,6 +157,42 @@ func TestAccountPoolHotRefreshRebalancesWithoutInterruptingExistingPointer(t *te
 	}
 }
 
+func TestAccountPoolHotConfigKeepsInflightPointerAndUpdatesFutureGates(t *testing.T) {
+	pool, err := newAccountPoolWithConfig([]AccountCredential{{
+		AccountID: "a", AccountName: "账号 A", Cookie: "sessionid_ss=a",
+	}}, poolConfig{
+		globalInterval: 80 * time.Millisecond, accountInterval: 750 * time.Millisecond,
+		globalParallel: 32, accountParallel: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAccount, err := pool.accountFor("room-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldGlobalGate := pool.globalGate
+	pool.applyConfig(poolConfig{
+		globalInterval: 120 * time.Millisecond, accountInterval: 900 * time.Millisecond,
+		globalParallel: 20, accountParallel: 2,
+	})
+	current, err := pool.accountFor("room-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current == oldAccount || current.gate == oldAccount.gate || pool.globalGate == oldGlobalGate {
+		t.Fatal("future requests did not receive replacement gates")
+	}
+	if current.gate.interval != 900*time.Millisecond || cap(current.gate.slots) != 2 ||
+		pool.globalGate.interval != 120*time.Millisecond || cap(pool.globalGate.slots) != 20 {
+		t.Fatalf("unexpected hot config: account=%s/%d global=%s/%d",
+			current.gate.interval, cap(current.gate.slots), pool.globalGate.interval, cap(pool.globalGate.slots))
+	}
+	if oldAccount.gate.interval != 750*time.Millisecond || cap(oldAccount.gate.slots) != 3 {
+		t.Fatal("in-flight account gate was mutated")
+	}
+}
+
 func TestAccountPoolRateLimitCooldownFailsOver(t *testing.T) {
 	pool, err := newAccountPoolWithConfig([]AccountCredential{
 		{AccountID: "a", AccountName: "账号 A", Cookie: "sessionid_ss=a"},

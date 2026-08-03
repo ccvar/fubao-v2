@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	storeVersion         = 10
+	storeVersion         = 11
 	unknownProbeInterval = 10 * time.Second
 	offlineProbeInterval = 60 * time.Second
 	livePacketInterval   = 15 * time.Second
@@ -206,6 +206,16 @@ type ParticipationSettings struct {
 	FollowPolicy             string `json:"follow_policy"`
 }
 
+// MonitoringSettings are safe, persisted throughput controls for the native
+// room-monitor pipeline. They contain no account credentials or request data.
+type MonitoringSettings struct {
+	GlobalRequestIntervalMS  int `json:"global_request_interval_ms"`
+	AccountRequestIntervalMS int `json:"account_request_interval_ms"`
+	GlobalConcurrency        int `json:"global_concurrency"`
+	AccountConcurrency       int `json:"account_concurrency"`
+	ProbeConcurrency         int `json:"probe_concurrency"`
+}
+
 // Activity is safe sidebar history. It never contains credentials, request
 // URLs, signatures, headers, or raw interface responses.
 type Activity struct {
@@ -250,6 +260,7 @@ type file struct {
 	Events                 []*Event                 `json:"events"`
 	ParticipationRecords   []*ParticipationRecord   `json:"participation_records,omitempty"`
 	ParticipationSettings  ParticipationSettings    `json:"participation_settings"`
+	MonitoringSettings     MonitoringSettings       `json:"monitoring_settings"`
 	ParticipationTasks     []*ParticipationTask     `json:"participation_tasks,omitempty"`
 	ParticipationTraces    []*ParticipationTrace    `json:"participation_traces,omitempty"`
 	ParticipationSchedules []*ParticipationSchedule `json:"participation_schedules,omitempty"`
@@ -266,6 +277,7 @@ type Store struct {
 	participationTraces    map[string]*ParticipationTrace
 	participationSchedules map[string]*ParticipationSchedule
 	settings               ParticipationSettings
+	monitoringSettings     MonitoringSettings
 	activities             map[string]*Activity
 	runtime                map[string]context.CancelFunc
 	pool                   *accountPool
@@ -321,9 +333,10 @@ func NewStore(dataDir string) (*Store, error) {
 		activities:             map[string]*Activity{},
 		runtime:                map[string]context.CancelFunc{},
 		bulkIDs:                map[string]struct{}{},
-		probeSlots:             make(chan struct{}, defaultProbeSlots),
 		settings:               normalizeParticipationSettings(ParticipationSettings{}),
+		monitoringSettings:     normalizeMonitoringSettings(MonitoringSettings{}),
 	}
+	s.probeSlots = make(chan struct{}, s.monitoringSettings.ProbeConcurrency)
 	if err := s.load(); err != nil {
 		return nil, err
 	}
@@ -407,6 +420,8 @@ func (s *Store) load() error {
 		}
 	}
 	s.settings = normalizeParticipationSettings(payload.ParticipationSettings)
+	s.monitoringSettings = normalizeMonitoringSettings(payload.MonitoringSettings)
+	s.probeSlots = make(chan struct{}, s.monitoringSettings.ProbeConcurrency)
 	migrated := payload.Version < storeVersion
 	deadlineGrace := time.Duration(s.settings.DrawResultTimeoutSeconds) * time.Second
 	for _, record := range s.participations {
@@ -495,7 +510,8 @@ func (s *Store) saveLocked() error {
 	}
 	payload, err := json.Marshal(file{
 		Version: storeVersion, Monitors: monitors, Events: events, ParticipationRecords: participations,
-		ParticipationSettings: s.settings, ParticipationTasks: participationTasks, ParticipationTraces: participationTraces,
+		ParticipationSettings: s.settings, MonitoringSettings: s.monitoringSettings,
+		ParticipationTasks: participationTasks, ParticipationTraces: participationTraces,
 		ParticipationSchedules: participationSchedules, Activities: activities,
 	})
 	if err != nil {
@@ -655,6 +671,71 @@ func normalizeParticipationSettings(settings ParticipationSettings) Participatio
 		settings.MinimumDiamonds = 1000000
 	}
 	return settings
+}
+
+func normalizeMonitoringSettings(settings MonitoringSettings) MonitoringSettings {
+	if settings.GlobalRequestIntervalMS <= 0 {
+		settings.GlobalRequestIntervalMS = int(defaultGlobalRequestInterval / time.Millisecond)
+	}
+	settings.GlobalRequestIntervalMS = maxInt(40, minInt(settings.GlobalRequestIntervalMS, 2000))
+	if settings.AccountRequestIntervalMS <= 0 {
+		settings.AccountRequestIntervalMS = int(defaultAccountRequestInterval / time.Millisecond)
+	}
+	settings.AccountRequestIntervalMS = maxInt(250, minInt(settings.AccountRequestIntervalMS, 5000))
+	if settings.GlobalConcurrency <= 0 {
+		settings.GlobalConcurrency = defaultGlobalConcurrency
+	}
+	settings.GlobalConcurrency = minInt(settings.GlobalConcurrency, 128)
+	if settings.AccountConcurrency <= 0 {
+		settings.AccountConcurrency = defaultAccountConcurrency
+	}
+	settings.AccountConcurrency = minInt(settings.AccountConcurrency, 8)
+	if settings.ProbeConcurrency <= 0 {
+		settings.ProbeConcurrency = defaultProbeSlots
+	}
+	settings.ProbeConcurrency = maxInt(8, minInt(settings.ProbeConcurrency, 256))
+	return settings
+}
+
+func (settings MonitoringSettings) poolConfig() poolConfig {
+	settings = normalizeMonitoringSettings(settings)
+	return poolConfig{
+		globalInterval:  time.Duration(settings.GlobalRequestIntervalMS) * time.Millisecond,
+		accountInterval: time.Duration(settings.AccountRequestIntervalMS) * time.Millisecond,
+		globalParallel:  settings.GlobalConcurrency,
+		accountParallel: settings.AccountConcurrency,
+	}
+}
+
+// GetMonitoringSettings returns credential-free monitor throughput controls.
+func (s *Store) GetMonitoringSettings() MonitoringSettings {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.monitoringSettings
+}
+
+// SetMonitoringSettings persists and hot-applies monitor throughput controls.
+// Requests already in flight retain their original gates; subsequent requests
+// and probes use the replacement gates without restarting room monitors.
+func (s *Store) SetMonitoringSettings(settings MonitoringSettings) (MonitoringSettings, error) {
+	settings = normalizeMonitoringSettings(settings)
+	s.mu.Lock()
+	previousSettings := s.monitoringSettings
+	previousSlots := s.probeSlots
+	s.monitoringSettings = settings
+	s.probeSlots = make(chan struct{}, settings.ProbeConcurrency)
+	pool := s.pool
+	if err := s.saveLocked(); err != nil {
+		s.monitoringSettings = previousSettings
+		s.probeSlots = previousSlots
+		s.mu.Unlock()
+		return MonitoringSettings{}, err
+	}
+	s.mu.Unlock()
+	if pool != nil {
+		pool.applyConfig(settings.poolConfig())
+	}
+	return settings, nil
 }
 
 // GetParticipationSettings returns a safe copy for frontend display.
@@ -1334,7 +1415,10 @@ func (s *Store) StartAll(accountID, accountName, cookie string) (int, error) {
 // Assignment is stable for a room until its account enters cooldown, at which
 // point the next poll automatically fails over to another available account.
 func (s *Store) StartAllPool(credentials []AccountCredential) (PoolStartResult, error) {
-	pool, err := newAccountPool(credentials)
+	s.mu.Lock()
+	poolConfig := s.monitoringSettings.poolConfig()
+	s.mu.Unlock()
+	pool, err := newAccountPoolWithConfig(credentials, poolConfig)
 	if err != nil {
 		return PoolStartResult{}, err
 	}
@@ -1426,10 +1510,11 @@ func (s *Store) StopAll() (int, error) {
 func (s *Store) StartPooled(id string, credentials []AccountCredential) error {
 	s.mu.Lock()
 	pool := s.pool
+	poolConfig := s.monitoringSettings.poolConfig()
 	s.mu.Unlock()
 	if pool == nil {
 		var err error
-		pool, err = newAccountPool(credentials)
+		pool, err = newAccountPoolWithConfig(credentials, poolConfig)
 		if err != nil {
 			return err
 		}
@@ -1629,11 +1714,12 @@ func (s *Store) runPooled(ctx context.Context, id string, pool *accountPool, ini
 			observed = &observedMonitorSource{inner: pool.sourceFor(account, webRID, actualRoomID)}
 		}
 		observed.lastErr = nil
-		if !s.acquireProbeSlot(ctx) {
+		releaseProbe, acquired := s.acquireProbeSlot(ctx)
+		if !acquired {
 			return
 		}
 		next := s.pollOnce(ctx, id, observed)
-		s.releaseProbeSlot()
+		releaseProbe()
 		if observed.lastErr == nil {
 			pool.markSuccess(account.credential.AccountID)
 		} else if pool.markFailure(account.credential.AccountID, observed.lastErr) {
@@ -1698,11 +1784,12 @@ func (s *Store) runBulkWorker(ctx context.Context, ids []string, worker, workerC
 			}
 			s.mu.Unlock()
 			observed := &observedMonitorSource{inner: pool.sourceFor(account, webRID, actualRoomID)}
-			if !s.acquireProbeSlot(ctx) {
+			releaseProbe, acquired := s.acquireProbeSlot(ctx)
+			if !acquired {
 				return
 			}
 			next := s.pollOnce(ctx, id, observed)
-			s.releaseProbeSlot()
+			releaseProbe()
 			s.mu.Lock()
 			_, stillBulk := s.bulkIDs[id]
 			if !stillBulk {
@@ -1785,11 +1872,12 @@ func (s *Store) run(ctx context.Context, id string, source monitorSource, initia
 		}
 	}
 	for {
-		if !s.acquireProbeSlot(ctx) {
+		releaseProbe, acquired := s.acquireProbeSlot(ctx)
+		if !acquired {
 			return
 		}
 		next := s.pollOnce(ctx, id, source)
-		s.releaseProbeSlot()
+		releaseProbe()
 		if next <= 0 {
 			next = unknownProbeInterval
 		}
@@ -2021,17 +2109,16 @@ func eventParticipationMetadataReady(event *Event) bool {
 	return event != nil && strings.TrimSpace(event.ActualRoomID) != "" && validLuckyboxID(event.JoinBoxID)
 }
 
-func (s *Store) acquireProbeSlot(ctx context.Context) bool {
+func (s *Store) acquireProbeSlot(ctx context.Context) (func(), bool) {
+	s.mu.Lock()
+	probeSlots := s.probeSlots
+	s.mu.Unlock()
 	select {
-	case s.probeSlots <- struct{}{}:
-		return true
+	case probeSlots <- struct{}{}:
+		return func() { <-probeSlots }, true
 	case <-ctx.Done():
-		return false
+		return nil, false
 	}
-}
-
-func (s *Store) releaseProbeSlot() {
-	<-s.probeSlots
 }
 
 func minInt(left, right int) int {

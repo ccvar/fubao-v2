@@ -59,11 +59,19 @@
   type MonitoringAccountSortMode = "default" | "total-requests" | "today-requests" | "last-request" | "created-at";
   type ParticipationAccountSortMode = "default" | "available-first" | "join-count" | "win-count" | "created-at";
   type AccountSortMode = MonitoringAccountSortMode | ParticipationAccountSortMode;
-  type SettingsTab = "participation" | "rooms";
+  type SettingsTab = "participation" | "rooms" | "monitoring";
 
   type RoomSettings = {
     auto_recycle_offline_days: number;
     participation_prewarm_minutes: number;
+  };
+
+  type MonitoringSettings = {
+    global_request_interval_ms: number;
+    account_request_interval_ms: number;
+    global_concurrency: number;
+    account_concurrency: number;
+    probe_concurrency: number;
   };
 
   type LicenseStatus = {
@@ -534,6 +542,13 @@
   let participationSettingsError = "";
   let settingsTab: SettingsTab = "participation";
   let roomSettings: RoomSettings = { auto_recycle_offline_days: 7, participation_prewarm_minutes: 10 };
+  let monitoringSettings: MonitoringSettings = {
+	global_request_interval_ms: 80,
+	account_request_interval_ms: 750,
+	global_concurrency: 32,
+	account_concurrency: 3,
+	probe_concurrency: 64,
+  };
   let participationSettings: ParticipationSettings = {
 	stop_after_joins: 0,
 	cooldown_seconds: 0,
@@ -1211,9 +1226,10 @@
 	if (!isTauriDesktop()) return;
 	participationSettingsBusy = true;
 	try {
-		[participationSettings, roomSettings] = await Promise.all([
+		[participationSettings, roomSettings, monitoringSettings] = await Promise.all([
 			engineRequest<ParticipationSettings>("red_packet_participation.settings"),
 			engineRequest<RoomSettings>("room.settings"),
+			engineRequest<MonitoringSettings>("red_packet_monitor.settings"),
 		]);
 	} catch (error) {
 		participationSettingsError = error instanceof Error ? error.message : String(error);
@@ -1239,6 +1255,33 @@
 	if (participationSettingsBusy) return;
 	participationSettingsBusy = true;
 	participationSettingsError = "";
+	if (settingsTab === "monitoring") {
+		const nextMonitoringSettings = {
+			global_request_interval_ms: Math.max(40, Math.min(2000, normalizedParticipationSetting(monitoringSettings.global_request_interval_ms, 2000))),
+			account_request_interval_ms: Math.max(250, Math.min(5000, normalizedParticipationSetting(monitoringSettings.account_request_interval_ms, 5000))),
+			global_concurrency: Math.max(1, Math.min(128, normalizedParticipationSetting(monitoringSettings.global_concurrency, 128))),
+			account_concurrency: Math.max(1, Math.min(8, normalizedParticipationSetting(monitoringSettings.account_concurrency, 8))),
+			probe_concurrency: Math.max(8, Math.min(256, normalizedParticipationSetting(monitoringSettings.probe_concurrency, 256))),
+		};
+		if (!isTauriDesktop()) {
+			monitoringSettings = nextMonitoringSettings;
+			participationSettingsBusy = false;
+			showToast("监测设置已保存并应用");
+			closeParticipationSettings();
+			return;
+		}
+		try {
+			monitoringSettings = await engineRequest<MonitoringSettings>("red_packet_monitor.set_settings", nextMonitoringSettings);
+			showToast("监测设置已保存并应用到运行中的任务");
+			participationSettingsBusy = false;
+			closeParticipationSettings();
+		} catch (error) {
+			participationSettingsError = error instanceof Error ? error.message : String(error);
+		} finally {
+			participationSettingsBusy = false;
+		}
+		return;
+	}
 	if (settingsTab === "rooms") {
 		const nextRoomSettings = {
 			auto_recycle_offline_days: normalizedParticipationSetting(roomSettings.auto_recycle_offline_days, 3650),
@@ -6317,6 +6360,7 @@
       <div class="general-settings-tabs" role="tablist" aria-label="设置分类">
         <button type="button" role="tab" aria-selected={settingsTab === "participation"} class:active={settingsTab === "participation"} onclick={() => settingsTab = "participation"}><Gift size={13} />红包参与</button>
         <button type="button" role="tab" aria-selected={settingsTab === "rooms"} class:active={settingsTab === "rooms"} onclick={() => settingsTab = "rooms"}><Radio size={13} />直播间</button>
+        <button type="button" role="tab" aria-selected={settingsTab === "monitoring"} class:active={settingsTab === "monitoring"} onclick={() => settingsTab = "monitoring"}><SlidersHorizontal size={13} />监测设置</button>
       </div>
 
       {#if settingsTab === "participation"}
@@ -6373,7 +6417,7 @@
             <span class="number-field"><input type="number" min="1" max="1000000" step="1" bind:value={participationSettings.minimum_diamonds} /><em>钻</em></span>
           </label>
         </div>
-      {:else}
+      {:else if settingsTab === "rooms"}
         <p class="participation-settings-intro">直播间自动整理与参与任务预热均由 Go 引擎持久化执行，不依赖当前页面或实例卡片是否渲染。</p>
         <div class="participation-settings-list">
           <label class="participation-setting-row room-auto-recycle-setting">
@@ -6383,6 +6427,30 @@
           <label class="participation-setting-row room-auto-recycle-setting">
             <span><strong>自动回收未开播直播间</strong><small>连续指定天数的监测均明确确认未开播后，自动停止监测并移入回收站；填 0 关闭自动回收</small></span>
             <span class="number-field"><input type="number" min="0" max="3650" step="1" bind:value={roomSettings.auto_recycle_offline_days} /><em>天</em></span>
+          </label>
+        </div>
+      {:else}
+        <p class="participation-settings-intro">以下参数由 Go 引擎持久化并热更新正在运行的监测池；降低间隔或提高并发会增加接口压力，遇到限流时账号仍会自动冷却。</p>
+        <div class="participation-settings-list monitoring-settings-list">
+          <label class="participation-setting-row">
+            <span><strong>全局请求间隔</strong><small>本机所有监测账号发起两次请求之间的最小间隔</small></span>
+            <span class="number-field"><input type="number" min="40" max="2000" step="10" bind:value={monitoringSettings.global_request_interval_ms} /><em>毫秒</em></span>
+          </label>
+          <label class="participation-setting-row">
+            <span><strong>单账号请求间隔</strong><small>同一监测账号发起两次请求之间的最小间隔</small></span>
+            <span class="number-field"><input type="number" min="250" max="5000" step="50" bind:value={monitoringSettings.account_request_interval_ms} /><em>毫秒</em></span>
+          </label>
+          <label class="participation-setting-row">
+            <span><strong>全局慢请求并发</strong><small>已按间隔发出的请求中，可同时等待响应的最大数量</small></span>
+            <span class="number-field"><input type="number" min="1" max="128" step="1" bind:value={monitoringSettings.global_concurrency} /><em>条</em></span>
+          </label>
+          <label class="participation-setting-row">
+            <span><strong>单账号慢请求并发</strong><small>每个监测账号可同时等待响应的最大请求数量</small></span>
+            <span class="number-field"><input type="number" min="1" max="8" step="1" bind:value={monitoringSettings.account_concurrency} /><em>条</em></span>
+          </label>
+          <label class="participation-setting-row">
+            <span><strong>原生探测窗口</strong><small>同时进入直播状态探测与红包查询流水线的任务上限</small></span>
+            <span class="number-field"><input type="number" min="8" max="256" step="8" bind:value={monitoringSettings.probe_concurrency} /><em>个</em></span>
           </label>
         </div>
       {/if}

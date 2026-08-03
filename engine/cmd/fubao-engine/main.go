@@ -1124,6 +1124,28 @@ func main() {
 				}
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.PageForRooms(params.RoomIDs)})
+		case "red_packet_monitor.settings":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.GetMonitoringSettings()})
+		case "red_packet_monitor.set_settings":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			var params redpacket.MonitoringSettings
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "监测设置参数无效")
+				continue
+			}
+			result, err := redPacketStore.SetMonitoringSettings(params)
+			if err != nil {
+				writeError(encoder, req.ID, "monitor_settings_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
 		case "red_packet_monitor.events":
 			if redPacketStoreErr != nil {
 				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())

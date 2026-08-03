@@ -226,6 +226,72 @@ func TestParticipationSettingsDefaultDrawTimeoutAndSafeTrace(t *testing.T) {
 	}
 }
 
+func TestMonitoringSettingsPersistAndHotSwapProbeWindow(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaults := store.GetMonitoringSettings()
+	if defaults.GlobalRequestIntervalMS != 80 || defaults.AccountRequestIntervalMS != 750 ||
+		defaults.GlobalConcurrency != 32 || defaults.AccountConcurrency != 3 || defaults.ProbeConcurrency != 64 {
+		t.Fatalf("unexpected monitoring defaults: %+v", defaults)
+	}
+
+	// Hold one old slot while replacing the channel. Its release must still
+	// target the captured old channel instead of blocking on the new one.
+	releaseOld, acquired := store.acquireProbeSlot(context.Background())
+	if !acquired {
+		t.Fatal("failed to acquire initial probe slot")
+	}
+	settings, err := store.SetMonitoringSettings(MonitoringSettings{
+		GlobalRequestIntervalMS:  120,
+		AccountRequestIntervalMS: 900,
+		GlobalConcurrency:        20,
+		AccountConcurrency:       2,
+		ProbeConcurrency:         48,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseOld()
+	if cap(store.probeSlots) != 48 {
+		t.Fatalf("probe window was not hot replaced: %d", cap(store.probeSlots))
+	}
+
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.GetMonitoringSettings(); got != settings {
+		t.Fatalf("monitoring settings did not persist: got=%+v want=%+v", got, settings)
+	}
+	if cap(reloaded.probeSlots) != settings.ProbeConcurrency {
+		t.Fatalf("persisted probe window not restored: %d", cap(reloaded.probeSlots))
+	}
+}
+
+func TestMonitoringSettingsClampUnsafeValues(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, err := store.SetMonitoringSettings(MonitoringSettings{
+		GlobalRequestIntervalMS:  1,
+		AccountRequestIntervalMS: 1,
+		GlobalConcurrency:        999,
+		AccountConcurrency:       999,
+		ProbeConcurrency:         999,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.GlobalRequestIntervalMS != 40 || settings.AccountRequestIntervalMS != 250 ||
+		settings.GlobalConcurrency != 128 || settings.AccountConcurrency != 8 || settings.ProbeConcurrency != 256 {
+		t.Fatalf("unsafe settings were not clamped: %+v", settings)
+	}
+}
+
 func TestParticipationSchedulesPersistClaimAndAdvance(t *testing.T) {
 	dataDir := t.TempDir()
 	store, err := NewStore(dataDir)

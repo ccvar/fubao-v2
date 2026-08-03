@@ -4535,7 +4535,7 @@ label.browser-column-control[data-tooltip]:focus-within {
 
 .general-settings-tabs {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 4px;
   margin-top: 13px;
   padding: 3px;
@@ -4569,8 +4569,12 @@ label.browser-column-control[data-tooltip]:focus-within {
   color: #bd5141;
 }
 
-.general-settings-tabs button.active:last-child {
+.general-settings-tabs button.active:nth-child(2) {
   color: #33836b;
+}
+
+.general-settings-tabs button.active:last-child {
+  color: #b56d22;
 }
 
 .participation-settings-intro {
