@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    webview::{Cookie, PageLoadEvent, WebviewBuilder},
+    webview::{Cookie, NewWindowResponse, PageLoadEvent, WebviewBuilder},
     Emitter, LogicalPosition, LogicalSize, Manager, RunEvent, Url, WebviewUrl,
     WebviewWindowBuilder, WindowEvent,
 };
@@ -139,6 +139,61 @@ fn stop_engine(app: &tauri::AppHandle) {
         }
     }
     runtime.online.store(false, Ordering::SeqCst);
+}
+
+#[cfg(windows)]
+fn open_engine_wait_handle(pid: u32) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+    if handle.is_null() {
+        return Err(format!("无法等待 Go 引擎进程退出（PID {pid}）"));
+    }
+    Ok(handle)
+}
+
+#[cfg(windows)]
+fn wait_for_engine_exit(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<(), String> {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, WAIT_OBJECT_0},
+        System::Threading::WaitForSingleObject,
+    };
+
+    const ENGINE_EXIT_TIMEOUT_MS: u32 = 10_000;
+    let result = unsafe { WaitForSingleObject(handle, ENGINE_EXIT_TIMEOUT_MS) };
+    unsafe { CloseHandle(handle) };
+    if result != WAIT_OBJECT_0 {
+        return Err("Go 引擎未能及时退出，请稍后重试更新".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn prepare_app_update(runtime: tauri::State<'_, Arc<EngineRuntime>>) -> Result<(), String> {
+    let child = runtime.child.lock().map_err(|_| "引擎状态锁不可用")?.take();
+
+    if let Some(child) = child {
+        #[cfg(windows)]
+        let wait_handle = open_engine_wait_handle(child.pid())?;
+
+        child
+            .kill()
+            .map_err(|error| format!("停止 Go 引擎失败：{error}"))?;
+
+        #[cfg(windows)]
+        tauri::async_runtime::spawn_blocking(move || wait_for_engine_exit(wait_handle))
+            .await
+            .map_err(|error| format!("等待 Go 引擎退出失败：{error}"))??;
+
+        #[cfg(not(windows))]
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    runtime.online.store(false, Ordering::SeqCst);
+    if let Ok(mut pending) = runtime.pending.lock() {
+        pending.clear();
+    }
+    Ok(())
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
@@ -646,7 +701,7 @@ fn login_cookie_values(raw_cookie: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod cookie_tests {
     use super::{
-        begin_browser_webview_close, browser_location_matches_live_room,
+        begin_browser_webview_close, browser_location_matches_live_room, browser_new_window_target,
         browser_webview_is_closing, canonical_cookie_values, login_cookie_snapshot_matches,
         login_cookie_values, remember_browser_location, EngineRuntime, Url,
     };
@@ -730,6 +785,30 @@ mod cookie_tests {
             "instance-b",
             "123456789"
         ));
+    }
+
+    #[test]
+    fn browser_popup_navigation_stays_on_safe_douyin_https_targets() {
+        let live_room = "https://live.douyin.com/123456789?from=homepage"
+            .parse::<Url>()
+            .expect("live-room URL must parse");
+        let douyin_subdomain = "https://www.douyin.com/follow"
+            .parse::<Url>()
+            .expect("Douyin URL must parse");
+        let insecure = "http://live.douyin.com/123456789"
+            .parse::<Url>()
+            .expect("insecure URL must parse");
+        let unrelated = "https://example.com/123456789"
+            .parse::<Url>()
+            .expect("external URL must parse");
+
+        assert_eq!(browser_new_window_target(&live_room), Some(live_room));
+        assert_eq!(
+            browser_new_window_target(&douyin_subdomain),
+            Some(douyin_subdomain)
+        );
+        assert_eq!(browser_new_window_target(&insecure), None);
+        assert_eq!(browser_new_window_target(&unrelated), None);
     }
 }
 
@@ -1802,6 +1881,10 @@ fn is_safe_douyin_location(url: &Url) -> bool {
             .is_some_and(|domain| domain == "douyin.com" || domain.ends_with(".douyin.com"))
 }
 
+fn browser_new_window_target(url: &Url) -> Option<Url> {
+    is_safe_douyin_location(url).then(|| url.clone())
+}
+
 fn remember_browser_location(runtime: &EngineRuntime, instance_id: &str, url: &Url) {
     if !is_safe_douyin_location(url) {
         return;
@@ -1894,6 +1977,10 @@ async fn ensure_browser_webview(
     let ready_once_for_page = ready_once.clone();
     let navigation_runtime = runtime.clone();
     let navigation_instance_id = instance_id.to_string();
+    let new_window_app = app.clone();
+    let new_window_runtime = runtime.clone();
+    let new_window_instance_id = instance_id.to_string();
+    let new_window_label = label.clone();
     let page_runtime = runtime.clone();
     let page_instance_id = instance_id.to_string();
     let restore_url = browser_restore_location(&runtime, &instance_id);
@@ -1915,6 +2002,39 @@ async fn ensure_browser_webview(
                 return true;
             }
             false
+        })
+        .on_new_window(move |url, _features| {
+            let Some(target) = browser_new_window_target(&url) else {
+                return NewWindowResponse::Deny;
+            };
+            if browser_webview_is_closing(&new_window_runtime, &new_window_label) {
+                return NewWindowResponse::Deny;
+            }
+
+            // Douyin opens live-room cards with window.open/target=_blank.
+            // Keep the navigation inside the originating account WebView so
+            // it retains the isolated profile, Cookie, and page context.
+            // Queue it after denying native popup creation to avoid creating
+            // an unmanaged WKWebView/WebView2 window.
+            let app_for_navigation = new_window_app.clone();
+            let runtime_for_navigation = new_window_runtime.clone();
+            let instance_for_navigation = new_window_instance_id.clone();
+            let label_for_navigation = new_window_label.clone();
+            let target_for_navigation = target.clone();
+            let _ = new_window_app.run_on_main_thread(move || {
+                if browser_webview_is_closing(&runtime_for_navigation, &label_for_navigation) {
+                    return;
+                }
+                if let Some(webview) = app_for_navigation.get_webview(&label_for_navigation) {
+                    remember_browser_location(
+                        &runtime_for_navigation,
+                        &instance_for_navigation,
+                        &target_for_navigation,
+                    );
+                    let _ = webview.navigate(target_for_navigation);
+                }
+            });
+            NewWindowResponse::Deny
         })
         .on_page_load(move |webview, payload| {
             let is_douyin = is_safe_douyin_location(payload.url());
@@ -2931,6 +3051,7 @@ pub fn run() {
             engine_status,
             engine_send,
             engine_restart,
+            prepare_app_update,
             start_window_drag,
             toggle_window_maximize,
             frontend_log,

@@ -950,6 +950,90 @@
     return result;
   }
 
+  let roomListUsesLegacyRPC = false;
+  let redPacketMonitorListUsesLegacyRPC = false;
+
+  function engineMethodIsUnavailable(error: unknown, method: string) {
+    const message = error instanceof Error ? error.message : String(error);
+    return message.includes(`尚未实现方法：${method}`)
+      || message.includes(`method not implemented: ${method}`)
+      || message.includes(`unimplemented method: ${method}`);
+  }
+
+  function legacyRoomPage(items: RoomItem[], offset: number, limit: number, search: string): RoomPage {
+    const needle = search.trim().toLowerCase();
+    const filtered = items.filter((room) => {
+      if (room.recycled) return false;
+      if (!needle) return true;
+      const haystack = [room.name, room.streamer_name, room.web_rid, room.actual_room_id, room.id]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(needle);
+    });
+    const safeOffset = Math.max(0, offset);
+    const safeLimit = Math.max(1, limit);
+    return {
+      items: filtered.slice(safeOffset, safeOffset + safeLimit),
+      total: filtered.length,
+    };
+  }
+
+  async function loadRoomPage(offset: number, limit: number, search: string): Promise<RoomPage> {
+    if (!roomListUsesLegacyRPC) {
+      try {
+        return await engineRequest<RoomPage>("room.list_page", { offset, limit, query: search });
+      } catch (error) {
+        if (!engineMethodIsUnavailable(error, "room.list_page")) throw error;
+        roomListUsesLegacyRPC = true;
+      }
+    }
+
+    const items = await engineRequest<RoomItem[]>("room.list");
+    return legacyRoomPage(items, offset, limit, search);
+  }
+
+  function legacyRedPacketMonitorPage(items: RedPacketMonitor[], roomIDs: string[]): RedPacketMonitorPage {
+    const wanted = new Set(roomIDs);
+    const summary: RedPacketMonitorSummary = {
+      total: items.length,
+      enabled: 0,
+      running: 0,
+      first_checked: 0,
+      pending_first: 0,
+      live_running: 0,
+      errors: 0,
+    };
+    for (const monitor of items) {
+      if (monitor.enabled) summary.enabled += 1;
+      if (monitor.status === "running") {
+        summary.running += 1;
+        if (monitor.connection_status === "connecting") summary.pending_first += 1;
+        else summary.first_checked += 1;
+        if (monitor.live_status === "live") summary.live_running += 1;
+      }
+      if (monitor.status === "error" || monitor.connection_status === "error") summary.errors += 1;
+    }
+    return {
+      items: items.filter((monitor) => wanted.has(monitor.room_id)),
+      summary,
+    };
+  }
+
+  async function loadRedPacketMonitorPage(roomIDs: string[]): Promise<RedPacketMonitorPage> {
+    if (!redPacketMonitorListUsesLegacyRPC) {
+      try {
+        return await engineRequest<RedPacketMonitorPage>("red_packet_monitor.list_page", { room_ids: roomIDs });
+      } catch (error) {
+        if (!engineMethodIsUnavailable(error, "red_packet_monitor.list_page")) throw error;
+        redPacketMonitorListUsesLegacyRPC = true;
+      }
+    }
+
+    const items = await engineRequest<RedPacketMonitor[]>("red_packet_monitor.list");
+    return legacyRedPacketMonitorPage(items, roomIDs);
+  }
+
   async function loadLicenseStatus() {
     if (!engineListenerReady) return;
     try {
@@ -1731,7 +1815,7 @@
     try {
       let downloaded = 0;
       let total = updateStatus?.size || 0;
-      await pendingAppUpdate.downloadAndInstall((event: DownloadEvent) => {
+      await pendingAppUpdate.download((event: DownloadEvent) => {
         if (event.event === "Started") {
           downloaded = 0;
           total = event.data.contentLength || total;
@@ -1771,8 +1855,16 @@
           installedAt: Date.now(),
         }));
       } catch { /* update installation must not depend on local storage */ }
+      // The Windows installer must replace the bundled Go sidecar. Stop it
+      // explicitly and wait for the executable lock to be released before
+      // launching NSIS; closing the Tauri window alone only hides it to tray.
+      await invoke("prepare_app_update");
+      await pendingAppUpdate.install();
       await relaunch();
     } catch (error) {
+      // If the installer could not be launched, restore the current engine so
+      // the still-running client does not remain in a half-stopped state.
+      try { await invoke("engine_restart"); } catch { /* preserve the update error */ }
       updateInstalling = false;
       updateError = error instanceof Error ? error.message : String(error);
     }
@@ -3531,9 +3623,7 @@
     redPacketMonitorsLoading = true;
     redPacketMonitorError = "";
     try {
-      const page = await engineRequest<RedPacketMonitorPage>("red_packet_monitor.list_page", {
-        room_ids: rooms.map((room) => room.id),
-      });
+      const page = await loadRedPacketMonitorPage(rooms.map((room) => room.id));
       // A polling request may have started before a start/stop action. Ignore
       // that older snapshot so it cannot put the row back into its old state.
       if (requestSeq !== redPacketMonitorListRequestSeq) return;
@@ -3709,7 +3799,7 @@
     roomError = "";
     try {
       const [page, recycled] = await Promise.all([
-        engineRequest<RoomPage>("room.list_page", { offset: 0, limit: roomRenderLimit, query: query.trim() }),
+        loadRoomPage(0, roomRenderLimit, query.trim()),
         engineRequest<RoomItem[]>("room.recycle_bin").catch(() => recycledRooms),
       ]);
       rooms = page.items;
@@ -3748,7 +3838,7 @@
     roomError = "";
     try {
       const result = await engineRequest<{ imported: number; merged: number; total: number }>("room.migrate_legacy");
-      const page = await engineRequest<RoomPage>("room.list_page", { offset: 0, limit: roomRenderLimit, query: "" });
+      const page = await loadRoomPage(0, roomRenderLimit, "");
       rooms = page.items;
       roomTotalCount = page.total;
       if (!silent || result.imported > 0) {
@@ -6176,7 +6266,7 @@
       {#if updateDownloading || updateDownloaded}
         <div class="update-progress-block">
           <div>
-            <span>{updateDownloaded ? "新版本已安装，等待重启" : "正在下载、验签并安装…"}</span>
+            <span>{updateDownloaded ? "新版本已下载，等待安装" : "正在下载并验签…"}</span>
             <strong>{updateProgress.percent}%</strong>
           </div>
           <progress max="100" value={updateProgress.percent}></progress>
@@ -6197,7 +6287,7 @@
         {#if updateDownloaded}
           <button class="primary-action" disabled={updateInstalling} onclick={installAppUpdate}>
             <ArrowClockwise class={updateInstalling ? "spinning" : undefined} size={14} />
-            {updateInstalling ? "正在重启…" : "重启并完成更新"}
+            {updateInstalling ? "正在安装…" : "安装并启动"}
           </button>
         {:else}
           <button class="primary-action" disabled={updateDownloading} onclick={downloadAppUpdate}>
