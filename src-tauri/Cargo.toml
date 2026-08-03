@@ -1,6 +1,6 @@
 [package]
 name = "fubao-desktop"
-version = "0.1.27"
+version = "0.1.28"
 description = "福宝红包监测桌面客户端"
 authors = ["ccvar"]
 edition = "2021"

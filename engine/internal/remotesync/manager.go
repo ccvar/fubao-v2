@@ -650,7 +650,11 @@ func redPacketItem(event redpacket.Event) (syncprotocol.BatchItem, bool, error) 
 		return syncprotocol.BatchItem{}, false, nil
 	}
 	payload := syncprotocol.RedPacket{
-		WebRID: webRID, PacketID: packetID, RoomName: event.RoomName,
+		WebRID: webRID, PacketID: packetID,
+		ActualRoomID: nativeNumericValue(event.ActualRoomID, 32), JoinBoxID: nativeNumericValue(event.JoinBoxID, 32),
+		AnchorID: nativeNumericValue(event.AnchorID, 32), BoxType: nativeNumericValue(event.BoxType, 16),
+		SendTime: nativeNumericValue(event.SendTime, 32), DelayTime: nativeNumericValue(event.DelayTime, 32),
+		RoomName:     event.RoomName,
 		StreamerName: event.StreamerName, Title: event.Title, Prize: event.Prize,
 		Source: event.Source, DetectedAt: event.DetectedAt, DrawAt: event.DrawAt,
 		ExpiresAt: event.ExpiresAt, ParticipantCount: event.ParticipantCount,
@@ -733,7 +737,10 @@ func (m *Manager) pullType(ctx context.Context, roomStore *rooms.Store, redPacke
 					return fmt.Errorf("解析中心库红包失败: %w", err)
 				}
 				centerEvents = append(centerEvents, redpacket.CenterEvent{
-					WebRID: item.WebRID, PacketID: item.PacketID, RoomName: item.RoomName,
+					WebRID: item.WebRID, PacketID: item.PacketID,
+					ActualRoomID: item.ActualRoomID, JoinBoxID: item.JoinBoxID,
+					AnchorID: item.AnchorID, BoxType: item.BoxType, SendTime: item.SendTime, DelayTime: item.DelayTime,
+					RoomName:     item.RoomName,
 					StreamerName: item.StreamerName, Title: item.Title, Prize: item.Prize,
 					Source: item.Source, DetectedAt: item.DetectedAt, DrawAt: item.DrawAt,
 					ExpiresAt: item.ExpiresAt, ParticipantCount: item.ParticipantCount,
@@ -939,4 +946,17 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func nativeNumericValue(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > limit {
+		return ""
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return ""
+		}
+	}
+	return value
 }

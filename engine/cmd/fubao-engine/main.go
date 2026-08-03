@@ -85,6 +85,14 @@ func main() {
 	}
 	if redPacketStoreErr == nil && accountStoreErr == nil {
 		redPacketStore.SetRequestRecorder(accountStore.RecordMonitoringRequest)
+		// A native Douyin page context cannot survive a real client/engine
+		// restart. Close stale tasks immediately so the frontend never reports
+		// a historical Active flag as a currently running participation task.
+		if reconciliation, err := redPacketStore.ReconcileParticipationTasksAfterRestart(time.Now()); err == nil {
+			for _, accountID := range reconciliation.StoppedAccountIDs {
+				_, _ = accountStore.SetRedPacketAPIEnabled(accountID, false)
+			}
+		}
 	}
 	if browserStoreErr == nil && accountStoreErr == nil {
 		browserStore.SetCookieUpdater(func(accountID, rawCookie string) error {
@@ -1298,6 +1306,12 @@ func main() {
 			for _, context := range pageParticipation.Contexts() {
 				prepared[context.InstanceID] = true
 			}
+			eligibleAccounts := map[string]bool{}
+			if accountStoreErr == nil {
+				for _, credential := range accountStore.RedPacketParticipationCredentials(time.Now()) {
+					eligibleAccounts[credential.AccountID] = true
+				}
+			}
 			states := make([]map[string]any, 0)
 			for _, instance := range browserStore.List() {
 				state := redPacketStore.GetParticipationState(instance.AccountID, time.Now())
@@ -1306,10 +1320,14 @@ func main() {
 				if len(pendingDraws) > 0 {
 					pendingWebRID = pendingDraws[0].WebRID
 				}
+				hasNativeContext := prepared[instance.ID]
+				resumable := !hasNativeContext && state.Active && len(pendingDraws) > 0
 				states = append(states, map[string]any{
 					"instance_id": instance.ID, "account_id": instance.AccountID,
-					"prepared": prepared[instance.ID], "accepting": prepared[instance.ID] && state.Active && !state.Stopped,
-					"active": state.Active, "task_id": state.TaskID,
+					"prepared":  hasNativeContext,
+					"accepting": hasNativeContext && eligibleAccounts[instance.AccountID] && state.Active && !state.Stopped && !state.WaitingDraw,
+					"active":    hasNativeContext && state.Active, "task_active": state.Active, "resumable": resumable,
+					"task_id": state.TaskID,
 					"stopped": state.Stopped, "stop_reason": state.StopReason,
 					"waiting_draw": state.WaitingDraw, "waiting_reason": state.WaitingReason,
 					"pending_draw_count": len(pendingDraws), "pending_result_web_rid": pendingWebRID,
@@ -1401,6 +1419,18 @@ func main() {
 				}
 				writeError(encoder, req.ID, "participation_context_failed", err.Error())
 				continue
+			}
+			if accountStoreErr == nil && !params.ResultOnly {
+				if _, setErr := accountStore.SetRedPacketAPIEnabled(accountID, params.Ready); setErr != nil {
+					if params.Ready {
+						pageParticipation.StopAccount(accountID)
+						_ = redPacketStore.FinishParticipationTask(accountID, "启动失败")
+					} else {
+						_ = redPacketStore.FinishParticipationTask(accountID, "手动停止")
+					}
+					writeError(encoder, req.ID, "participation_account_toggle_failed", setErr.Error())
+					continue
+				}
 			}
 			if !params.Ready {
 				_ = redPacketStore.FinishParticipationTask(accountID, "手动停止")

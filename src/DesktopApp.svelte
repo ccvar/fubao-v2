@@ -227,6 +227,8 @@
 	prepared: boolean;
 	accepting: boolean;
 	active?: boolean;
+	task_active?: boolean;
+	resumable?: boolean;
 	task_id?: string;
 	stopped: boolean;
 	stop_reason?: string;
@@ -871,7 +873,11 @@
   });
   $: visibleParticipationRecords = filteredParticipationRecords.slice(0, participationRecordRenderLimit);
   $: browserSubtitle = `${browserInstances.length} 个实例 · ${browserInstances.filter((item) => item.status === "online").length} 个在线 · ${browserInstances.filter(browserCookieExpired).length} 个失效`;
-  $: activeBrowserParticipationContexts = Object.values(browserParticipationContexts).filter((context) => context.active);
+  // A persisted task flag alone is not evidence that native participation is
+  // running. The account must still own a prepared native browser context in
+  // this process; this also keeps older engines from producing a stale banner
+  // after a desktop restart.
+  $: activeBrowserParticipationContexts = Object.values(browserParticipationContexts).filter((context) => context.active && context.prepared);
   $: browserParticipationRuntime = {
     accounts: activeBrowserParticipationContexts.length,
     prepared: activeBrowserParticipationContexts.filter((context) => context.prepared).length,
@@ -1174,7 +1180,7 @@
 	if (stoppedAt) return "已停止";
 	const instance = browserInstances.find((item) => item.account_id === accountID);
 	const context = instance ? browserParticipationContexts[instance.id] : undefined;
-	if (activityActive && instance && (context?.active || context?.accepting || browserRedPacketContextIds.includes(instance.id))) {
+	if (activityActive && instance && ((context?.active && context?.prepared) || context?.accepting || browserRedPacketContextIds.includes(instance.id))) {
 		return "参与中";
 	}
 	return activityActive ? "等待红包" : "已结束";
@@ -4442,7 +4448,7 @@
 	if (browserCookieExpired(instance)) return;
 	const participationContext = browserParticipationContexts[instance.id];
 	const canResumePendingResult = Boolean(
-		participationContext?.active && !participationContext.prepared && participationContext.pending_draw_count &&
+		participationContext?.resumable && !participationContext.prepared && participationContext.pending_draw_count &&
 		/^\d{6,20}$/.test(participationContext.pending_result_web_rid || ""),
 	);
 	if (participationContext?.stopped && !canResumePendingResult) {
@@ -4506,7 +4512,7 @@
 
   async function startBrowserRedPacketFromBatch(instance: BrowserInstance) {
 	const context = browserParticipationContexts[instance.id];
-	if (context?.accepting || context?.active || browserRedPacketContextIds.includes(instance.id)) return false;
+	if (context?.accepting || context?.active || context?.task_active || browserRedPacketContextIds.includes(instance.id)) return false;
 	const account = accounts.find((item) => item.id === instance.account_id);
 	if (!account || account.cookie_status === "expired" || !account.roles.includes("participation")) return false;
 	const target = browserRedPacketLiveTarget(instance);
@@ -5421,7 +5427,7 @@
 			  {@const cookieExpired = browserCookieExpired(item)}
 			  {@const followedLive = followingLiveSnapshot(item)}
 			  {@const followedLiveLoading = browserFollowingLiveLoadingIds.includes(item.id)}
-			  {@const pendingResultCanResume = Boolean(participationContext?.active && !participationContext?.prepared && participationContext?.pending_draw_count && /^\d{6,20}$/.test(participationContext?.pending_result_web_rid || ""))}
+			  {@const pendingResultCanResume = Boolean(participationContext?.resumable && !participationContext?.prepared && participationContext?.pending_draw_count && /^\d{6,20}$/.test(participationContext?.pending_result_web_rid || ""))}
 			  {@const participationTip = participationStopped
 				? `${participationContext?.stop_reason || "已达到红包参与停止条件"}${pendingResultCanResume ? "；点击仅恢复待开奖记录查询" : ""}`
 				: pendingResultCanResume ? "恢复待开奖记录查询" : participationEnabled ? "停止红包页面参与" : "进入直播间并启用红包页面参与"}

@@ -35,7 +35,11 @@ func TestRegisterAndSyncBatch(t *testing.T) {
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	roomPayload, _ := json.Marshal(syncprotocol.RoomState{WebRID: "123456", Title: "测试直播间", LiveStatus: "live", UpdatedAt: now})
-	packetPayload, _ := json.Marshal(syncprotocol.RedPacket{WebRID: "123456", PacketID: "packet-1", Title: "钻石红包", Prize: "总99钻，24份红包", DetectedAt: now, TotalDiamonds: 99, ShareCount: 24})
+	packetPayload, _ := json.Marshal(syncprotocol.RedPacket{
+		WebRID: "123456", PacketID: "packet-1", ActualRoomID: "7000000000000000001",
+		JoinBoxID: "7669047909329177395", AnchorID: "1234567890", BoxType: "1", SendTime: "100", DelayTime: "30",
+		Title: "钻石红包", Prize: "总99钻，24份红包", DetectedAt: now, TotalDiamonds: 99, ShareCount: 24,
+	})
 	batch := syncprotocol.BatchRequest{
 		Version: syncprotocol.Version, RequestID: "request-1", ClientID: registration.ClientID, SentAt: now,
 		Items: []syncprotocol.BatchItem{
@@ -67,6 +71,17 @@ func TestRegisterAndSyncBatch(t *testing.T) {
 	}
 	if changes.Changes[0].OriginClientID != registration.ClientID || changes.Changes[1].OriginClientID != registration.ClientID {
 		t.Fatalf("change origin was not retained: %+v", changes.Changes)
+	}
+	var syncedPacket syncprotocol.RedPacket
+	for _, change := range changes.Changes {
+		if change.Type == syncprotocol.ItemRedPacket {
+			if err := json.Unmarshal(change.Payload, &syncedPacket); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if syncedPacket.ActualRoomID != "7000000000000000001" || syncedPacket.JoinBoxID != "7669047909329177395" || syncedPacket.DelayTime != "30" {
+		t.Fatalf("native participation metadata was not retained by center: %+v", syncedPacket)
 	}
 	batch.RequestID = "request-2"
 	requestJSON(t, httpServer.Client(), http.MethodPost, httpServer.URL+"/api/v1/sync/batch", registration.DeviceToken, batch, http.StatusOK, &first)

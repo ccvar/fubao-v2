@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	storeVersion         = 11
+	storeVersion         = 12
 	unknownProbeInterval = 10 * time.Second
 	offlineProbeInterval = 60 * time.Second
 	livePacketInterval   = 15 * time.Second
@@ -102,6 +102,12 @@ type Event struct {
 type CenterEvent struct {
 	WebRID           string
 	PacketID         string
+	ActualRoomID     string
+	JoinBoxID        string
+	AnchorID         string
+	BoxType          string
+	SendTime         string
+	DelayTime        string
 	RoomName         string
 	StreamerName     string
 	Title            string
@@ -171,6 +177,13 @@ type ParticipationTask struct {
 	StartedAt string `json:"started_at"`
 	EndedAt   string `json:"ended_at,omitempty"`
 	EndReason string `json:"end_reason,omitempty"`
+}
+
+// ParticipationRestartReconciliation reports task state repaired after a
+// real engine restart. Native page contexts never survive process exit.
+type ParticipationRestartReconciliation struct {
+	StoppedAccountIDs []string `json:"stopped_account_ids"`
+	PendingAccountIDs []string `json:"pending_account_ids"`
 }
 
 // ParticipationTrace is a credential-free native request audit row. Request
@@ -254,17 +267,29 @@ type ParticipationScheduleExecution struct {
 	DueAt      string `json:"due_at"`
 }
 
+// nativeParticipationMetadata is persisted only in the permission-restricted
+// Go store. It is never part of Event JSON returned to the frontend.
+type nativeParticipationMetadata struct {
+	ActualRoomID string `json:"actual_room_id,omitempty"`
+	JoinBoxID    string `json:"join_box_id,omitempty"`
+	AnchorID     string `json:"anchor_id,omitempty"`
+	BoxType      string `json:"box_type,omitempty"`
+	SendTime     string `json:"send_time,omitempty"`
+	DelayTime    string `json:"delay_time,omitempty"`
+}
+
 type file struct {
-	Version                int                      `json:"version"`
-	Monitors               []*Monitor               `json:"monitors"`
-	Events                 []*Event                 `json:"events"`
-	ParticipationRecords   []*ParticipationRecord   `json:"participation_records,omitempty"`
-	ParticipationSettings  ParticipationSettings    `json:"participation_settings"`
-	MonitoringSettings     MonitoringSettings       `json:"monitoring_settings"`
-	ParticipationTasks     []*ParticipationTask     `json:"participation_tasks,omitempty"`
-	ParticipationTraces    []*ParticipationTrace    `json:"participation_traces,omitempty"`
-	ParticipationSchedules []*ParticipationSchedule `json:"participation_schedules,omitempty"`
-	Activities             []*Activity              `json:"activities,omitempty"`
+	Version                int                                    `json:"version"`
+	Monitors               []*Monitor                             `json:"monitors"`
+	Events                 []*Event                               `json:"events"`
+	NativeParticipation    map[string]nativeParticipationMetadata `json:"native_participation,omitempty"`
+	ParticipationRecords   []*ParticipationRecord                 `json:"participation_records,omitempty"`
+	ParticipationSettings  ParticipationSettings                  `json:"participation_settings"`
+	MonitoringSettings     MonitoringSettings                     `json:"monitoring_settings"`
+	ParticipationTasks     []*ParticipationTask                   `json:"participation_tasks,omitempty"`
+	ParticipationTraces    []*ParticipationTrace                  `json:"participation_traces,omitempty"`
+	ParticipationSchedules []*ParticipationSchedule               `json:"participation_schedules,omitempty"`
+	Activities             []*Activity                            `json:"activities,omitempty"`
 }
 
 type Store struct {
@@ -396,6 +421,14 @@ func (s *Store) load() error {
 	}
 	for _, event := range payload.Events {
 		if event != nil && event.ID != "" {
+			if metadata, ok := payload.NativeParticipation[event.ID]; ok {
+				event.ActualRoomID = metadata.ActualRoomID
+				event.JoinBoxID = metadata.JoinBoxID
+				event.AnchorID = metadata.AnchorID
+				event.BoxType = metadata.BoxType
+				event.SendTime = metadata.SendTime
+				event.DelayTime = metadata.DelayTime
+			}
 			s.events[event.ID] = event
 		}
 	}
@@ -465,9 +498,16 @@ func (s *Store) saveLocked() error {
 		monitors = append(monitors, &copy)
 	}
 	events := make([]*Event, 0, len(s.events))
+	nativeParticipation := make(map[string]nativeParticipationMetadata)
 	for _, item := range s.events {
 		copy := *item
 		events = append(events, &copy)
+		if item.ActualRoomID != "" || item.JoinBoxID != "" || item.AnchorID != "" || item.BoxType != "" || item.SendTime != "" || item.DelayTime != "" {
+			nativeParticipation[item.ID] = nativeParticipationMetadata{
+				ActualRoomID: item.ActualRoomID, JoinBoxID: item.JoinBoxID, AnchorID: item.AnchorID,
+				BoxType: item.BoxType, SendTime: item.SendTime, DelayTime: item.DelayTime,
+			}
+		}
 	}
 	participations := make([]*ParticipationRecord, 0, len(s.participations))
 	for _, item := range s.participations {
@@ -509,7 +549,7 @@ func (s *Store) saveLocked() error {
 		activities = activities[:100]
 	}
 	payload, err := json.Marshal(file{
-		Version: storeVersion, Monitors: monitors, Events: events, ParticipationRecords: participations,
+		Version: storeVersion, Monitors: monitors, Events: events, NativeParticipation: nativeParticipation, ParticipationRecords: participations,
 		ParticipationSettings: s.settings, MonitoringSettings: s.monitoringSettings,
 		ParticipationTasks: participationTasks, ParticipationTraces: participationTraces,
 		ParticipationSchedules: participationSchedules, Activities: activities,
@@ -939,6 +979,54 @@ func (s *Store) FinishParticipationTask(accountID, reason string) error {
 	return s.saveLocked()
 }
 
+// ReconcileParticipationTasksAfterRestart removes stale "active" state left
+// by a process restart. Tasks with an unresolved accepted packet remain only
+// as resumable draw-result work; every other task is closed because its native
+// browser page context no longer exists.
+func (s *Store) ReconcileParticipationTasksAfterRestart(now time.Time) (ParticipationRestartReconciliation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := ParticipationRestartReconciliation{}
+	previous := make(map[string]ParticipationTask)
+	for accountID, task := range s.participationTasks {
+		if task == nil || !task.Active {
+			continue
+		}
+		pending := false
+		for _, record := range s.participations {
+			if record == nil || record.AccountID != accountID || record.TaskID != task.ID {
+				continue
+			}
+			if record.Joined && !record.Won && !participationDrawTerminal(record.Status) {
+				pending = true
+				break
+			}
+		}
+		if pending {
+			result.PendingAccountIDs = append(result.PendingAccountIDs, accountID)
+			continue
+		}
+		previous[accountID] = *task
+		task.Active = false
+		task.EndedAt = now.Format(time.RFC3339Nano)
+		task.EndReason = "客户端重启，原生参与上下文已结束"
+		result.StoppedAccountIDs = append(result.StoppedAccountIDs, accountID)
+	}
+	sort.Strings(result.StoppedAccountIDs)
+	sort.Strings(result.PendingAccountIDs)
+	if len(result.StoppedAccountIDs) == 0 {
+		return result, nil
+	}
+	if err := s.saveLocked(); err != nil {
+		for accountID, task := range previous {
+			copy := task
+			s.participationTasks[accountID] = &copy
+		}
+		return ParticipationRestartReconciliation{}, err
+	}
+	return result, nil
+}
+
 // Activities returns newest-first safe sidebar history.
 func (s *Store) Activities() []Activity {
 	s.mu.Lock()
@@ -1334,14 +1422,15 @@ func (s *Store) EventsAll() []Event {
 	return items
 }
 
-// MergeCenter persists safe red-packet events learned from the shared center.
-// It deliberately does not invoke the participation handler: downloaded rows
-// contain no native page context or private request metadata.
+// MergeCenter persists red-packet events learned from the shared center. Newer
+// native uploaders include only the non-credential participation identifiers
+// already observed by their local monitor. Those identifiers remain hidden
+// from frontend JSON, but allow another native engine to dispatch the event.
 func (s *Store) MergeCenter(items []CenterEvent) (int, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	changed := false
 	imported := 0
+	dispatch := make([]Event, 0)
 	for _, item := range items {
 		webRID, packetID := strings.TrimSpace(item.WebRID), strings.TrimSpace(item.PacketID)
 		if webRID == "" || packetID == "" {
@@ -1359,6 +1448,7 @@ func (s *Store) MergeCenter(items []CenterEvent) (int, error) {
 			changed = true
 			imported++
 		}
+		wasParticipationReady := eventParticipationMetadataReady(existing)
 		centerOwned := existing.DataSource == "center"
 		if centerOwned || existing.RoomName == "" {
 			existing.RoomName = firstNonEmpty(item.RoomName, existing.RoomName)
@@ -1387,12 +1477,38 @@ func (s *Store) MergeCenter(items []CenterEvent) (int, error) {
 				existing.ShareCount = item.ShareCount
 			}
 		}
+		if validLuckyboxID(item.ActualRoomID) {
+			existing.ActualRoomID = firstNonEmpty(existing.ActualRoomID, item.ActualRoomID)
+		}
+		if validLuckyboxID(item.JoinBoxID) {
+			existing.JoinBoxID = firstNonEmpty(existing.JoinBoxID, item.JoinBoxID)
+		}
+		existing.AnchorID = firstNonEmpty(existing.AnchorID, item.AnchorID)
+		existing.BoxType = firstNonEmpty(existing.BoxType, item.BoxType)
+		existing.SendTime = firstNonEmpty(existing.SendTime, item.SendTime)
+		existing.DelayTime = firstNonEmpty(existing.DelayTime, item.DelayTime)
+		if !wasParticipationReady && eventParticipationMetadataReady(existing) && eventOpenAt(*existing, time.Now()) {
+			dispatch = append(dispatch, *existing)
+		}
 		changed = true
 	}
 	if !changed {
+		s.mu.Unlock()
 		return imported, nil
 	}
-	return imported, s.saveLocked()
+	err := s.saveLocked()
+	handler := s.eventHandler
+	s.mu.Unlock()
+	if err != nil {
+		return imported, err
+	}
+	if handler != nil {
+		for _, event := range dispatch {
+			event := event
+			go handler(event)
+		}
+	}
+	return imported, nil
 }
 
 func (s *Store) findEventByIdentityLocked(webRID, packetID string) *Event {

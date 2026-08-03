@@ -95,6 +95,12 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE TABLE IF NOT EXISTS red_packet_events (
 			web_rid TEXT NOT NULL,
 			packet_id TEXT NOT NULL,
+			actual_room_id TEXT NOT NULL DEFAULT '',
+			join_box_id TEXT NOT NULL DEFAULT '',
+			anchor_id TEXT NOT NULL DEFAULT '',
+			box_type TEXT NOT NULL DEFAULT '',
+			send_time TEXT NOT NULL DEFAULT '',
+			delay_time TEXT NOT NULL DEFAULT '',
 			room_name TEXT NOT NULL DEFAULT '',
 			streamer_name TEXT NOT NULL DEFAULT '',
 			title TEXT NOT NULL DEFAULT '',
@@ -138,6 +144,11 @@ func (s *Store) migrate(ctx context.Context) error {
 	}
 	if err := s.ensureColumn(ctx, "devices", "access_mode", "TEXT NOT NULL DEFAULT 'full'"); err != nil {
 		return err
+	}
+	for _, column := range []string{"actual_room_id", "join_box_id", "anchor_id", "box_type", "send_time", "delay_time"} {
+		if err := s.ensureColumn(ctx, "red_packet_events", column, "TEXT NOT NULL DEFAULT ''"); err != nil {
+			return err
+		}
 	}
 	return s.backfillChanges(ctx)
 }
@@ -377,10 +388,12 @@ func readRoomTx(ctx context.Context, tx *sql.Tx, webRID string) (syncprotocol.Ro
 func readRedPacketTx(ctx context.Context, tx *sql.Tx, webRID, packetID string) (syncprotocol.RedPacket, error) {
 	var packet syncprotocol.RedPacket
 	err := tx.QueryRowContext(ctx, `
-		SELECT web_rid, packet_id, room_name, streamer_name, title, prize, source, detected_at,
+		SELECT web_rid, packet_id, actual_room_id, join_box_id, anchor_id, box_type, send_time, delay_time,
+			room_name, streamer_name, title, prize, source, detected_at,
 			draw_at, expires_at, participant_count, total_diamonds, share_count
 		FROM red_packet_events WHERE web_rid = ? AND packet_id = ?`, strings.TrimSpace(webRID), strings.TrimSpace(packetID)).Scan(
-		&packet.WebRID, &packet.PacketID, &packet.RoomName, &packet.StreamerName, &packet.Title,
+		&packet.WebRID, &packet.PacketID, &packet.ActualRoomID, &packet.JoinBoxID, &packet.AnchorID,
+		&packet.BoxType, &packet.SendTime, &packet.DelayTime, &packet.RoomName, &packet.StreamerName, &packet.Title,
 		&packet.Prize, &packet.Source, &packet.DetectedAt, &packet.DrawAt, &packet.ExpiresAt,
 		&packet.ParticipantCount, &packet.TotalDiamonds, &packet.ShareCount,
 	)
@@ -397,9 +410,15 @@ func upsertRedPacket(ctx context.Context, tx *sql.Tx, clientID string, packet sy
 		return errors.New("红包发现时间无效")
 	}
 	_, err := tx.ExecContext(ctx, `
-		INSERT INTO red_packet_events(web_rid, packet_id, room_name, streamer_name, title, prize, source, detected_at, draw_at, expires_at, participant_count, total_diamonds, share_count, last_seen_at, last_client_id)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO red_packet_events(web_rid, packet_id, actual_room_id, join_box_id, anchor_id, box_type, send_time, delay_time, room_name, streamer_name, title, prize, source, detected_at, draw_at, expires_at, participant_count, total_diamonds, share_count, last_seen_at, last_client_id)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(web_rid, packet_id) DO UPDATE SET
+			actual_room_id=COALESCE(NULLIF(excluded.actual_room_id, ''), red_packet_events.actual_room_id),
+			join_box_id=COALESCE(NULLIF(excluded.join_box_id, ''), red_packet_events.join_box_id),
+			anchor_id=COALESCE(NULLIF(excluded.anchor_id, ''), red_packet_events.anchor_id),
+			box_type=COALESCE(NULLIF(excluded.box_type, ''), red_packet_events.box_type),
+			send_time=COALESCE(NULLIF(excluded.send_time, ''), red_packet_events.send_time),
+			delay_time=COALESCE(NULLIF(excluded.delay_time, ''), red_packet_events.delay_time),
 			room_name=COALESCE(NULLIF(excluded.room_name, ''), red_packet_events.room_name),
 			streamer_name=COALESCE(NULLIF(excluded.streamer_name, ''), red_packet_events.streamer_name),
 			title=COALESCE(NULLIF(excluded.title, ''), red_packet_events.title),
@@ -413,7 +432,10 @@ func upsertRedPacket(ctx context.Context, tx *sql.Tx, clientID string, packet sy
 			share_count=MAX(red_packet_events.share_count, excluded.share_count),
 			last_seen_at=excluded.last_seen_at,
 			last_client_id=excluded.last_client_id`,
-		packet.WebRID, packet.PacketID, safeText(packet.RoomName, 500), safeText(packet.StreamerName, 200), safeText(packet.Title, 500), safeText(packet.Prize, 500), safeText(packet.Source, 80), packet.DetectedAt, packet.DrawAt, packet.ExpiresAt, packet.ParticipantCount, packet.TotalDiamonds, packet.ShareCount, seenAt, clientID)
+		packet.WebRID, packet.PacketID,
+		safeNumericText(packet.ActualRoomID, 32), safeNumericText(packet.JoinBoxID, 32), safeNumericText(packet.AnchorID, 32),
+		safeNumericText(packet.BoxType, 16), safeNumericText(packet.SendTime, 32), safeNumericText(packet.DelayTime, 32),
+		safeText(packet.RoomName, 500), safeText(packet.StreamerName, 200), safeText(packet.Title, 500), safeText(packet.Prize, 500), safeText(packet.Source, 80), packet.DetectedAt, packet.DrawAt, packet.ExpiresAt, packet.ParticipantCount, packet.TotalDiamonds, packet.ShareCount, seenAt, clientID)
 	return err
 }
 
@@ -508,7 +530,8 @@ func (s *Store) backfillChanges(ctx context.Context) error {
 		return err
 	}
 	packetRows, err := s.db.QueryContext(ctx, `
-		SELECT web_rid, packet_id, room_name, streamer_name, title, prize, source, detected_at,
+		SELECT web_rid, packet_id, actual_room_id, join_box_id, anchor_id, box_type, send_time, delay_time,
+			room_name, streamer_name, title, prize, source, detected_at,
 			draw_at, expires_at, participant_count, total_diamonds, share_count, last_seen_at, last_client_id
 		FROM red_packet_events ORDER BY detected_at, web_rid, packet_id`)
 	if err != nil {
@@ -517,7 +540,8 @@ func (s *Store) backfillChanges(ctx context.Context) error {
 	for packetRows.Next() {
 		var packet syncprotocol.RedPacket
 		var changedAt, clientID string
-		if err := packetRows.Scan(&packet.WebRID, &packet.PacketID, &packet.RoomName, &packet.StreamerName, &packet.Title,
+		if err := packetRows.Scan(&packet.WebRID, &packet.PacketID, &packet.ActualRoomID, &packet.JoinBoxID, &packet.AnchorID,
+			&packet.BoxType, &packet.SendTime, &packet.DelayTime, &packet.RoomName, &packet.StreamerName, &packet.Title,
 			&packet.Prize, &packet.Source, &packet.DetectedAt, &packet.DrawAt, &packet.ExpiresAt,
 			&packet.ParticipantCount, &packet.TotalDiamonds, &packet.ShareCount, &changedAt, &clientID); err != nil {
 			packetRows.Close()
@@ -573,6 +597,19 @@ func safeText(value string, limit int) string {
 	runes := []rune(value)
 	if len(runes) > limit {
 		return string(runes[:limit])
+	}
+	return value
+}
+
+func safeNumericText(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > limit {
+		return ""
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return ""
+		}
 	}
 	return value
 }

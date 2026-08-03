@@ -1,6 +1,7 @@
 package redpacket
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -527,6 +528,60 @@ func TestReloadMigratesOverduePendingDrawToError(t *testing.T) {
 	}
 }
 
+func TestRestartReconciliationStopsStaleTaskButKeepsPendingDrawResumable(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordParticipationStarted("account-stale", "旧任务账号"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordParticipationStarted("account-pending", "待开奖账号"); err != nil {
+		t.Fatal(err)
+	}
+	event := Event{
+		ID: "event-pending-restart", WebRID: "123456", ActualRoomID: "700001", JoinBoxID: "7669063194534955828",
+		ExpiresAt: time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+	}
+	if reserved, reserveErr := store.ReserveParticipation(event, "account-pending", "待开奖账号"); reserveErr != nil || !reserved {
+		t.Fatalf("reserve pending event: reserved=%v err=%v", reserved, reserveErr)
+	}
+	if err := store.CompleteParticipation(event.ID, "account-pending", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	result, err := store.ReconcileParticipationTasksAfterRestart(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.StoppedAccountIDs) != 1 || result.StoppedAccountIDs[0] != "account-stale" {
+		t.Fatalf("unexpected stopped accounts: %+v", result)
+	}
+	if len(result.PendingAccountIDs) != 1 || result.PendingAccountIDs[0] != "account-pending" {
+		t.Fatalf("unexpected pending accounts: %+v", result)
+	}
+	stale := store.participationTasks["account-stale"]
+	if stale == nil || stale.Active || stale.EndedAt == "" || !strings.Contains(stale.EndReason, "客户端重启") {
+		t.Fatalf("stale task was not closed: %+v", stale)
+	}
+	if pending := store.participationTasks["account-pending"]; pending == nil || !pending.Active {
+		t.Fatalf("pending draw task must remain resumable: %+v", pending)
+	}
+
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := reloaded.GetParticipationState("account-stale", now); state.Active {
+		t.Fatalf("stale task became active after reload: %+v", state)
+	}
+	if draws := reloaded.PendingDraws("account-pending"); len(draws) != 1 || draws[0].ID != event.ID {
+		t.Fatalf("pending draw was not retained for explicit recovery: %+v", draws)
+	}
+}
+
 func TestParticipationPolicyStopsAtJoinAndWinLimits(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {
@@ -941,6 +996,50 @@ func TestPollOnceDispatchesCenterEventAfterLocalRequestMetadataIsEnriched(t *tes
 	case duplicate := <-handled:
 		t.Fatalf("already actionable event was dispatched twice: %+v", duplicate)
 	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestMergeCenterDispatchesAndPersistsNativeParticipationMetadata(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handled := make(chan Event, 2)
+	store.SetEventHandler(func(event Event) { handled <- event })
+	future := time.Now().Add(2 * time.Minute).Format(time.RFC3339Nano)
+	item := CenterEvent{
+		WebRID: "123456789", PacketID: "AC202509231602294103473098",
+		ActualRoomID: "7000000000000000001", JoinBoxID: "7669047909329177395",
+		AnchorID: "1234567890", BoxType: "1", SendTime: "100", DelayTime: "30",
+		Title: "钻石红包", Prize: "总25钻，15份红包", ExpiresAt: future,
+	}
+	if imported, mergeErr := store.MergeCenter([]CenterEvent{item}); mergeErr != nil || imported != 1 {
+		t.Fatalf("merge native center event: imported=%d err=%v", imported, mergeErr)
+	}
+	select {
+	case event := <-handled:
+		if event.ActualRoomID != item.ActualRoomID || event.JoinBoxID != item.JoinBoxID || event.AnchorID != item.AnchorID {
+			t.Fatalf("center event lost native metadata: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("actionable center event was not dispatched")
+	}
+
+	safeJSON, err := json.Marshal(store.EventsAll())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(safeJSON, []byte(item.ActualRoomID)) || bytes.Contains(safeJSON, []byte(item.JoinBoxID)) {
+		t.Fatalf("native participation metadata leaked through event JSON: %s", safeJSON)
+	}
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events := reloaded.EventsAll()
+	if len(events) != 1 || events[0].ActualRoomID != item.ActualRoomID || events[0].JoinBoxID != item.JoinBoxID || events[0].DelayTime != item.DelayTime {
+		t.Fatalf("native participation metadata did not survive reload: %+v", events)
 	}
 }
 

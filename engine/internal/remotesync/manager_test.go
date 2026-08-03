@@ -417,6 +417,8 @@ func TestPullOnceImportsOtherClientDataWithoutEchoingIt(t *testing.T) {
 	}
 	if err := managerA.EnqueueEvent(redpacket.Event{
 		WebRID: "123456789012", RoomID: "123456789012", PacketID: "packet-center",
+		ActualRoomID: "7000000000000000001", JoinBoxID: "7669047909329177395",
+		AnchorID: "1234567890", BoxType: "1", SendTime: "100", DelayTime: "30",
 		Title: "钻石红包", Prize: "总99钻，24份红包", Source: "luckybox_api", DetectedAt: now,
 	}); err != nil {
 		t.Fatal(err)
@@ -438,7 +440,8 @@ func TestPullOnceImportsOtherClientDataWithoutEchoingIt(t *testing.T) {
 		t.Fatalf("finite-license pull imported center rooms: %+v", roomsB)
 	}
 	eventsB := redPacketStoreB.EventsAll()
-	if len(eventsB) != 1 || eventsB[0].DataSource != "center" || eventsB[0].PacketID != "packet-center" {
+	if len(eventsB) != 1 || eventsB[0].DataSource != "center" || eventsB[0].PacketID != "packet-center" ||
+		eventsB[0].ActualRoomID != "7000000000000000001" || eventsB[0].JoinBoxID != "7669047909329177395" {
 		t.Fatalf("finite-license pull did not import center packet: %+v", eventsB)
 	}
 	if err := managerB.PullOnceScoped(context.Background(), roomStoreB, redPacketStoreB, PullAll); err != nil {

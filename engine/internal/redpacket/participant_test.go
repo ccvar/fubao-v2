@@ -602,16 +602,18 @@ func TestPageParticipantStoppedBeforeRequestReleasesReservation(t *testing.T) {
 	executor.mu.Unlock()
 	participant.HandleEvent(event)
 	deadline = time.Now().Add(time.Second)
+	var records []ParticipationRecord
 	for time.Now().Before(deadline) {
 		executor.mu.Lock()
 		executedAgain := len(executor.requests) == 2
 		executor.mu.Unlock()
-		if executedAgain {
+		records = recordStore.ParticipationRecords()
+		if executedAgain && len(records) == 1 && records[0].Status == "joined" && records[0].AttemptCount == 1 {
 			break
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if records := recordStore.ParticipationRecords(); len(records) != 1 || records[0].Status != "joined" || records[0].AttemptCount != 1 {
+	if len(records) != 1 || records[0].Status != "joined" || records[0].AttemptCount != 1 {
 		t.Fatalf("re-enabled context did not participate once: %+v", records)
 	}
 }

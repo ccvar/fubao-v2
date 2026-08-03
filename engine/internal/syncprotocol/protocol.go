@@ -98,6 +98,12 @@ type RoomState struct {
 type RedPacket struct {
 	WebRID           string  `json:"web_rid"`
 	PacketID         string  `json:"packet_id"`
+	ActualRoomID     string  `json:"actual_room_id,omitempty"`
+	JoinBoxID        string  `json:"join_box_id,omitempty"`
+	AnchorID         string  `json:"anchor_id,omitempty"`
+	BoxType          string  `json:"box_type,omitempty"`
+	SendTime         string  `json:"send_time,omitempty"`
+	DelayTime        string  `json:"delay_time,omitempty"`
 	RoomName         string  `json:"room_name,omitempty"`
 	StreamerName     string  `json:"streamer_name,omitempty"`
 	Title            string  `json:"title,omitempty"`
