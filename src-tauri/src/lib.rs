@@ -40,6 +40,11 @@ struct EngineRuntime {
     browser_webviews_closing: Mutex<HashSet<String>>,
     browser_red_packet_contexts: Mutex<HashSet<String>>,
     browser_cookie_synced_at: Mutex<HashMap<String, Instant>>,
+    // WebView2 applies Cookie-manager writes asynchronously. Remember when a
+    // complete login snapshot was confirmed in a newly mounted account
+    // profile so an initial login-dialog paint cannot immediately invalidate
+    // the canonical CK while Douyin is still restoring the session.
+    browser_cookie_injected_at: Mutex<HashMap<String, Instant>>,
 }
 
 impl Default for EngineRuntime {
@@ -53,6 +58,7 @@ impl Default for EngineRuntime {
             browser_webviews_closing: Mutex::new(HashSet::new()),
             browser_red_packet_contexts: Mutex::new(HashSet::new()),
             browser_cookie_synced_at: Mutex::new(HashMap::new()),
+            browser_cookie_injected_at: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -516,6 +522,38 @@ fn inject_douyin_cookie(webview: &tauri::Webview, raw_cookie: &str) -> Result<()
     Ok(())
 }
 
+fn login_cookie_snapshot_matches(expected: &str, actual: &str) -> bool {
+    let expected = login_cookie_values(expected);
+    let actual = login_cookie_values(actual);
+    !expected.is_empty()
+        && expected
+            .iter()
+            .all(|(name, value)| actual.get(name).is_some_and(|current| current == value))
+}
+
+async fn inject_douyin_cookie_and_confirm(
+    webview: &tauri::Webview,
+    raw_cookie: &str,
+) -> Result<(), String> {
+    if login_cookie_values(raw_cookie).is_empty() {
+        return Err("账号 Cookie 缺少登录凭据，请重新扫码登录".into());
+    }
+    let mut last_error = "等待浏览器接收账号 Cookie".to_string();
+    for attempt in 0..6 {
+        inject_douyin_cookie(webview, raw_cookie)?;
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        match read_douyin_cookie(webview) {
+            Ok(actual) if login_cookie_snapshot_matches(raw_cookie, &actual) => return Ok(()),
+            Ok(_) => last_error = "浏览器尚未写入完整登录 Cookie".into(),
+            Err(error) => last_error = error,
+        }
+        if attempt < 5 {
+            tokio::time::sleep(Duration::from_millis(140)).await;
+        }
+    }
+    Err(format!("同步账号 Cookie 失败：{last_error}"))
+}
+
 fn read_douyin_cookie(webview: &tauri::Webview) -> Result<String, String> {
     let mut values = HashMap::<String, (u8, String)>::new();
     // Wry's macOS `cookies_for_url` currently compares cookie domains using
@@ -609,8 +647,8 @@ fn login_cookie_values(raw_cookie: &str) -> HashMap<String, String> {
 mod cookie_tests {
     use super::{
         begin_browser_webview_close, browser_location_matches_live_room,
-        browser_webview_is_closing, canonical_cookie_values, login_cookie_values,
-        remember_browser_location, EngineRuntime, Url,
+        browser_webview_is_closing, canonical_cookie_values, login_cookie_snapshot_matches,
+        login_cookie_values, remember_browser_location, EngineRuntime, Url,
     };
 
     #[test]
@@ -629,6 +667,23 @@ mod cookie_tests {
             login_cookie_values("sessionid_ss=session; ttwid=old"),
             login_cookie_values("sessionid_ss=session; ttwid=new")
         );
+    }
+
+    #[test]
+    fn injected_profile_requires_every_login_cookie_to_match() {
+        let expected = "sessionid_ss=new-session; sid_guard=new-guard; ttwid=aux";
+        assert!(login_cookie_snapshot_matches(
+            expected,
+            "sid_guard=new-guard; sessionid_ss=new-session; ttwid=other"
+        ));
+        assert!(!login_cookie_snapshot_matches(
+            expected,
+            "sid_guard=old-guard; sessionid_ss=new-session"
+        ));
+        assert!(!login_cookie_snapshot_matches(
+            "ttwid=auxiliary-only",
+            "ttwid=auxiliary-only"
+        ));
     }
 
     #[test]
@@ -740,7 +795,7 @@ async fn read_authenticated_douyin_cookie(webview: &tauri::Webview) -> Result<St
     // manager exposes the final HttpOnly login values. Retry the native read
     // briefly instead of saving the previously injected, expired account CK.
     let mut last_error = "尚未检测到登录状态，请先在抖音窗口完成登录".to_string();
-    for attempt in 0..4 {
+    for attempt in 0..8 {
         match inspect_douyin_login(webview).await {
             Ok(BrowserLoginSnapshot {
                 raw_cookie: Some(raw_cookie),
@@ -755,8 +810,8 @@ async fn read_authenticated_douyin_cookie(webview: &tauri::Webview) -> Result<St
             }
             Err(error) => last_error = error,
         }
-        if attempt < 3 {
-            tokio::time::sleep(Duration::from_millis(220)).await;
+        if attempt < 7 {
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }
     Err(last_error)
@@ -1430,7 +1485,7 @@ async fn open_account_rebind(
         )
         .map_err(|error| format!("创建登录页面失败：{error}"))?;
     if !credential.cookie.trim().is_empty() {
-        inject_douyin_cookie(&webview, &credential.cookie)?;
+        inject_douyin_cookie_and_confirm(&webview, &credential.cookie).await?;
     }
     let douyin_url: Url = "https://www.douyin.com/"
         .parse()
@@ -1619,9 +1674,9 @@ async fn complete_account_create(
     let webview = app
         .get_webview(&label)
         .ok_or("登录页面已关闭，请重新打开")?;
-    let raw_cookie = read_douyin_cookie(&webview)?;
+    let raw_cookie = read_authenticated_douyin_cookie(&webview).await?;
     let runtime = runtime.inner().clone();
-    let result = native_engine_request(
+    let mut result = native_engine_request(
         runtime.clone(),
         "account.native_create_from_cookie",
         json!({
@@ -1632,6 +1687,24 @@ async fn complete_account_create(
         }),
     )
     .await?;
+    let account_id = result
+        .pointer("/account/id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or("新增账号结果缺少账号标识")?;
+    let account = native_engine_request(
+        runtime.clone(),
+        "account.native_set_browser_login_state",
+        json!({
+            "account_id": account_id,
+            "logged_in": true,
+            "secret": runtime.native_secret
+        }),
+    )
+    .await?;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("account".into(), account);
+    }
     webview
         .hide()
         .map_err(|error| format!("隐藏登录页面失败：{error}"))?;
@@ -1896,7 +1969,10 @@ async fn ensure_browser_webview(
         .hide()
         .map_err(|error| format!("隐藏待加载浏览器失败：{error}"))?;
     apply_browser_geometry(&webview, &bounds)?;
-    inject_douyin_cookie(&webview, &credential.cookie)?;
+    inject_douyin_cookie_and_confirm(&webview, &credential.cookie).await?;
+    if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
+        injected.insert(instance_id.to_string(), Instant::now());
+    }
     webview
         .navigate(restore_url)
         .map_err(|error| format!("加载抖音页面失败：{error}"))?;
@@ -2198,7 +2274,10 @@ async fn refresh_browser_account_cookie(
         .parse()
         .map_err(|error| format!("解析抖音地址失败：{error}"))?;
     for webview in webviews {
-        inject_douyin_cookie(&webview, &credential.cookie)?;
+        inject_douyin_cookie_and_confirm(&webview, &credential.cookie).await?;
+        if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
+            injected.insert(instance_id.clone(), Instant::now());
+        }
         webview
             .navigate(douyin_url.clone())
             .map_err(|error| format!("刷新账号登录状态失败：{error}"))?;
@@ -2230,7 +2309,7 @@ async fn sync_browser_account_cookie(
         }
         return Ok(false);
     };
-    let snapshot = inspect_douyin_login(&webview).await?;
+    let mut snapshot = inspect_douyin_login(&webview).await?;
     let runtime = runtime.inner().clone();
     let result = native_engine_request(
         runtime.clone(),
@@ -2243,6 +2322,32 @@ async fn sync_browser_account_cookie(
     .await?;
     let credential: NativeBrowserCredential =
         serde_json::from_value(result).map_err(|error| format!("解析浏览器凭据失败：{error}"))?;
+    let within_injection_grace = runtime
+        .browser_cookie_injected_at
+        .lock()
+        .ok()
+        .and_then(|injected| injected.get(&instance_id).copied())
+        .is_some_and(|injected_at| injected_at.elapsed() < Duration::from_secs(15));
+    if snapshot.state == BrowserLoginState::LoggedOut && within_injection_grace {
+        if !require_logged_in {
+            if cfg!(debug_assertions) {
+                eprintln!(
+                    "[embedded-browser] login-state deferred instance={instance_id} reason=profile-bootstrap"
+                );
+            }
+            return Ok(false);
+        }
+        // An explicit open action needs a definitive result. Give the newly
+        // injected Windows profile a bounded page-restoration window instead
+        // of failing on its first transient login-dialog frame.
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            snapshot = inspect_douyin_login(&webview).await?;
+            if snapshot.state != BrowserLoginState::LoggedOut {
+                break;
+            }
+        }
+    }
     let mut cookie_persisted = false;
     if snapshot.state == BrowserLoginState::LoggedIn {
         if let Some(raw_cookie) = snapshot.raw_cookie.as_deref() {

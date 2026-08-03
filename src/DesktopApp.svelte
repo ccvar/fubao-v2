@@ -4989,6 +4989,25 @@
                 </span>
               </span>
             </span>
+            {#if !participationTaskMenuOpen && (participationBatchRunning || browserParticipationRuntime.accounts > 0)}
+              <button
+                class="browser-participation-runtime topbar-participation-runtime"
+                aria-label="查看实际红包参与情况"
+                data-tooltip="查看参与记录"
+                data-tooltip-placement="bottom"
+                onclick={() => openManagementTab("participation-records")}
+              >
+                <span class="browser-participation-runtime-state"><i></i>{participationBatchRunning && browserParticipationRuntime.accounts === 0 ? "正在准备参与上下文" : "参与任务进行中"}</span>
+                {#if browserParticipationRuntime.accounts > 0}
+                  <span>{browserParticipationRuntime.accounts} 个账号</span>
+                  <span>就绪 {browserParticipationRuntime.prepared}/{browserParticipationRuntime.accounts}</span>
+                  <span>可参与 {browserParticipationRuntime.accepting}</span>
+                  <span>已参与 {browserParticipationRuntime.joined}</span>
+                  <span>待开奖 {browserParticipationRuntime.pending}</span>
+                  <span>中奖 {browserParticipationRuntime.won}</span>
+                {/if}
+              </button>
+            {/if}
           {/if}
         </div>
         <p data-tauri-drag-region>
@@ -5159,34 +5178,13 @@
         {#if browserLoading && browserInstances.length === 0}
           <div class="empty-state"><ArrowClockwise class="spinning" size={25} /><strong>正在读取浏览器实例</strong><span>由 Go 引擎加载本机独立配置</span></div>
         {:else if visibleBrowserInstances.length > 0}
-          {#if (browserCapacity && (browserCapacity.waiting > 0 || browserCapacity.resources.pressure === "constrained" || browserCapacity.resources.pressure === "critical")) || participationBatchRunning || browserParticipationRuntime.accounts > 0}
+          {#if browserCapacity && (browserCapacity.waiting > 0 || browserCapacity.resources.pressure === "constrained" || browserCapacity.resources.pressure === "critical")}
             <div class="browser-runtime-strip">
-              {#if browserCapacity && (browserCapacity.waiting > 0 || browserCapacity.resources.pressure === "constrained" || browserCapacity.resources.pressure === "critical")}
-                <div class:critical={browserCapacity.resources.pressure === "critical"} class="browser-capacity-note">
-                  <ClockCountdown size={14} />
-                  <span>{browserCapacity.message}</span>
-                  <small>运行 {browserCapacity.running}/{browserCapacity.effective_limit} · 建议 {browserCapacity.recommended_limit}</small>
-                </div>
-              {/if}
-              {#if participationBatchRunning || browserParticipationRuntime.accounts > 0}
-                <button
-                  class="browser-participation-runtime"
-                  aria-label="查看实际红包参与情况"
-                  data-tooltip="查看参与记录"
-                  data-tooltip-placement="bottom"
-                  onclick={() => openManagementTab("participation-records")}
-                >
-                  <span class="browser-participation-runtime-state"><i></i>{participationBatchRunning && browserParticipationRuntime.accounts === 0 ? "正在准备参与上下文" : "参与任务进行中"}</span>
-                  {#if browserParticipationRuntime.accounts > 0}
-                    <span>{browserParticipationRuntime.accounts} 个账号</span>
-                    <span>就绪 {browserParticipationRuntime.prepared}/{browserParticipationRuntime.accounts}</span>
-                    <span>可参与 {browserParticipationRuntime.accepting}</span>
-                    <span>已参与 {browserParticipationRuntime.joined}</span>
-                    <span>待开奖 {browserParticipationRuntime.pending}</span>
-                    <span>中奖 {browserParticipationRuntime.won}</span>
-                  {/if}
-                </button>
-              {/if}
+              <div class:critical={browserCapacity.resources.pressure === "critical"} class="browser-capacity-note">
+                <ClockCountdown size={14} />
+                <span>{browserCapacity.message}</span>
+                <small>运行 {browserCapacity.running}/{browserCapacity.effective_limit} · 建议 {browserCapacity.recommended_limit}</small>
+              </div>
             </div>
           {/if}
           <div

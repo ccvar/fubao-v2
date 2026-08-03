@@ -1170,6 +1170,27 @@ label.browser-column-control[data-tooltip]:focus-within {
   transform: none;
 }
 
+.title-line .topbar-participation-runtime {
+  height: 18px;
+  min-height: 18px;
+  gap: 5px;
+  margin-left: 2px;
+  padding: 0 5px;
+  border-radius: 5px;
+  font-size: 8.5px;
+  line-height: 18px;
+}
+
+.title-line .topbar-participation-runtime .browser-participation-runtime-state {
+  gap: 4px;
+}
+
+.title-line .topbar-participation-runtime .browser-participation-runtime-state i {
+  width: 5px;
+  height: 5px;
+  box-shadow: 0 0 0 2px rgb(53 164 126 / 10%);
+}
+
 .browser-participation-runtime-state {
   display: inline-flex;
   align-items: center;

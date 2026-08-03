@@ -146,6 +146,8 @@ Native browser WebView teardown is idempotent and must never inspect the page UR
 
 An active red-packet participation task retains its real native live-room WebView and Go runtime lease even when the instance card is outside the viewport or another app page is selected; hide the surface without destroying the page context. Release both only after the participation context ends. The browser screen shows a compact live task summary from safe Go context state—active accounts, prepared/accepting contexts, task-local joined count, pending draws, and wins—and never invents frontend counters.
 
+On the browser-instance screen, place the compact live participation-task summary immediately after the top-bar “抢包” trigger rather than in a separate content row. Hide that summary while the “抢包” action menu is expanded, restore it after the menu collapses, and keep its height aligned with the compact trigger so active-task status does not increase the page header or content height.
+
 Room records without a valid 6–20 digit `web_rid` are invalid and must be removed rather than displayed as record-only rooms. Red-packet bulk controls reflect actual runtime state: hide “全部停止” when none are running, hide “全部启动” when all eligible rooms are running, visually distinguish start from stop, and provide a compact runtime-log entry point.
 
 When dismissing the CK rebind flow, hide and destroy the native child WebView before unmounting the HTML modal. If native teardown fails, keep the modal visible and report the failure so an orphan WebView can never remain over the main interface.

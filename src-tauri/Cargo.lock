@@ -884,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "fubao-desktop"
-version = "0.1.22"
+version = "0.1.23"
 dependencies = [
  "cookie",
  "futures-util",
