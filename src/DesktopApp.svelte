@@ -589,6 +589,7 @@
   let searchOpen = false;
   let topbarSearchInput: HTMLInputElement;
   let toast = "";
+  let toastTimer: number | undefined;
   let refreshing = false;
   let instanceModalOpen = false;
   let browserInstances: BrowserInstance[] = [];
@@ -1246,13 +1247,13 @@
 		if (!isTauriDesktop()) {
 			roomSettings = nextRoomSettings;
 			participationSettingsBusy = false;
-			toast = "直播间设置已保存";
+			showToast("直播间设置已保存");
 			closeParticipationSettings();
 			return;
 		}
 		try {
 			roomSettings = await engineRequest<RoomSettings>("room.set_settings", nextRoomSettings);
-			toast = roomSettings.auto_recycle_offline_days === 0 ? "已关闭直播间自动回收" : "直播间设置已保存";
+			showToast(roomSettings.auto_recycle_offline_days === 0 ? "已关闭直播间自动回收" : "直播间设置已保存");
 			participationSettingsBusy = false;
 			closeParticipationSettings();
 		} catch (error) {
@@ -1278,14 +1279,14 @@
 	if (!isTauriDesktop()) {
 		participationSettings = next;
 		participationSettingsBusy = false;
-		toast = "红包参与设置已保存";
+		showToast("红包参与设置已保存");
 		closeParticipationSettings();
 		return;
 	}
 	try {
 		participationSettings = await engineRequest<ParticipationSettings>("red_packet_participation.set_settings", next);
 		await loadBrowserParticipationContexts();
-		toast = "红包参与设置已保存";
+		showToast("红包参与设置已保存");
 		participationSettingsBusy = false;
 		closeParticipationSettings();
 	} catch (error) {
@@ -1635,8 +1636,7 @@
       });
       remoteSyncToken = "";
       remoteSyncEditing = false;
-      toast = enabled ? "中心数据接收已启用" : "中心数据接收已停用，本机数据仍会上传";
-      window.setTimeout(() => (toast = ""), 2200);
+      showToast(enabled ? "中心数据接收已启用" : "中心数据接收已停用，本机数据仍会上传");
     } catch (error) {
       remoteSyncError = error instanceof Error ? error.message : String(error);
       await loadRemoteSyncStatus(false);
@@ -1678,8 +1678,7 @@
       }
       licenseKey = "";
       licenseReplacing = false;
-      toast = result.message;
-      window.setTimeout(() => (toast = ""), 2200);
+      showToast(result.message);
     } catch (error) {
       licenseError = error instanceof Error ? error.message : String(error);
     } finally {
@@ -1696,8 +1695,7 @@
       licenseStatus = result.status;
       if (!result.success) licenseError = result.message;
       else {
-        toast = result.message;
-        window.setTimeout(() => (toast = ""), 2200);
+        showToast(result.message);
       }
     } catch (error) {
       licenseError = error instanceof Error ? error.message : String(error);
@@ -2308,7 +2306,7 @@
       try {
         await invoke("open_page_window", { view: key });
       } catch (error) {
-        toast = error instanceof Error ? error.message : String(error);
+        showToast(error instanceof Error ? error.message : String(error));
       }
       return;
     }
@@ -4648,9 +4646,11 @@
   }
 
   function showToast(message: string) {
+    if (toastTimer !== undefined) window.clearTimeout(toastTimer);
     toast = message;
-    window.setTimeout(() => {
-      if (toast === message) toast = "";
+    toastTimer = window.setTimeout(() => {
+      toast = "";
+      toastTimer = undefined;
     }, 3000);
   }
 

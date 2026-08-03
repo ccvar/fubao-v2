@@ -23,11 +23,15 @@ const (
 	// 1,000+ room start from turning into one large request burst.
 	defaultGlobalRequestInterval  = 80 * time.Millisecond
 	defaultAccountRequestInterval = 750 * time.Millisecond
-	defaultGlobalConcurrency      = 12
-	defaultAccountConcurrency     = 1
-	defaultRateLimitCooldown      = 2 * time.Minute
-	defaultTimeoutCooldown        = 30 * time.Second
-	maximumAccountCooldown        = 15 * time.Minute
+	// Concurrency is deliberately larger than the request-rate gates. Requests
+	// still begin no faster than one globally every 80ms and one per account
+	// every 750ms, but slow Windows/network responses no longer leave those safe
+	// pacing windows idle while the previous request is still completing.
+	defaultGlobalConcurrency  = 32
+	defaultAccountConcurrency = 3
+	defaultRateLimitCooldown  = 2 * time.Minute
+	defaultTimeoutCooldown    = 30 * time.Second
+	maximumAccountCooldown    = 15 * time.Minute
 )
 
 var errMonitoringAccountCooling = errors.New("监测账号正在冷却")
@@ -50,6 +54,17 @@ type PoolStartResult struct {
 	Started      int           `json:"started"`
 	AccountCount int           `json:"account_count"`
 	Assignments  []AccountLoad `json:"assignments"`
+}
+
+// PoolRefreshResult is safe runtime metadata for a hot account-pool refresh.
+// It never contains Cookie values or other native credentials.
+type PoolRefreshResult struct {
+	Active       bool `json:"active"`
+	Added        int  `json:"added"`
+	Updated      int  `json:"updated"`
+	Removed      int  `json:"removed"`
+	AccountCount int  `json:"account_count"`
+	Rebalanced   int  `json:"rebalanced"`
 }
 
 type poolConfig struct {
@@ -119,19 +134,7 @@ func newAccountPoolWithConfig(credentials []AccountCredential, config poolConfig
 		globalGate:  newRequestGate(config.globalInterval, config.globalParallel),
 		config:      config,
 	}
-	for _, credential := range credentials {
-		credential.AccountID = strings.TrimSpace(credential.AccountID)
-		credential.AccountName = strings.TrimSpace(credential.AccountName)
-		credential.Cookie = strings.TrimSpace(credential.Cookie)
-		if credential.AccountID == "" || credential.Cookie == "" {
-			continue
-		}
-		if credential.AccountName == "" {
-			credential.AccountName = credential.AccountID
-		}
-		if _, exists := pool.accounts[credential.AccountID]; exists {
-			continue
-		}
+	for _, credential := range normalizedAccountCredentials(credentials) {
 		account := &poolAccount{
 			credential: credential,
 			gate:       newRequestGate(config.accountInterval, config.accountParallel),
@@ -146,6 +149,82 @@ func newAccountPoolWithConfig(credentials []AccountCredential, config poolConfig
 		return pool.ordered[i].credential.AccountID < pool.ordered[j].credential.AccountID
 	})
 	return pool, nil
+}
+
+func normalizedAccountCredentials(credentials []AccountCredential) []AccountCredential {
+	byID := make(map[string]AccountCredential, len(credentials))
+	for _, credential := range credentials {
+		credential.AccountID = strings.TrimSpace(credential.AccountID)
+		credential.AccountName = strings.TrimSpace(credential.AccountName)
+		credential.Cookie = strings.TrimSpace(credential.Cookie)
+		if credential.AccountID == "" || credential.Cookie == "" {
+			continue
+		}
+		if credential.AccountName == "" {
+			credential.AccountName = credential.AccountID
+		}
+		byID[credential.AccountID] = credential
+	}
+	items := make([]AccountCredential, 0, len(byID))
+	for _, credential := range byID {
+		items = append(items, credential)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].AccountID < items[j].AccountID })
+	return items
+}
+
+// syncCredentials hot-reloads monitoring credentials without interrupting an
+// already-issued request. Existing poolAccount pointers remain valid for
+// in-flight calls; changed credentials are installed as replacement entries
+// and are observed by the next accountFor lookup.
+func (p *accountPool) syncCredentials(credentials []AccountCredential) PoolRefreshResult {
+	normalized := normalizedAccountCredentials(credentials)
+	nextCredentials := make(map[string]AccountCredential, len(normalized))
+	for _, credential := range normalized {
+		nextCredentials[credential.AccountID] = credential
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	result := PoolRefreshResult{Active: true}
+	nextAccounts := make(map[string]*poolAccount, len(nextCredentials))
+	nextOrdered := make([]*poolAccount, 0, len(nextCredentials))
+	for _, credential := range normalized {
+		existing := p.accounts[credential.AccountID]
+		if existing == nil {
+			existing = &poolAccount{
+				credential: credential,
+				gate:       newRequestGate(p.config.accountInterval, p.config.accountParallel),
+			}
+			result.Added++
+		} else if existing.credential != credential {
+			existing = &poolAccount{
+				credential:    credential,
+				gate:          existing.gate,
+				cooldownUntil: existing.cooldownUntil,
+				failureStreak: existing.failureStreak,
+			}
+			result.Updated++
+		}
+		nextAccounts[credential.AccountID] = existing
+		nextOrdered = append(nextOrdered, existing)
+	}
+	for accountID := range p.accounts {
+		if _, exists := nextCredentials[accountID]; !exists {
+			result.Removed++
+		}
+	}
+	p.accounts = nextAccounts
+	p.ordered = nextOrdered
+	result.AccountCount = len(nextOrdered)
+	if result.Added > 0 || result.Removed > 0 {
+		// StartAllPool preassigns every room. Clear those stable assignments only
+		// when membership changes so subsequent polls naturally rebalance across
+		// the expanded/reduced pool without cancelling in-flight requests.
+		result.Rebalanced = len(p.assignments)
+		p.assignments = make(map[string]string, len(p.assignments))
+	}
+	return result
 }
 
 func newRequestGate(interval time.Duration, parallel int) *requestGate {

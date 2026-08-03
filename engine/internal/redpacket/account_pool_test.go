@@ -60,6 +60,16 @@ func TestAccountPoolAssignmentsAreStableAndDistributed(t *testing.T) {
 	}
 }
 
+func TestDefaultPoolKeepsSafePacingWhileAllowingSlowRequestsToOverlap(t *testing.T) {
+	config := defaultPoolConfig()
+	if config.globalInterval != 80*time.Millisecond || config.accountInterval != 750*time.Millisecond {
+		t.Fatalf("request pacing changed unexpectedly: global=%s account=%s", config.globalInterval, config.accountInterval)
+	}
+	if config.globalParallel != 32 || config.accountParallel != 3 {
+		t.Fatalf("slow-request overlap window not applied: global=%d account=%d", config.globalParallel, config.accountParallel)
+	}
+}
+
 func TestAccountPoolDistributesLargeRoomSetAcrossNinetyNineAccounts(t *testing.T) {
 	credentials := make([]AccountCredential, 0, 99)
 	for i := 0; i < 99; i++ {
@@ -91,6 +101,59 @@ func TestAccountPoolDistributesLargeRoomSetAcrossNinetyNineAccounts(t *testing.T
 	}
 	if assigned != 1272 {
 		t.Fatalf("expected 1272 room assignments, got %d", assigned)
+	}
+}
+
+func TestAccountPoolHotRefreshRebalancesWithoutInterruptingExistingPointer(t *testing.T) {
+	pool, err := newAccountPoolWithConfig([]AccountCredential{
+		{AccountID: "a", AccountName: "账号 A", Cookie: "sessionid_ss=a"},
+		{AccountID: "b", AccountName: "账号 B", Cookie: "sessionid_ss=b"},
+	}, poolConfig{globalParallel: 4, accountParallel: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldAccount, err := pool.accountFor("room-existing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 500; index++ {
+		if _, err := pool.accountFor(fmt.Sprintf("room-%03d", index)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	result := pool.syncCredentials([]AccountCredential{
+		{AccountID: "a", AccountName: "账号 A", Cookie: "sessionid_ss=a-new"},
+		{AccountID: "b", AccountName: "账号 B", Cookie: "sessionid_ss=b"},
+		{AccountID: "c", AccountName: "账号 C", Cookie: "sessionid_ss=c"},
+	})
+	if result.Added != 1 || result.Updated != 1 || result.Removed != 0 || result.AccountCount != 3 || result.Rebalanced == 0 {
+		t.Fatalf("unexpected hot refresh result: %+v", result)
+	}
+	if oldAccount.credential.Cookie == "sessionid_ss=a-new" {
+		t.Fatal("in-flight account pointer was mutated")
+	}
+	counts := map[string]int{}
+	for index := 0; index < 500; index++ {
+		account, err := pool.accountFor(fmt.Sprintf("room-%03d", index))
+		if err != nil {
+			t.Fatal(err)
+		}
+		counts[account.credential.AccountID]++
+	}
+	if counts["c"] == 0 {
+		t.Fatalf("new account did not receive rebalanced rooms: %+v", counts)
+	}
+	currentA := pool.accounts["a"]
+	if currentA == nil || currentA.credential.Cookie != "sessionid_ss=a-new" {
+		t.Fatal("updated credential was not installed for subsequent requests")
+	}
+
+	result = pool.syncCredentials([]AccountCredential{
+		{AccountID: "a", AccountName: "账号 A", Cookie: "sessionid_ss=a-new"},
+		{AccountID: "c", AccountName: "账号 C", Cookie: "sessionid_ss=c"},
+	})
+	if result.Removed != 1 || result.AccountCount != 2 || pool.accounts["b"] != nil {
+		t.Fatalf("removed account remained in hot pool: result=%+v", result)
 	}
 }
 

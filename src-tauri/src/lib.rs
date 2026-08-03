@@ -142,24 +142,28 @@ fn stop_engine(app: &tauri::AppHandle) {
 }
 
 #[cfg(windows)]
-fn open_engine_wait_handle(pid: u32) -> Result<windows_sys::Win32::Foundation::HANDLE, String> {
+fn open_engine_wait_handle(pid: u32) -> Result<usize, String> {
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
 
     let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
     if handle.is_null() {
         return Err(format!("无法等待 Go 引擎进程退出（PID {pid}）"));
     }
-    Ok(handle)
+    // windows-sys models HANDLE as `*mut c_void`, which is not Send. Store
+    // its pointer-sized value while it crosses into spawn_blocking, then
+    // restore the HANDLE only inside that blocking thread.
+    Ok(handle as usize)
 }
 
 #[cfg(windows)]
-fn wait_for_engine_exit(handle: windows_sys::Win32::Foundation::HANDLE) -> Result<(), String> {
+fn wait_for_engine_exit(handle_value: usize) -> Result<(), String> {
     use windows_sys::Win32::{
-        Foundation::{CloseHandle, WAIT_OBJECT_0},
+        Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0},
         System::Threading::WaitForSingleObject,
     };
 
     const ENGINE_EXIT_TIMEOUT_MS: u32 = 10_000;
+    let handle = handle_value as HANDLE;
     let result = unsafe { WaitForSingleObject(handle, ENGINE_EXIT_TIMEOUT_MS) };
     unsafe { CloseHandle(handle) };
     if result != WAIT_OBJECT_0 {

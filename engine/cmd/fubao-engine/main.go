@@ -70,17 +70,6 @@ func main() {
 	if browserStoreErr == nil {
 		browserStore, browserStoreErr = browsers.NewStore(dataDir)
 	}
-	if browserStoreErr == nil && accountStoreErr == nil {
-		browserStore.SetCookieUpdater(func(accountID, rawCookie string) error {
-			if _, err := accountStore.ReplaceCookie(accountID, rawCookie); err != nil {
-				return err
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
-			defer cancel()
-			_, err := accountStore.ValidateCookie(ctx, accountID, true)
-			return err
-		})
-	}
 	followingLiveService := followinglive.NewService()
 	var roomStore *rooms.Store
 	roomStoreErr := dataDirErr
@@ -96,6 +85,20 @@ func main() {
 	}
 	if redPacketStoreErr == nil && accountStoreErr == nil {
 		redPacketStore.SetRequestRecorder(accountStore.RecordMonitoringRequest)
+	}
+	if browserStoreErr == nil && accountStoreErr == nil {
+		browserStore.SetCookieUpdater(func(accountID, rawCookie string) error {
+			if _, err := accountStore.ReplaceCookie(accountID, rawCookie); err != nil {
+				return err
+			}
+			if redPacketStoreErr == nil {
+				refreshRunningMonitoringPool(accountStore, redPacketStore)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+			defer cancel()
+			_, err := accountStore.ValidateCookie(ctx, accountID, true)
+			return err
+		})
 	}
 	if redPacketStoreErr == nil && roomStoreErr == nil {
 		redPacketStore.SetLiveResultHandler(func(roomID, status string, checkedAt time.Time) {
@@ -361,6 +364,9 @@ func main() {
 				writeError(encoder, req.ID, "legacy_migration_failed", err.Error())
 				continue
 			}
+			if redPacketStoreErr == nil {
+				refreshRunningMonitoringPool(accountStore, redPacketStore)
+			}
 			_ = encoder.Encode(response{
 				Version: protocolVersion,
 				ID:      req.ID,
@@ -413,6 +419,9 @@ func main() {
 				}
 			}
 			identityCancel()
+			if params.Role == accounts.RoleMonitoring && redPacketStoreErr == nil {
+				refreshRunningMonitoringPool(accountStore, redPacketStore)
+			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]int{
 				"imported":        createdCount,
 				"merged":          mergedCount,
@@ -438,6 +447,9 @@ func main() {
 				writeError(encoder, req.ID, "account_role_failed", err.Error())
 				continue
 			}
+			if params.Role == accounts.RoleMonitoring && redPacketStoreErr == nil {
+				refreshRunningMonitoringPool(accountStore, redPacketStore)
+			}
 			_ = encoder.Encode(response{
 				Version: protocolVersion,
 				ID:      req.ID,
@@ -461,6 +473,9 @@ func main() {
 			if err != nil {
 				writeError(encoder, req.ID, "account_role_failed", err.Error())
 				continue
+			}
+			if params.Role == accounts.RoleMonitoring && redPacketStoreErr == nil {
+				refreshRunningMonitoringPool(accountStore, redPacketStore)
 			}
 			_ = encoder.Encode(response{
 				Version: protocolVersion,
@@ -502,6 +517,9 @@ func main() {
 			if err := accountStore.Delete(params.AccountID); err != nil {
 				writeError(encoder, req.ID, "account_delete_failed", err.Error())
 				continue
+			}
+			if redPacketStoreErr == nil {
+				refreshRunningMonitoringPool(accountStore, redPacketStore)
 			}
 			_ = encoder.Encode(response{
 				Version: protocolVersion,
@@ -584,6 +602,9 @@ func main() {
 				writeError(encoder, req.ID, "account_cookie_update_failed", err.Error())
 				continue
 			}
+			if redPacketStoreErr == nil {
+				refreshRunningMonitoringPool(accountStore, redPacketStore)
+			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: account})
 		case "account.native_set_browser_login_state":
 			if accountStoreErr != nil {
@@ -641,6 +662,9 @@ func main() {
 			if err != nil {
 				writeError(encoder, req.ID, "account_create_failed", err.Error())
 				continue
+			}
+			if params.Role == accounts.RoleMonitoring && redPacketStoreErr == nil {
+				refreshRunningMonitoringPool(accountStore, redPacketStore)
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{"account": account, "created": created}})
 		case "browser.list":
@@ -1577,6 +1601,13 @@ func monitoringPoolCredentials(store *accounts.Store) []redpacket.AccountCredent
 		})
 	}
 	return credentials
+}
+
+func refreshRunningMonitoringPool(store *accounts.Store, redPacketStore *redpacket.Store) redpacket.PoolRefreshResult {
+	if store == nil || redPacketStore == nil {
+		return redpacket.PoolRefreshResult{}
+	}
+	return redPacketStore.RefreshMonitoringPool(monitoringPoolCredentials(store))
 }
 
 func startAllEligibleRoomMonitors(accountStore *accounts.Store, roomStore *rooms.Store, redPacketStore *redpacket.Store) (redpacket.PoolStartResult, error) {

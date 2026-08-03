@@ -28,6 +28,8 @@ const (
 	offlineProbeInterval = 60 * time.Second
 	livePacketInterval   = 15 * time.Second
 	activePacketInterval = 5 * time.Second
+	defaultProbeSlots    = 64
+	defaultBulkWorkers   = 64
 
 	ParticipationPacketTypeAll     = "all"
 	ParticipationPacketTypeGift    = "gift"
@@ -319,7 +321,7 @@ func NewStore(dataDir string) (*Store, error) {
 		activities:             map[string]*Activity{},
 		runtime:                map[string]context.CancelFunc{},
 		bulkIDs:                map[string]struct{}{},
-		probeSlots:             make(chan struct{}, 32),
+		probeSlots:             make(chan struct{}, defaultProbeSlots),
 		settings:               normalizeParticipationSettings(ParticipationSettings{}),
 	}
 	if err := s.load(); err != nil {
@@ -1369,11 +1371,24 @@ func (s *Store) StartAllPool(credentials []AccountCredential) (PoolStartResult, 
 	}
 	s.scheduleSaveLocked()
 	s.mu.Unlock()
-	workerCount := minInt(32, len(ids))
+	workerCount := minInt(defaultBulkWorkers, len(ids))
 	for worker := 0; worker < workerCount; worker++ {
 		go s.runBulkWorker(ctx, ids, worker, workerCount, pool)
 	}
 	return PoolStartResult{Started: len(ids), AccountCount: len(pool.ordered), Assignments: pool.summary()}, nil
+}
+
+// RefreshMonitoringPool hot-reloads the account pool used by running bulk and
+// per-room monitors. Current native requests are allowed to finish; the next
+// account lookup observes the new pool membership and credentials.
+func (s *Store) RefreshMonitoringPool(credentials []AccountCredential) PoolRefreshResult {
+	s.mu.Lock()
+	pool := s.pool
+	s.mu.Unlock()
+	if pool == nil {
+		return PoolRefreshResult{}
+	}
+	return pool.syncCredentials(credentials)
 }
 
 // StopAll stops every room monitor. Persisted event history is retained.
@@ -1908,12 +1923,18 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 			existing = s.findEventByIdentityLocked(firstNonEmpty(monitor.WebRID, monitor.RoomID), packetID)
 		}
 		if existing != nil {
-			if existing.DataSource == "center" {
+			wasParticipationReady := eventParticipationMetadataReady(existing)
+			wasCenterOwned := existing.DataSource == "center"
+			if wasCenterOwned {
 				existing.DataSource = ""
 				existing.MonitorID = id
 				existing.AccountID, existing.AccountName = monitor.AccountID, monitor.AccountName
 				existing.RoomID = monitor.RoomID
 			}
+			existing.WebRID = firstNonEmpty(monitor.WebRID, existing.WebRID, monitor.RoomID)
+			existing.RoomName = firstNonEmpty(monitor.Name, monitor.StreamerName, existing.RoomName)
+			existing.StreamerName = firstNonEmpty(monitor.StreamerName, existing.StreamerName)
+			existing.ActualRoomID = firstNonEmpty(snapshot.ActualRoomID, monitor.ActualRoomID, existing.ActualRoomID)
 			// The same activity remains in the luckybox list while it is active.
 			// Use later snapshots to enrich legacy/incomplete rows after the
 			// grouped 福宝 prize parser has enough box records.
@@ -1940,6 +1961,19 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 			existing.BoxType = firstNonEmpty(packet.boxType, existing.BoxType)
 			existing.SendTime = firstNonEmpty(packet.sendTime, existing.SendTime)
 			existing.DelayTime = firstNonEmpty(packet.delayTime, existing.DelayTime)
+			// Center-library rows intentionally contain display metadata only. A
+			// positive local room probe may later add the private native request
+			// identifiers. Dispatch exactly once when that existing row first
+			// becomes actionable; otherwise the UI can show a real packet while
+			// the participation scheduler never receives it.
+			if !wasParticipationReady && eventParticipationMetadataReady(existing) && eventOpenAt(*existing, time.Now()) {
+				newEvents = append(newEvents, *existing)
+				if wasCenterOwned {
+					monitor.PacketCount++
+				}
+				monitor.LastEventAt, monitor.LastPacketID, monitor.LastPacketTitle = now, existing.PacketID, existing.Title
+				monitor.LastParticipantCount = existing.ParticipantCount
+			}
 			continue
 		}
 		event := &Event{
@@ -1981,6 +2015,10 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 		return activePacketInterval
 	}
 	return livePacketInterval
+}
+
+func eventParticipationMetadataReady(event *Event) bool {
+	return event != nil && strings.TrimSpace(event.ActualRoomID) != "" && validLuckyboxID(event.JoinBoxID)
 }
 
 func (s *Store) acquireProbeSlot(ctx context.Context) bool {

@@ -828,6 +828,56 @@ func TestPollOnceFetchesRedPacketsOnlyAfterPositiveLiveProbe(t *testing.T) {
 	}
 }
 
+func TestPollOnceDispatchesCenterEventAfterLocalRequestMetadataIsEnriched(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncRooms([]rooms.Room{{ID: "room-center", WebRID: "123456789", Name: "中心直播间", Enabled: true}}); err != nil {
+		t.Fatal(err)
+	}
+	future := time.Now().Add(2 * time.Minute).Format(time.RFC3339Nano)
+	if imported, err := store.MergeCenter([]CenterEvent{{
+		WebRID: "123456789", PacketID: "AC202509231602294103473098",
+		Title: "钻石红包", Prize: "总25钻，15份红包", ExpiresAt: future,
+	}}); err != nil || imported != 1 {
+		t.Fatalf("merge center event: imported=%d err=%v", imported, err)
+	}
+	store.mu.Lock()
+	store.monitors["room_room-center"].Status = "running"
+	store.monitors["room_room-center"].AccountID = "monitor-account"
+	store.monitors["room_room-center"].AccountName = "监测账号"
+	store.mu.Unlock()
+
+	handled := make(chan Event, 2)
+	store.SetEventHandler(func(event Event) { handled <- event })
+	source := &fakeMonitorSource{
+		probe: LiveProbe{Status: "live", ActualRoomID: "7000000000000000001", Source: "room_web_enter"},
+		snapshots: []poller.Snapshot{{Source: "luckybox_api", ActualRoomID: "7000000000000000001", Data: map[string]any{
+			"activity_kind": "red_packet", "activity_id": "AC202509231602294103473098",
+			"box_id_str": "7669047909329177395", "title": "钻石红包",
+			"total_diamond_count": 25, "box_count": 15, "expire_time": future,
+		}}},
+	}
+	store.pollOnce(context.Background(), "room_room-center", source)
+
+	select {
+	case event := <-handled:
+		if event.DataSource != "" || event.MonitorID != "room_room-center" || event.ActualRoomID != "7000000000000000001" || event.JoinBoxID != "7669047909329177395" {
+			t.Fatalf("enriched center event missing native participation metadata: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("enriched center event was not dispatched to participation handler")
+	}
+
+	store.pollOnce(context.Background(), "room_room-center", source)
+	select {
+	case duplicate := <-handled:
+		t.Fatalf("already actionable event was dispatched twice: %+v", duplicate)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestPollOnceDoesNotClaimConnectedWhenLiveProbeFails(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {
@@ -865,5 +915,15 @@ func TestMonitorStaggerDelayIsStableAndBounded(t *testing.T) {
 	}
 	if first < 0 || first >= 10*time.Second {
 		t.Fatalf("stagger delay out of range: %s", first)
+	}
+}
+
+func TestLargeMonitorStoreUsesBoundedExpandedProbeWindow(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cap(store.probeSlots) != defaultProbeSlots || defaultBulkWorkers != 64 {
+		t.Fatalf("unexpected large-monitor bounds: slots=%d workers=%d", cap(store.probeSlots), defaultBulkWorkers)
 	}
 }

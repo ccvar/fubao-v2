@@ -202,6 +202,10 @@ The live-room table exposes one compact sort menu in the “直播与红包状�
 
 Bulk red-packet monitoring distributes rooms across all enabled monitoring accounts with stable room assignment, shared and per-account request pacing, cooldown after rate-limit/transport failures, and automatic failover. Rate-limit or transport errors must never be presented as Cookie expiry. Monitoring logs and room rows retain account-to-room attribution while raw Cookie data remains inside the Go engine.
 
+Large-room first-pass monitoring may overlap a bounded number of slow native requests so Windows/network response latency does not leave the existing global and per-account pacing windows idle. Increasing overlap must never shorten the configured request-start intervals; global pacing, per-account pacing, cooldown and failover remain the authoritative anti-risk limits.
+
+The running monitoring-account pool hot-reloads after monitoring-account import, role assignment/removal, deletion, or native Cookie replacement. Membership changes atomically invalidate stable room assignments so later polls rebalance across the current pool, while already-issued requests finish on their original account. Credential changes take effect only for subsequent native requests, and raw Cookies never leave Go.
+
 Followed-live discovery is account-centric rather than instance-centric. Each participation account's browser credential refreshes its Douyin followed-live feed at most once per refresh cycle, and successful fresh snapshots upsert into the canonical room list by public `web_rid` first and actual room ID second. Never delete canonical rooms or history merely because a later followed-live snapshot omits them. When several participation accounts report the same room, keep one room with all safe source attributions; render one source as `账号名的关注` and multiple sources as `首个账号等 N 个账号的关注` with the full account list in the shared tooltip. Participation accounts only discover rooms; the independent monitoring-account pool performs red-packet monitoring.
 
 Every successful followed-live account snapshot is authoritative only for that account's current-live flags: mark omitted attributions offline without deleting their canonical rooms or source history. Treat a fresh followed-live flag as evidence that the room is currently live, expire stale evidence after a short refresh grace period, and surface it in the combined room status even before red-packet probing catches up. The live-room sort menu includes `实例优先`, which brings all rooms discovered from participation-account browser credentials to the top, with currently live and most recently seen rooms first.
@@ -241,6 +245,8 @@ On Windows, retain the native caption and system window controls. Keep the sideb
 浏览器实例卡片的红包图标必须是真实的双向开关：启用后再次点击应通过原生通道注销该账号的页面参与上下文并取消所有尚未发出的任务，不能只改变前端样式；已经发出的单次请求允许结束。自动页面参与对每个红包事件只允许发送一次 `join`，禁止在未捕获真实页面交互请求模板时猜测式追加 `rush` 回退，因为同一次事件的 `join → rush` 双请求会触发 `rush_spam` 风控。
 
 红包监测 payload 中的 `activity_id` 只是活动分组键，可能是跨直播间重复的 `AC...` 业务标识；参与接口必须优先使用当前原始盒子行里 3 位以上的纯数字 `box_id_str/box_id`，缺少真实数字 box ID 时不得发送参与请求。单个参与账号的页面参与任务必须严格串行，并在每次发送前重新检查冷却状态，禁止同账号并发 `join/rush` 造成假性 `rush_spam` 风控。
+
+红包参与页面上下文绑定参与账号及其专属原生 WebView，而不是永久绑定启动任务时所在的直播间；该直播结束不能自动终止参与任务。每个可执行红包到来后，原生层必须先将保留的 WebView 导航到该红包的目标直播间，再校验登录并发送请求。中心库同步的展示型红包在本机尚未取得真实 `ActualRoomID` 与纯数字 `JoinBoxID` 前不得派发参与；本地监测首次补齐这两个原生请求标识时，必须把既有事件准确派发一次，后续轮询不得重复派发。
 
 在“账号与直播间”的“监测账号”后保留独立“参与记录”页签。每个账号与红包事件的参与尝试必须在 Go redpacket store 中先持久化占位再发送请求，以提供跨客户端重启的幂等去重；记录只向前端暴露账号、红包、直播间、接口类型、请求次数、结果、冷却和时间等安全元数据，绝不保存或返回 CK、签名参数、请求头或原始响应体。
 
