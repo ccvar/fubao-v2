@@ -267,9 +267,29 @@ type Store struct {
 	activities             map[string]*Activity
 	runtime                map[string]context.CancelFunc
 	pool                   *accountPool
+	bulkCancel             context.CancelFunc
+	bulkIDs                map[string]struct{}
 	requestRecorder        func(accountID string, requestErr error)
 	eventHandler           func(Event)
 	liveResultHandler      func(roomID, status string, checkedAt time.Time)
+	persistDirty           bool
+	persistScheduled       bool
+	probeSlots             chan struct{}
+}
+
+type MonitorSummary struct {
+	Total        int `json:"total"`
+	Enabled      int `json:"enabled"`
+	Running      int `json:"running"`
+	FirstChecked int `json:"first_checked"`
+	PendingFirst int `json:"pending_first"`
+	LiveRunning  int `json:"live_running"`
+	Errors       int `json:"errors"`
+}
+
+type MonitorPage struct {
+	Items   []Monitor      `json:"items"`
+	Summary MonitorSummary `json:"summary"`
 }
 
 type monitorJob struct {
@@ -298,6 +318,8 @@ func NewStore(dataDir string) (*Store, error) {
 		participationSchedules: map[string]*ParticipationSchedule{},
 		activities:             map[string]*Activity{},
 		runtime:                map[string]context.CancelFunc{},
+		bulkIDs:                map[string]struct{}{},
+		probeSlots:             make(chan struct{}, 32),
 		settings:               normalizeParticipationSettings(ParticipationSettings{}),
 	}
 	if err := s.load(); err != nil {
@@ -469,11 +491,11 @@ func (s *Store) saveLocked() error {
 	if len(activities) > 100 {
 		activities = activities[:100]
 	}
-	payload, err := json.MarshalIndent(file{
+	payload, err := json.Marshal(file{
 		Version: storeVersion, Monitors: monitors, Events: events, ParticipationRecords: participations,
 		ParticipationSettings: s.settings, ParticipationTasks: participationTasks, ParticipationTraces: participationTraces,
 		ParticipationSchedules: participationSchedules, Activities: activities,
-	}, "", "  ")
+	})
 	if err != nil {
 		return fmt.Errorf("序列化红包监测数据失败: %w", err)
 	}
@@ -490,6 +512,31 @@ func (s *Store) saveLocked() error {
 		return fmt.Errorf("保存红包监测数据失败: %w", err)
 	}
 	return nil
+}
+
+// scheduleSaveLocked coalesces high-frequency probe state changes. Serializing
+// a store with tens of thousands of rooms after every probe can monopolize the
+// engine RPC loop and Windows message pump for minutes.
+func (s *Store) scheduleSaveLocked() {
+	s.persistDirty = true
+	if s.persistScheduled {
+		return
+	}
+	s.persistScheduled = true
+	go func() {
+		time.Sleep(3 * time.Second)
+		s.mu.Lock()
+		if s.persistDirty {
+			s.persistDirty = false
+			_ = s.saveLocked()
+		}
+		s.persistScheduled = false
+		again := s.persistDirty
+		if again {
+			s.scheduleSaveLocked()
+		}
+		s.mu.Unlock()
+	}()
 }
 
 // ReserveParticipation durably claims one account/event pair before the native
@@ -1075,6 +1122,7 @@ func (s *Store) SyncRooms(items []rooms.Room) error {
 			cancel()
 			delete(s.runtime, id)
 		}
+		delete(s.bulkIDs, id)
 		delete(s.monitors, id)
 		for eventID, item := range s.events {
 			if item.MonitorID == id {
@@ -1086,7 +1134,8 @@ func (s *Store) SyncRooms(items []rooms.Room) error {
 	if !changed {
 		return nil
 	}
-	return s.saveLocked()
+	s.scheduleSaveLocked()
+	return nil
 }
 
 func (s *Store) List() []Monitor {
@@ -1102,6 +1151,55 @@ func (s *Store) List() []Monitor {
 		return left < right
 	})
 	return items
+}
+
+func (s *Store) MonitorCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.monitors)
+}
+
+// PageForRooms returns only monitor rows currently visible in the desktop UI,
+// while Summary remains global for counters and bulk-control state.
+func (s *Store) PageForRooms(roomIDs []string) MonitorPage {
+	wanted := make(map[string]struct{}, len(roomIDs))
+	for _, roomID := range roomIDs {
+		if roomID = strings.TrimSpace(roomID); roomID != "" {
+			wanted["room_"+roomID] = struct{}{}
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	page := MonitorPage{Items: make([]Monitor, 0, len(wanted))}
+	for id, monitor := range s.monitors {
+		page.Summary.Total++
+		if monitor.Enabled {
+			page.Summary.Enabled++
+		}
+		if monitor.Status == "running" {
+			page.Summary.Running++
+			if monitor.ConnectionStatus == "connecting" {
+				page.Summary.PendingFirst++
+			} else {
+				page.Summary.FirstChecked++
+			}
+			if monitor.LiveStatus == "live" {
+				page.Summary.LiveRunning++
+			}
+		}
+		if monitor.Status == "error" || monitor.ConnectionStatus == "error" {
+			page.Summary.Errors++
+		}
+		if _, ok := wanted[id]; ok {
+			page.Items = append(page.Items, *monitor)
+		}
+	}
+	sort.Slice(page.Items, func(i, j int) bool {
+		left := strings.ToLower(firstNonEmpty(page.Items[i].Name, page.Items[i].StreamerName, page.Items[i].RoomID))
+		right := strings.ToLower(firstNonEmpty(page.Items[j].Name, page.Items[j].StreamerName, page.Items[j].RoomID))
+		return left < right
+	})
+	return page
 }
 
 // Get returns a safe snapshot of one monitor after a state-changing command.
@@ -1239,15 +1337,15 @@ func (s *Store) StartAllPool(credentials []AccountCredential) (PoolStartResult, 
 		return PoolStartResult{}, err
 	}
 	s.mu.Lock()
-	if s.pool == nil {
-		s.pool = pool
-	} else {
-		// Preserve the pool referenced by already-running goroutines. A fresh
-		// engine start still builds it from every currently enabled account.
-		pool = s.pool
+	if s.bulkCancel != nil {
+		s.bulkCancel()
 	}
+	s.pool = pool
+	s.bulkIDs = make(map[string]struct{}, len(s.monitors))
+	ctx, cancel := context.WithCancel(context.Background())
+	s.bulkCancel = cancel
 	now := time.Now().Format(time.RFC3339Nano)
-	jobs := make([]monitorJob, 0, len(s.monitors))
+	ids := make([]string, 0, len(s.monitors))
 	for _, monitor := range s.monitors {
 		if !monitor.Enabled {
 			continue
@@ -1256,44 +1354,36 @@ func (s *Store) StartAllPool(credentials []AccountCredential) (PoolStartResult, 
 			if account, accountErr := pool.accountFor(monitor.ID); accountErr == nil {
 				monitor.AccountID, monitor.AccountName = account.credential.AccountID, account.credential.AccountName
 			}
-			jobs = append(jobs, monitorJob{id: monitor.ID})
 			continue
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		s.runtime[monitor.ID] = cancel
 		account, accountErr := pool.accountFor(monitor.ID)
 		if accountErr != nil {
-			delete(s.runtime, monitor.ID)
-			cancel()
 			continue
 		}
 		monitor.AccountID, monitor.AccountName = account.credential.AccountID, account.credential.AccountName
 		monitor.Status, monitor.ConnectionStatus, monitor.LastError = "running", "connecting", ""
+		monitor.LiveStatus = "unknown"
 		monitor.UpdatedAt = now
-		jobs = append(jobs, monitorJob{id: monitor.ID, ctx: ctx, cancel: cancel, pool: pool, initialDelay: monitorStaggerDelay(monitor.ID)})
+		ids = append(ids, monitor.ID)
+		s.bulkIDs[monitor.ID] = struct{}{}
 	}
-	if err := s.saveLocked(); err != nil {
-		for _, job := range jobs {
-			if job.cancel != nil {
-				job.cancel()
-				delete(s.runtime, job.id)
-			}
-		}
-		s.mu.Unlock()
-		return PoolStartResult{}, err
-	}
+	s.scheduleSaveLocked()
 	s.mu.Unlock()
-	for _, job := range jobs {
-		if job.ctx != nil && job.pool != nil {
-			go s.runPooled(job.ctx, job.id, job.pool, job.initialDelay)
-		}
+	workerCount := minInt(32, len(ids))
+	for worker := 0; worker < workerCount; worker++ {
+		go s.runBulkWorker(ctx, ids, worker, workerCount, pool)
 	}
-	return PoolStartResult{Started: len(jobs), AccountCount: len(pool.ordered), Assignments: pool.summary()}, nil
+	return PoolStartResult{Started: len(ids), AccountCount: len(pool.ordered), Assignments: pool.summary()}, nil
 }
 
 // StopAll stops every room monitor. Persisted event history is retained.
 func (s *Store) StopAll() (int, error) {
 	s.mu.Lock()
+	if s.bulkCancel != nil {
+		s.bulkCancel()
+		s.bulkCancel = nil
+	}
+	s.bulkIDs = map[string]struct{}{}
 	s.pool = nil
 	stopped := 0
 	now := time.Now().Format(time.RFC3339Nano)
@@ -1310,9 +1400,9 @@ func (s *Store) StopAll() (int, error) {
 		monitor.Status, monitor.ConnectionStatus = "stopped", "disconnected"
 		monitor.UpdatedAt = now
 	}
-	err := s.saveLocked()
+	s.scheduleSaveLocked()
 	s.mu.Unlock()
-	return stopped, err
+	return stopped, nil
 }
 
 // StartPooled starts one monitor through the shared account pool. This keeps
@@ -1371,13 +1461,9 @@ func (s *Store) StartPooled(id string, credentials []AccountCredential) error {
 	s.runtime[id] = cancel
 	monitor.AccountID, monitor.AccountName = account.credential.AccountID, account.credential.AccountName
 	monitor.Status, monitor.ConnectionStatus, monitor.LastError = "running", "connecting", ""
+	monitor.LiveStatus = "unknown"
 	monitor.UpdatedAt = time.Now().Format(time.RFC3339Nano)
-	if err := s.saveLocked(); err != nil {
-		delete(s.runtime, id)
-		cancel()
-		s.mu.Unlock()
-		return err
-	}
+	s.scheduleSaveLocked()
 	s.mu.Unlock()
 	go s.runPooled(ctx, id, pool, 0)
 	return nil
@@ -1406,13 +1492,9 @@ func (s *Store) Start(id, accountID, accountName, cookie string) error {
 	s.runtime[id] = cancel
 	monitor.AccountID, monitor.AccountName = accountID, accountName
 	monitor.Status, monitor.ConnectionStatus, monitor.LastError = "running", "connecting", ""
+	monitor.LiveStatus = "unknown"
 	monitor.UpdatedAt = time.Now().Format(time.RFC3339Nano)
-	if err := s.saveLocked(); err != nil {
-		delete(s.runtime, id)
-		cancel()
-		s.mu.Unlock()
-		return err
-	}
+	s.scheduleSaveLocked()
 	roomID := firstNonEmpty(monitor.WebRID, monitor.RoomID)
 	actualRoomID := firstNonEmpty(monitor.ActualRoomID, monitor.RoomID)
 	s.mu.Unlock()
@@ -1434,12 +1516,14 @@ func (s *Store) Stop(id string) error {
 		cancel()
 		delete(s.runtime, id)
 	}
+	delete(s.bulkIDs, id)
 	if s.pool != nil {
 		s.pool.dropAssignment(id, monitor.AccountID)
 	}
 	monitor.Status, monitor.ConnectionStatus = "stopped", "disconnected"
 	monitor.UpdatedAt = time.Now().Format(time.RFC3339Nano)
-	return s.saveLocked()
+	s.scheduleSaveLocked()
+	return nil
 }
 
 func (s *Store) Delete(id string) error {
@@ -1452,6 +1536,7 @@ func (s *Store) Delete(id string) error {
 		cancel()
 		delete(s.runtime, id)
 	}
+	delete(s.bulkIDs, id)
 	if s.pool != nil {
 		s.pool.dropAssignment(id, s.monitors[id].AccountID)
 	}
@@ -1472,7 +1557,7 @@ func (s *Store) runPooled(ctx context.Context, id string, pool *accountPool, ini
 			if monitor := s.monitors[id]; monitor != nil && monitor.Status == "running" {
 				monitor.Status, monitor.ConnectionStatus = "stopped", "disconnected"
 				monitor.UpdatedAt = time.Now().Format(time.RFC3339Nano)
-				_ = s.saveLocked()
+				s.scheduleSaveLocked()
 			}
 		}
 		s.mu.Unlock()
@@ -1529,7 +1614,11 @@ func (s *Store) runPooled(ctx context.Context, id string, pool *accountPool, ini
 			observed = &observedMonitorSource{inner: pool.sourceFor(account, webRID, actualRoomID)}
 		}
 		observed.lastErr = nil
+		if !s.acquireProbeSlot(ctx) {
+			return
+		}
 		next := s.pollOnce(ctx, id, observed)
+		s.releaseProbeSlot()
 		if observed.lastErr == nil {
 			pool.markSuccess(account.credential.AccountID)
 		} else if pool.markFailure(account.credential.AccountID, observed.lastErr) {
@@ -1540,6 +1629,98 @@ func (s *Store) runPooled(ctx context.Context, id string, pool *accountPool, ini
 			next = unknownProbeInterval
 		}
 		if !waitContext(ctx, next) {
+			return
+		}
+	}
+}
+
+// runBulkWorker schedules a stable partition of room IDs without allocating a
+// goroutine per room. With 100k imported rooms this keeps the Go scheduler and
+// the desktop message pump responsive while preserving per-room probe cadence.
+func (s *Store) runBulkWorker(ctx context.Context, ids []string, worker, workerCount int, pool *accountPool) {
+	due := make(map[string]time.Time, (len(ids)+workerCount-1)/workerCount)
+	startedAt := time.Now()
+	for index := worker; index < len(ids); index += workerCount {
+		due[ids[index]] = startedAt.Add(monitorStaggerDelay(ids[index]))
+	}
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		now := time.Now()
+		nextWake := now.Add(time.Minute)
+		processed := false
+		for index := worker; index < len(ids); index += workerCount {
+			id := ids[index]
+			if when := due[id]; when.After(now) {
+				if when.Before(nextWake) {
+					nextWake = when
+				}
+				continue
+			}
+			s.mu.Lock()
+			monitor := s.monitors[id]
+			_, bulk := s.bulkIDs[id]
+			if monitor == nil || !bulk || !monitor.Enabled || monitor.Status != "running" {
+				s.mu.Unlock()
+				due[id] = now.Add(time.Second)
+				continue
+			}
+			webRID := firstNonEmpty(monitor.WebRID, monitor.RoomID)
+			actualRoomID := firstNonEmpty(monitor.ActualRoomID, monitor.RoomID)
+			s.mu.Unlock()
+
+			account, err := pool.accountFor(id)
+			if err != nil {
+				s.updatePoolWaitState(id, err)
+				due[id] = now.Add(time.Second)
+				continue
+			}
+			s.mu.Lock()
+			if monitor := s.monitors[id]; monitor != nil {
+				monitor.AccountID, monitor.AccountName = account.credential.AccountID, account.credential.AccountName
+				monitor.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+			}
+			s.mu.Unlock()
+			observed := &observedMonitorSource{inner: pool.sourceFor(account, webRID, actualRoomID)}
+			if !s.acquireProbeSlot(ctx) {
+				return
+			}
+			next := s.pollOnce(ctx, id, observed)
+			s.releaseProbeSlot()
+			s.mu.Lock()
+			_, stillBulk := s.bulkIDs[id]
+			if !stillBulk {
+				if monitor := s.monitors[id]; monitor != nil {
+					monitor.Status, monitor.ConnectionStatus = "stopped", "disconnected"
+					monitor.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+					s.scheduleSaveLocked()
+				}
+			}
+			s.mu.Unlock()
+			if !stillBulk {
+				continue
+			}
+			if observed.lastErr == nil {
+				pool.markSuccess(account.credential.AccountID)
+			} else if pool.markFailure(account.credential.AccountID, observed.lastErr) {
+				pool.dropAssignment(id, account.credential.AccountID)
+				next = time.Second
+			}
+			if next <= 0 {
+				next = unknownProbeInterval
+			}
+			due[id] = time.Now().Add(next)
+			processed = true
+		}
+		if processed {
+			continue
+		}
+		delay := time.Until(nextWake)
+		if delay < 50*time.Millisecond {
+			delay = 50 * time.Millisecond
+		}
+		if !waitContext(ctx, delay) {
 			return
 		}
 	}
@@ -1574,7 +1755,7 @@ func (s *Store) run(ctx context.Context, id string, source monitorSource, initia
 			if monitor := s.monitors[id]; monitor != nil && monitor.Status == "running" {
 				monitor.Status, monitor.ConnectionStatus = "stopped", "disconnected"
 				monitor.UpdatedAt = time.Now().Format(time.RFC3339Nano)
-				_ = s.saveLocked()
+				s.scheduleSaveLocked()
 			}
 		}
 		s.mu.Unlock()
@@ -1589,7 +1770,11 @@ func (s *Store) run(ctx context.Context, id string, source monitorSource, initia
 		}
 	}
 	for {
+		if !s.acquireProbeSlot(ctx) {
+			return
+		}
 		next := s.pollOnce(ctx, id, source)
+		s.releaseProbeSlot()
 		if next <= 0 {
 			next = unknownProbeInterval
 		}
@@ -1642,7 +1827,7 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 	if probeErr != nil {
 		monitor.LiveStatus, monitor.LiveStatusSource = "error", "room_web_enter"
 		monitor.ConnectionStatus, monitor.LastError = "error", probeErr.Error()
-		_ = s.saveLocked()
+		s.scheduleSaveLocked()
 		s.mu.Unlock()
 		return unknownProbeInterval
 	}
@@ -1668,7 +1853,7 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 	liveResultHandler := s.liveResultHandler
 	roomID := monitor.RoomID
 	if monitor.LiveStatus != "live" {
-		_ = s.saveLocked()
+		s.scheduleSaveLocked()
 		status := monitor.LiveStatus
 		s.mu.Unlock()
 		if liveResultHandler != nil && status == "offline" {
@@ -1705,7 +1890,7 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 	monitor.LastRedPacketCheckedAt, monitor.LastCheckedAt, monitor.UpdatedAt = now, now, now
 	if err != nil {
 		monitor.ConnectionStatus, monitor.LastError = "error", err.Error()
-		_ = s.saveLocked()
+		s.scheduleSaveLocked()
 		s.mu.Unlock()
 		return livePacketInterval
 	}
@@ -1783,7 +1968,7 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 		monitor.LastEventAt, monitor.LastPacketID, monitor.LastPacketTitle = now, packetID, packet.title
 		monitor.LastParticipantCount = packet.participants
 	}
-	_ = s.saveLocked()
+	s.scheduleSaveLocked()
 	handler := s.eventHandler
 	s.mu.Unlock()
 	if handler != nil {
@@ -1796,6 +1981,26 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 		return activePacketInterval
 	}
 	return livePacketInterval
+}
+
+func (s *Store) acquireProbeSlot(ctx context.Context) bool {
+	select {
+	case s.probeSlots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (s *Store) releaseProbeSlot() {
+	<-s.probeSlots
+}
+
+func minInt(left, right int) int {
+	if left < right {
+		return left
+	}
+	return right
 }
 
 func monitorStaggerDelay(id string) time.Duration {

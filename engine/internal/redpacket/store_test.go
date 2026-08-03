@@ -53,6 +53,33 @@ func TestSyncRoomsRemovesStaleMonitorsAndEvents(t *testing.T) {
 	}
 }
 
+func TestMonitorPageReturnsVisibleRowsAndGlobalSummary(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := []rooms.Room{
+		{ID: "one", WebRID: "123456", Name: "一号", Enabled: true},
+		{ID: "two", WebRID: "654321", Name: "二号", Enabled: true},
+		{ID: "three", WebRID: "987654", Name: "三号", Enabled: false},
+	}
+	if err := store.SyncRooms(items); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.monitors["room_one"].Status = "running"
+	store.monitors["room_one"].LiveStatus = "live"
+	store.monitors["room_two"].ConnectionStatus = "error"
+	store.mu.Unlock()
+	page := store.PageForRooms([]string{"one"})
+	if len(page.Items) != 1 || page.Items[0].RoomID != "one" {
+		t.Fatalf("page leaked non-visible rows: %+v", page.Items)
+	}
+	if page.Summary.Total != 3 || page.Summary.Enabled != 2 || page.Summary.Running != 1 || page.Summary.FirstChecked != 1 || page.Summary.PendingFirst != 0 || page.Summary.LiveRunning != 1 || page.Summary.Errors != 1 {
+		t.Fatalf("unexpected global monitor summary: %+v", page.Summary)
+	}
+}
+
 func TestParticipationRecordPersistsAndDeduplicates(t *testing.T) {
 	dataDir := t.TempDir()
 	store, err := NewStore(dataDir)

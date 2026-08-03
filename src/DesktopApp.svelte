@@ -287,6 +287,8 @@
     updated_at: string;
   };
 
+  type RoomPage = { items: RoomItem[]; total: number };
+
   type RedPacketMonitor = {
     id: string;
     room_id: string;
@@ -315,6 +317,18 @@
     created_at: string;
     updated_at: string;
   };
+
+  type RedPacketMonitorSummary = {
+    total: number;
+    enabled: number;
+    running: number;
+    first_checked: number;
+    pending_first: number;
+    live_running: number;
+    errors: number;
+  };
+
+  type RedPacketMonitorPage = { items: RedPacketMonitor[]; summary: RedPacketMonitorSummary };
 
   type RedPacketEvent = {
     id: string;
@@ -621,6 +635,7 @@
   let instanceAccountsRefreshing = false;
   let managementTab: ManagementTab = "rooms";
   let rooms: RoomItem[] = [];
+  let roomTotalCount = 0;
   let roomsLoading = false;
   let roomsMigrating = false;
   let roomError = "";
@@ -634,12 +649,16 @@
   let roomImportModalOpen = false;
   let roomImportText = "";
   let roomImportBusy = false;
+  let roomImportCompleted = 0;
+  let roomImportTotal = 0;
   let roomImportFileInput: HTMLInputElement;
   let redPacketMonitors: RedPacketMonitor[] = [];
+  let redPacketMonitorSummary: RedPacketMonitorSummary = { total: 0, enabled: 0, running: 0, first_checked: 0, pending_first: 0, live_running: 0, errors: 0 };
   let redPacketMonitorOverrides: Record<string, { status: string; connectionStatus: string }> = {};
   let redPacketMonitorListRequestSeq = 0;
   let redPacketMonitorsLoading = false;
   let redPacketMonitorError = "";
+  let roomSearchTimer = 0;
   let redPacketEvents: RedPacketEvent[] = [];
   let redPacketEventsInitialized = false;
   let redPacketEventsLoading = false;
@@ -807,15 +826,13 @@
     .map(({ room }) => room);
   $: visibleRooms = sortedRooms.slice(0, roomRenderLimit);
   $: enabledRedPacketMonitors = redPacketMonitors.filter((monitor) => monitor.enabled);
-  $: runningRedPacketMonitorCount = enabledRedPacketMonitors.filter((monitor) => redPacketMonitorUiStatus(monitor) === "running").length;
-  $: liveRunningRedPacketMonitorCount = enabledRedPacketMonitors.filter(
-    (monitor) => redPacketMonitorUiStatus(monitor) === "running" && monitor.live_status === "live",
-  ).length;
-  $: canStartAnyRedPacketMonitor = enabledRedPacketMonitors.some((monitor) => redPacketMonitorUiStatus(monitor) !== "running");
+  $: runningRedPacketMonitorCount = redPacketMonitorSummary.running;
+  $: liveRunningRedPacketMonitorCount = redPacketMonitorSummary.live_running;
+  $: canStartAnyRedPacketMonitor = redPacketMonitorSummary.enabled > redPacketMonitorSummary.running;
   $: canStopAnyRedPacketMonitor = runningRedPacketMonitorCount > 0;
 	$: activeRedPacketCount = redPacketEvents.filter((event) => redPacketEventIsActive(event, redPacketClock)).length;
 	$: historicalRedPacketCount = redPacketEvents.length - activeRedPacketCount;
-	$: accountSubtitle = `${activeRedPacketCount} 个红包 · ${runningRedPacketMonitorCount} 个房间正在监测${runningRedPacketMonitorCount > 0 ? ` · ${liveRunningRedPacketMonitorCount} 个正在直播` : ""} · ${participationAccounts.length} 个参与 · ${monitoringAccounts.length} 个监测`;
+	$: accountSubtitle = `${activeRedPacketCount} 个红包 · ${runningRedPacketMonitorCount} 个房间正在监测${runningRedPacketMonitorCount > 0 ? ` · ${redPacketMonitorSummary.first_checked} 个已完成首轮检测 · ${redPacketMonitorSummary.pending_first} 个待检测 · ${liveRunningRedPacketMonitorCount} 个正在直播` : ""} · ${participationAccounts.length} 个参与 · ${monitoringAccounts.length} 个监测`;
 	$: expiredParticipationAccountCount = participationAccounts.filter((account) => accountCookieStatus(account, "participation") === "expired").length;
 	$: expiredMonitoringAccountCount = monitoringAccounts.filter((account) => accountCookieStatus(account, "monitoring") === "expired").length;
 	$: scopedRedPacketEvents = redPacketEvents.filter((event) => redPacketHistoryVisible
@@ -2693,6 +2710,7 @@
   function closeTopbarSearch() {
     query = "";
     searchOpen = false;
+    scheduleRoomSearch();
   }
 
   function hasAccountRole(account: AccountItem, role: AccountRole) {
@@ -3034,7 +3052,27 @@
   function openRoomImportModal() {
     importMenuOpen = false;
     roomImportText = "";
+    roomImportCompleted = 0;
+    roomImportTotal = 0;
     roomImportModalOpen = true;
+  }
+
+  function normalizeRoomImportValues(raw: string) {
+    const seen = new Set<string>();
+    const valid: string[] = [];
+    let invalid = 0;
+    for (const part of raw.split(/[,，;；\s]+/)) {
+      let value = part.trim();
+      if (!value) continue;
+      const slash = value.lastIndexOf("/");
+      if (slash >= 0) value = value.slice(slash + 1);
+      value = value.split(/[?#]/, 1)[0]?.trim() || "";
+      if (!value || seen.has(value)) continue;
+      seen.add(value);
+      if (/^\d{6,20}$/.test(value)) valid.push(value);
+      else invalid += 1;
+    }
+    return { valid, invalid };
   }
 
   async function readRoomImportFile(event: Event) {
@@ -3053,18 +3091,38 @@
 
   async function importRoomIDs() {
     if (roomImportBusy || !roomImportText.trim()) return;
+    const normalized = normalizeRoomImportValues(roomImportText);
+    if (normalized.valid.length === 0) {
+      showToast("没有识别到有效的直播间 ID");
+      return;
+    }
     roomImportBusy = true;
+    roomImportCompleted = 0;
+    roomImportTotal = normalized.valid.length;
     roomError = "";
     try {
-      const result = await engineRequest<{ imported: number; merged: number; invalid?: number; total: number }>("room.import_ids", {
-        ids: roomImportText,
-      });
-      rooms = await engineRequest<RoomItem[]>("room.list");
-      await loadRedPacketMonitors();
+      const result = { imported: 0, merged: 0, invalid: normalized.invalid, total: 0 };
+      const batchSize = normalized.valid.length > 10000 ? 2000 : normalized.valid.length > 3000 ? 500 : 100;
+      for (let offset = 0; offset < normalized.valid.length; offset += batchSize) {
+        const batch = normalized.valid.slice(offset, offset + batchSize);
+        const persist = offset + batch.length >= normalized.valid.length;
+        const current = await engineRequest<{ imported: number; merged: number; invalid?: number; total: number }>("room.import_ids", {
+          ids: batch.join("\n"),
+          persist,
+        });
+        result.imported += current.imported;
+        result.merged += current.merged;
+        result.invalid += current.invalid ?? 0;
+        result.total = current.total;
+        roomImportCompleted = Math.min(normalized.valid.length, offset + batch.length);
+        await tick();
+        await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+      }
+      roomRenderLimit = 300;
+      await loadRooms(false);
       roomImportModalOpen = false;
       managementTab = "rooms";
       query = "";
-      roomRenderLimit = 300;
       const invalidText = result.invalid ? `，${result.invalid} 条无效` : "";
       showToast(`已导入 ${result.imported} 个直播间${result.merged ? `，${result.merged} 个已存在` : ""}${invalidText}`);
     } catch (error) {
@@ -3072,6 +3130,8 @@
       showToast(roomError);
     } finally {
       roomImportBusy = false;
+      roomImportCompleted = 0;
+      roomImportTotal = 0;
     }
   }
 
@@ -3368,8 +3428,8 @@
     return {
       logs: monitorRuntimeLogs,
       running: runningRedPacketMonitorCount,
-      stopped: Math.max(0, enabledRedPacketMonitors.length - runningRedPacketMonitorCount),
-      error: redPacketMonitors.filter((item) => redPacketMonitorUiStatus(item) === "error").length,
+      stopped: Math.max(0, redPacketMonitorSummary.enabled - runningRedPacketMonitorCount),
+      error: redPacketMonitorSummary.errors,
     };
   }
 
@@ -3408,7 +3468,7 @@
   }
 
   async function openMonitorRuntimeLog() {
-    appendMonitorLog(`运行概况：${runningRedPacketMonitorCount}/${enabledRedPacketMonitors.length} 个直播间正在监测`);
+    appendMonitorLog(`运行概况：${runningRedPacketMonitorCount}/${redPacketMonitorSummary.enabled} 个直播间正在监测`);
     if (!("__TAURI_INTERNALS__" in window)) {
       showToast("运行日志窗口仅支持桌面端");
       return;
@@ -3471,14 +3531,17 @@
     redPacketMonitorsLoading = true;
     redPacketMonitorError = "";
     try {
-      const items = await engineRequest<RedPacketMonitor[]>("red_packet_monitor.list");
+      const page = await engineRequest<RedPacketMonitorPage>("red_packet_monitor.list_page", {
+        room_ids: rooms.map((room) => room.id),
+      });
       // A polling request may have started before a start/stop action. Ignore
       // that older snapshot so it cannot put the row back into its old state.
       if (requestSeq !== redPacketMonitorListRequestSeq) return;
       const previous = redPacketMonitors;
-      const next = applyRedPacketMonitorOverrides(items);
+      const next = applyRedPacketMonitorOverrides(page.items);
       recordMonitorStateChanges(previous, next);
       redPacketMonitors = next;
+      redPacketMonitorSummary = page.summary;
     } catch (error) {
       if (requestSeq !== redPacketMonitorListRequestSeq) return;
       redPacketMonitorError = error instanceof Error ? error.message : String(error);
@@ -3621,6 +3684,13 @@
           ? item
           : { ...item, status: nextStatus, connection_status: nextConnectionStatus, last_error: "" },
       );
+      redPacketMonitorSummary = {
+        ...redPacketMonitorSummary,
+        running: action === "start" ? redPacketMonitorSummary.enabled : 0,
+        first_checked: 0,
+        pending_first: action === "start" ? redPacketMonitorSummary.enabled : 0,
+        live_running: action === "start" ? redPacketMonitorSummary.live_running : 0,
+      };
       void loadRedPacketMonitors(true);
       void loadRedPacketEvents();
     } catch (error) {
@@ -3638,20 +3708,37 @@
     roomsLoading = true;
     roomError = "";
     try {
-      const [items, recycled] = await Promise.all([
-        engineRequest<RoomItem[]>("room.list"),
+      const [page, recycled] = await Promise.all([
+        engineRequest<RoomPage>("room.list_page", { offset: 0, limit: roomRenderLimit, query: query.trim() }),
         engineRequest<RoomItem[]>("room.recycle_bin").catch(() => recycledRooms),
       ]);
-      rooms = items;
+      rooms = page.items;
+      roomTotalCount = page.total;
       recycledRooms = recycled;
-      if (items.length === 0 && autoMigrate) {
+      if (page.total === 0 && autoMigrate && !query.trim()) {
         await migrateLegacyRooms(true);
+      } else {
+        void loadRedPacketMonitors(true);
       }
     } catch (error) {
       roomError = error instanceof Error ? error.message : String(error);
     } finally {
       roomsLoading = false;
     }
+  }
+
+  function scheduleRoomSearch() {
+    if (managementTab !== "rooms") return;
+    window.clearTimeout(roomSearchTimer);
+    roomSearchTimer = window.setTimeout(() => {
+      roomRenderLimit = 300;
+      void loadRooms(false);
+    }, 220);
+  }
+
+  function showMoreRooms() {
+    roomRenderLimit += 300;
+    void loadRooms(false);
   }
 
   async function migrateLegacyRooms(silent = false) {
@@ -3661,7 +3748,9 @@
     roomError = "";
     try {
       const result = await engineRequest<{ imported: number; merged: number; total: number }>("room.migrate_legacy");
-      rooms = await engineRequest<RoomItem[]>("room.list");
+      const page = await engineRequest<RoomPage>("room.list_page", { offset: 0, limit: roomRenderLimit, query: "" });
+      rooms = page.items;
+      roomTotalCount = page.total;
       if (!silent || result.imported > 0) {
         showToast(`已导入 ${result.imported} 个直播间，当前共 ${result.total} 个`);
       }
@@ -4451,7 +4540,7 @@
       } else if (managementTab === "redpackets") {
         await loadRedPacketEvents();
       } else if (managementTab === "rooms") {
-        await Promise.all([loadRooms(false), loadRedPacketMonitors(true)]);
+        await loadRooms(false);
       } else if (managementTab === "participation-records") {
         await Promise.all([loadParticipationRecords(), loadParticipationRuntimeLogs()]);
       } else {
@@ -5052,6 +5141,7 @@
                 bind:this={topbarSearchInput}
                 bind:value={query}
                 placeholder={searchPlaceholder()}
+                oninput={scheduleRoomSearch}
                 onkeydown={(event) => event.key === "Escape" && closeTopbarSearch()}
               />
               <button aria-label="关闭搜索" data-tooltip="关闭搜索" data-tooltip-placement="bottom" onclick={closeTopbarSearch}>
@@ -5386,7 +5476,7 @@
             aria-selected={managementTab === "rooms"}
             onclick={() => selectManagementTab("rooms")}
           >
-            直播间 <span>{rooms.length}</span>
+            直播间 <span>{roomTotalCount}</span>
           </button>
           <button
             class:active={managementTab === "participation"}
@@ -5444,7 +5534,7 @@
               {#if canStartAnyRedPacketMonitor || redPacketBatchAction === "start"}
                 <button
                   class="secondary-button compact-action monitor-bulk-start"
-                  disabled={redPacketBatchAction !== "" || enabledRedPacketMonitors.length === 0}
+                  disabled={redPacketBatchAction !== "" || redPacketMonitorSummary.enabled === 0}
                   onclick={() => toggleAllRedPacketMonitors("start")}
                 >
                   <Play size={12} weight="fill" />{redPacketBatchAction === "start" ? "启动中…" : "全部启动"}
@@ -5755,10 +5845,10 @@
                     {/if}
                     </article>
                 {/each}
-                {#if visibleRooms.length < filteredRooms.length}
+                {#if rooms.length < roomTotalCount}
                   <div class="room-list-more">
-                    <span>已显示 {visibleRooms.length} / {filteredRooms.length} 条</span>
-                    <button onclick={() => (roomRenderLimit += 300)}>继续显示</button>
+                    <span>已显示 {rooms.length} / {roomTotalCount} 条</span>
+                    <button onclick={showMoreRooms}>继续显示</button>
                   </div>
                 {/if}
               </div>
@@ -6693,7 +6783,7 @@
         <button class="secondary-button" disabled={roomImportBusy} onclick={() => (roomImportModalOpen = false)}>取消</button>
         <button class="primary-action" disabled={roomImportBusy || !roomImportText.trim()} onclick={importRoomIDs}>
           {#if roomImportBusy}<ArrowClockwise class="spinning" size={15} />{:else}<UploadSimple size={15} />{/if}
-          {roomImportBusy ? "正在导入…" : "导入"}
+          {roomImportBusy ? `正在导入 ${roomImportCompleted}/${roomImportTotal}…` : "导入"}
         </button>
       </div>
     </dialog>

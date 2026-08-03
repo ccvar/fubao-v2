@@ -126,6 +126,10 @@ In the room list, place a compact external-link icon immediately after the room 
 
 “导入直播间” follows 福宝’s batch-import interaction: it opens a modal that accepts pasted room IDs or `.txt/.csv` uploads, normalizes links/separators, deduplicates existing rooms, and imports only valid numeric room IDs.
 
+High-volume room imports and monitoring must remain responsive at roughly 100,000 rooms. Import in bounded chunks with visible completed/total progress but persist only at the final chunk; room and monitor tables consume Go-backed pages plus separate global summaries rather than transferring or reactively sorting the whole store. Bulk monitor startup rolls work into a bounded native request queue, and recurring probes coalesce persistence instead of serializing the full monitor store after every room result.
+
+Large live-room imports must remain responsive on Windows. Normalize and deduplicate the input before submission, send valid room IDs to Go in bounded batches, yield the frontend between batches, and show real completed/total progress such as “正在导入 15/1200…”. The Go room store must use indexed lookup rather than scanning every existing room for every imported ID.
+
 On the “账号与直播间” screen, the high-volume room list fills the available viewport with only a compact bottom inset and owns its internal scroll. Participation and monitoring account panels size to their actual row content instead of stretching to fill the window and leaving a large blank area inside the card.
 
 Search lives in the top toolbar as a compact progressive-disclosure control: show only the search icon by default, then expand a small inline input when clicked. Do not reserve a full content row for search. Remove decorative top-bar health/security icons that have no working behavior.

@@ -924,6 +924,23 @@ func main() {
 				OK:      true,
 				Result:  roomStore.List(),
 			})
+		case "room.list_page":
+			if roomStoreErr != nil {
+				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			var params struct {
+				Offset int    `json:"offset"`
+				Limit  int    `json:"limit"`
+				Query  string `json:"query"`
+			}
+			if len(req.Params) > 0 {
+				if err := json.Unmarshal(req.Params, &params); err != nil {
+					writeError(encoder, req.ID, "invalid_params", "直播间分页参数无效")
+					continue
+				}
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: roomStore.Page(params.Offset, params.Limit, params.Query)})
 		case "room.settings":
 			if roomStoreErr != nil {
 				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
@@ -1024,16 +1041,24 @@ func main() {
 				continue
 			}
 			var params struct {
-				IDs string `json:"ids"`
+				IDs     string `json:"ids"`
+				Persist *bool  `json:"persist"`
 			}
 			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.IDs) == "" {
 				writeError(encoder, req.ID, "invalid_params", "直播间导入内容为空")
 				continue
 			}
-			result, err := roomStore.ImportIDs(params.IDs)
+			persist := true
+			if params.Persist != nil {
+				persist = *params.Persist
+			}
+			result, err := roomStore.ImportIDsBatch(params.IDs, persist)
 			if err != nil {
 				writeError(encoder, req.ID, "room_import_failed", err.Error())
 				continue
+			}
+			if persist && redPacketStoreErr == nil {
+				_ = redPacketStore.SyncRooms(roomStore.All())
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
 		case "red_packet_monitor.list":
@@ -1050,6 +1075,31 @@ func main() {
 				continue
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.List()})
+		case "red_packet_monitor.list_page":
+			if roomStoreErr != nil {
+				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			if redPacketStore.MonitorCount() != roomStore.CountAll() {
+				if err := redPacketStore.SyncRooms(roomStore.All()); err != nil {
+					writeError(encoder, req.ID, "red_packet_store_unavailable", err.Error())
+					continue
+				}
+			}
+			var params struct {
+				RoomIDs []string `json:"room_ids"`
+			}
+			if len(req.Params) > 0 {
+				if err := json.Unmarshal(req.Params, &params); err != nil {
+					writeError(encoder, req.ID, "invalid_params", "红包监测分页参数无效")
+					continue
+				}
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.PageForRooms(params.RoomIDs)})
 		case "red_packet_monitor.events":
 			if redPacketStoreErr != nil {
 				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())

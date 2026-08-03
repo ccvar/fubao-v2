@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -278,6 +280,78 @@ func TestImportIDsNormalizesDeduplicatesAndMerges(t *testing.T) {
 	items := store.List()
 	if len(items) != 2 || items[0].Source != "manual" {
 		t.Fatalf("unexpected imported rooms: %+v", items)
+	}
+}
+
+func TestImportIDsHandlesLargeBatchesWithoutQuadraticLookup(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := make([]string, 1200)
+	for index := range values {
+		values[index] = strconv.FormatInt(473000000000+int64(index), 10)
+	}
+	result, err := store.ImportIDs(strings.Join(values, "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Imported != len(values) || result.Total != len(values) {
+		t.Fatalf("unexpected large import result: %+v", result)
+	}
+	result, err = store.ImportIDs(strings.Join(values[:100], "\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Merged != 100 || result.Total != len(values) {
+		t.Fatalf("expected indexed duplicate merge: %+v", result)
+	}
+}
+
+func TestImportIDsBatchPersistsOnlyFinalChunkAndPagesResults(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ImportIDsBatch("473000000001\n473000000002", false); err != nil {
+		t.Fatal(err)
+	}
+	beforeFinal, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if beforeFinal.CountAll() != 0 {
+		t.Fatal("intermediate import chunks must not rewrite the room store")
+	}
+	if _, err := store.ImportIDsBatch("473000000003", true); err != nil {
+		t.Fatal(err)
+	}
+	page := store.Page(0, 2, "")
+	if page.Total != 3 || len(page.Items) != 2 {
+		t.Fatalf("unexpected first page: %+v", page)
+	}
+	filtered := store.Page(0, 10, "000003")
+	if filtered.Total != 1 || len(filtered.Items) != 1 || filtered.Items[0].WebRID != "473000000003" {
+		t.Fatalf("unexpected filtered page: %+v", filtered)
+	}
+}
+
+func TestPageKeepsHundredThousandRoomResponseBounded(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := make([]string, 100000)
+	for index := range values {
+		values[index] = strconv.FormatInt(600000000000+int64(index), 10)
+	}
+	if _, err := store.ImportIDsBatch(strings.Join(values, "\n"), false); err != nil {
+		t.Fatal(err)
+	}
+	page := store.Page(0, 300, "")
+	if page.Total != len(values) || len(page.Items) != 300 {
+		t.Fatalf("high-volume page must return 300/%d rows, got %d/%d", len(values), len(page.Items), page.Total)
 	}
 }
 

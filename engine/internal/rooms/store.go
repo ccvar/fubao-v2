@@ -25,6 +25,11 @@ type Settings struct {
 	ParticipationPrewarmMinutes int `json:"participation_prewarm_minutes"`
 }
 
+type ListPage struct {
+	Items []Room `json:"items"`
+	Total int    `json:"total"`
+}
+
 // FollowSource records which participation account reported a broadcaster as
 // currently live. It contains safe attribution metadata only; credentials
 // remain inside the account store.
@@ -176,10 +181,12 @@ type legacyRoom struct {
 }
 
 type Store struct {
-	mu       sync.Mutex
-	path     string
-	rooms    map[string]*Room
-	settings Settings
+	mu               sync.Mutex
+	path             string
+	rooms            map[string]*Room
+	settings         Settings
+	persistDirty     bool
+	persistScheduled bool
 }
 
 func NewStore(dataDir string) (*Store, error) {
@@ -250,7 +257,7 @@ func (s *Store) saveLocked() error {
 		items = append(items, room)
 	}
 	sortRooms(items)
-	payload, err := json.MarshalIndent(roomFile{Version: storeVersion, Settings: s.settings, Rooms: items}, "", "  ")
+	payload, err := json.Marshal(roomFile{Version: storeVersion, Settings: s.settings, Rooms: items})
 	if err != nil {
 		return fmt.Errorf("序列化直播间数据失败: %w", err)
 	}
@@ -269,8 +276,75 @@ func (s *Store) saveLocked() error {
 	return nil
 }
 
+func (s *Store) scheduleSaveLocked() {
+	s.persistDirty = true
+	if s.persistScheduled {
+		return
+	}
+	s.persistScheduled = true
+	go func() {
+		time.Sleep(3 * time.Second)
+		s.mu.Lock()
+		if s.persistDirty {
+			s.persistDirty = false
+			_ = s.saveLocked()
+		}
+		s.persistScheduled = false
+		if s.persistDirty {
+			s.scheduleSaveLocked()
+		}
+		s.mu.Unlock()
+	}()
+}
+
 func (s *Store) List() []Room {
 	return s.list(false)
+}
+
+func (s *Store) CountAll() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.rooms)
+}
+
+func (s *Store) Page(offset, limit int, query string) ListPage {
+	if offset < 0 {
+		offset = 0
+	}
+	if limit < 1 {
+		limit = 300
+	}
+	if limit > 3000 {
+		limit = 3000
+	}
+	query = strings.ToLower(strings.TrimSpace(query))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := make([]Room, 0, minInt(len(s.rooms), limit*2))
+	for _, room := range s.rooms {
+		if room.Recycled {
+			continue
+		}
+		if query != "" {
+			haystack := strings.ToLower(strings.Join([]string{room.Name, room.StreamerName, room.WebRID, room.ActualRoomID, room.ID}, " "))
+			if !strings.Contains(haystack, query) {
+				continue
+			}
+		}
+		copy := *room
+		copy.FollowSources = append([]FollowSource(nil), room.FollowSources...)
+		items = append(items, copy)
+	}
+	sort.Slice(items, func(i, j int) bool { return roomSortKey(&items[i]) < roomSortKey(&items[j]) })
+	total := len(items)
+	if offset >= total {
+		return ListPage{Items: []Room{}, Total: total}
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return ListPage{Items: items[offset:end], Total: total}
 }
 
 // All returns active and recycled rooms for internal monitor synchronization.
@@ -416,9 +490,7 @@ func (s *Store) RecordLiveResult(roomID, status string, checkedAt time.Time) (bo
 		return false, nil
 	}
 	room.UpdatedAt = checkedAt.Format(time.RFC3339Nano)
-	if err := s.saveLocked(); err != nil {
-		return false, err
-	}
+	s.scheduleSaveLocked()
 	return room.Recycled, nil
 }
 
@@ -695,6 +767,18 @@ func (s *Store) MigrateLegacy(legacyDir string) (MigrationResult, error) {
 // ImportIDs adds live-room IDs from pasted text or a .txt/.csv file. Inputs
 // are normalized and deduplicated locally; no legacy file is modified.
 func (s *Store) ImportIDs(raw string) (MigrationResult, error) {
+	return s.importIDs(raw, true)
+}
+
+// ImportIDsBatch applies one bounded import chunk. Intermediate chunks stay
+// in the in-memory canonical store and only the final chunk persists the
+// complete file, avoiding hundreds of full-file rewrites for very large
+// imports while the serial native RPC still observes every completed batch.
+func (s *Store) ImportIDsBatch(raw string, persist bool) (MigrationResult, error) {
+	return s.importIDs(raw, persist)
+}
+
+func (s *Store) importIDs(raw string, persist bool) (MigrationResult, error) {
 	values := splitRoomInputs(raw)
 	if len(values) == 0 {
 		return MigrationResult{}, errors.New("没有识别到有效的直播间 ID")
@@ -704,6 +788,14 @@ func (s *Store) ImportIDs(raw string) (MigrationResult, error) {
 	result := MigrationResult{}
 	now := time.Now().Format(time.RFC3339Nano)
 	seen := map[string]struct{}{}
+	existingByID := make(map[string]*Room, len(s.rooms)*3)
+	for _, room := range s.rooms {
+		for _, key := range []string{room.ID, room.WebRID, room.ActualRoomID} {
+			if key = strings.TrimSpace(key); key != "" {
+				existingByID[key] = room
+			}
+		}
+	}
 	for _, value := range values {
 		if _, exists := seen[value]; exists {
 			continue
@@ -713,13 +805,7 @@ func (s *Store) ImportIDs(raw string) (MigrationResult, error) {
 			result.Invalid++
 			continue
 		}
-		var existing *Room
-		for _, room := range s.rooms {
-			if room.ID == value || room.WebRID == value {
-				existing = room
-				break
-			}
-		}
+		existing := existingByID[value]
 		if existing != nil {
 			if existing.Source == "center" {
 				existing.Source = "manual"
@@ -739,14 +825,17 @@ func (s *Store) ImportIDs(raw string) (MigrationResult, error) {
 			CreatedAt:        now,
 			UpdatedAt:        now,
 		}
+		existingByID[value] = s.rooms[value]
 		result.Imported++
 	}
 	result.Total = len(s.rooms)
 	if result.Imported == 0 && result.Merged == 0 {
 		return result, errors.New("没有识别到有效的直播间 ID")
 	}
-	if err := s.saveLocked(); err != nil {
-		return MigrationResult{}, err
+	if persist {
+		if err := s.saveLocked(); err != nil {
+			return MigrationResult{}, err
+		}
 	}
 	return result, nil
 }
@@ -834,6 +923,13 @@ func validRoomID(value string) bool {
 
 func maxInt(left, right int) int {
 	if left > right {
+		return left
+	}
+	return right
+}
+
+func minInt(left, right int) int {
+	if left < right {
 		return left
 	}
 	return right
