@@ -70,6 +70,7 @@
     auto_recycle_max_live_sessions: number;
     auto_recycle_no_packet_enabled: boolean;
     auto_recycle_no_packet_days: number;
+    auto_recycle_imported_no_packet_enabled: boolean;
   };
 
   type RoomCleanupProgress = {
@@ -599,6 +600,7 @@
     auto_recycle_max_live_sessions: 0,
     auto_recycle_no_packet_enabled: false,
     auto_recycle_no_packet_days: 3,
+    auto_recycle_imported_no_packet_enabled: false,
   };
   let monitoringSettings: MonitoringSettings = {
 	global_request_interval_ms: 80,
@@ -1397,6 +1399,7 @@
 			auto_recycle_max_live_sessions: normalizedParticipationSetting(roomSettings.auto_recycle_max_live_sessions, 100000),
 			auto_recycle_no_packet_enabled: roomSettings.auto_recycle_no_packet_enabled,
 			auto_recycle_no_packet_days: normalizedParticipationSetting(roomSettings.auto_recycle_no_packet_days, 3650),
+			auto_recycle_imported_no_packet_enabled: roomSettings.auto_recycle_imported_no_packet_enabled,
 		};
 		if (!isTauriDesktop()) {
 			roomSettings = nextRoomSettings;
@@ -1457,7 +1460,9 @@
 	try {
 		const [recycled, excluded] = await Promise.all([
 			engineRequest<RoomItem[]>("room.recycle_bin"),
-			engineRequest<CenterExclusionItem[]>("room.center_exclusions"),
+			permanentCenterRoomAccess()
+				? engineRequest<CenterExclusionItem[]>("room.center_exclusions")
+				: Promise.resolve([] as CenterExclusionItem[]),
 		]);
 		recycledRooms = recycled;
 		centerExcludedRooms = excluded;
@@ -3359,6 +3364,10 @@
   }
 
   function reconcileRoomSourceLicense() {
+	if (!permanentCenterRoomAccess()) {
+		centerExcludedRooms = [];
+		if (roomRecycleView === "center-exclusions") roomRecycleView = "recycle";
+	}
     if (roomSourceFilter !== "center" || permanentCenterRoomAccess()) return;
     roomSourceFilter = "all";
     roomSourceMenuOpen = false;
@@ -4152,7 +4161,9 @@
       const [page, recycled, excluded] = await Promise.all([
         loadRoomPage(0, roomRenderLimit, query.trim(), roomSourceFilter),
         engineRequest<RoomItem[]>("room.recycle_bin").catch(() => recycledRooms),
-        engineRequest<CenterExclusionItem[]>("room.center_exclusions").catch(() => centerExcludedRooms),
+        permanentCenterRoomAccess()
+			? engineRequest<CenterExclusionItem[]>("room.center_exclusions").catch(() => centerExcludedRooms)
+			: Promise.resolve([] as CenterExclusionItem[]),
       ]);
       rooms = page.items;
       roomTotalCount = page.total;
@@ -6023,7 +6034,7 @@
             <div class="room-monitor-bulk-actions" aria-label="直播间红包监测批量操作">
               <div class="menu-anchor room-cleanup-settings-anchor">
                 <button
-                  class:active={roomCleanupMenuOpen || roomSettings.auto_recycle_low_live_enabled || roomSettings.auto_recycle_no_packet_enabled}
+                  class:active={roomCleanupMenuOpen || roomSettings.auto_recycle_low_live_enabled || roomSettings.auto_recycle_no_packet_enabled || roomSettings.auto_recycle_imported_no_packet_enabled}
                   class="monitor-log-button"
                   aria-label="直播间自动清理设置"
                   aria-haspopup="menu"
@@ -6048,12 +6059,17 @@
                       <span>未发红包</span>
                     </label>
                     <small>从首次有效检测或最后发现红包开始计算</small>
+                    <label class="room-cleanup-rule room-cleanup-rule-wide">
+                      <input type="checkbox" bind:checked={roomSettings.auto_recycle_imported_no_packet_enabled} />
+                      <span>清理本地导入且从未发现红包的直播间</span>
+                    </label>
+                    <small>包括尚未有效检测过的本地导入记录；不影响关注列表和中心库数据</small>
                     {#if roomCleanupSettingsBusy || roomCleanupProgress}
                       <div class="room-cleanup-progress" aria-live="polite">
                         <div><span>执行进度</span><strong>{roomCleanupTotal > 0 ? Math.min(100, Math.round(roomCleanupProcessed / roomCleanupTotal * 100)) : 100}%</strong></div>
                         <progress max={Math.max(1, roomCleanupTotal)} value={roomCleanupTotal > 0 ? Math.min(roomCleanupProcessed, roomCleanupTotal) : 1}></progress>
                         {#if roomCleanupProgress}
-                          <small>已扫描 {roomCleanupProgress.scanned} 个，已处理 {roomCleanupProgress.cleaned} 个（回收站 {roomCleanupProgress.recycled}，中心库清除 {roomCleanupProgress.excluded}）</small>
+                          <small>已扫描 {roomCleanupProgress.scanned} 个，已处理 {roomCleanupProgress.cleaned} 个（回收站 {roomCleanupProgress.recycled}{#if permanentCenterRoomAccess()}，中心库清除 {roomCleanupProgress.excluded}{/if}）</small>
                         {:else}
                           <small>正在保存规则并扫描直播间…</small>
                         {/if}
@@ -6069,13 +6085,15 @@
               </div>
               <button
                 class="monitor-log-button room-recycle-entry"
-                aria-label={`打开直播间回收站与中心库排除${recycledRooms.length + centerExcludedRooms.length ? `，共 ${recycledRooms.length + centerExcludedRooms.length} 条记录` : ""}`}
-                data-tooltip="回收站与中心库排除"
+                aria-label={permanentCenterRoomAccess()
+                  ? `打开直播间回收站与中心库排除${recycledRooms.length + centerExcludedRooms.length ? `，共 ${recycledRooms.length + centerExcludedRooms.length} 条记录` : ""}`
+                  : `打开直播间回收站${recycledRooms.length ? `，共 ${recycledRooms.length} 条记录` : ""}`}
+                data-tooltip={permanentCenterRoomAccess() ? "回收站与中心库排除" : "直播间回收站"}
                 data-tooltip-placement="bottom"
                 onclick={openRoomRecycleBin}
               >
                 <Archive size={13} />
-                {#if recycledRooms.length + centerExcludedRooms.length > 0}<span>{recycledRooms.length + centerExcludedRooms.length}</span>{/if}
+                {#if recycledRooms.length + (permanentCenterRoomAccess() ? centerExcludedRooms.length : 0) > 0}<span>{recycledRooms.length + (permanentCenterRoomAccess() ? centerExcludedRooms.length : 0)}</span>{/if}
               </button>
               <button class="monitor-log-button" aria-label="查看红包监测运行日志" data-tooltip="查看红包监测运行日志" data-tooltip-placement="top" onclick={openMonitorRuntimeLog}>
                 <TerminalWindow size={13} />
@@ -6943,11 +6961,15 @@
       </div>
       <div class="room-recycle-tabs" role="tablist" aria-label="直播间清理记录分类">
         <button class:active={roomRecycleView === "recycle"} role="tab" aria-selected={roomRecycleView === "recycle"} onclick={() => (roomRecycleView = "recycle")}>回收站 <span>{recycledRooms.length}</span></button>
-        <button class:active={roomRecycleView === "center-exclusions"} role="tab" aria-selected={roomRecycleView === "center-exclusions"} onclick={() => (roomRecycleView = "center-exclusions")}>中心库全局排除 <span>{centerExcludedRooms.length}</span></button>
+        {#if permanentCenterRoomAccess()}
+          <button class:active={roomRecycleView === "center-exclusions"} role="tab" aria-selected={roomRecycleView === "center-exclusions"} onclick={() => (roomRecycleView = "center-exclusions")}>中心库全局排除 <span>{centerExcludedRooms.length}</span></button>
+        {/if}
       </div>
       <p class="participation-settings-intro">
         {roomRecycleView === "recycle"
-          ? "自动回收只归档直播间。恢复后保持未启动状态；永久删除中心库关联房间时会进入排除库。"
+          ? permanentCenterRoomAccess()
+            ? "自动清理会先将直播间移入回收站；永久删除中心库关联房间时会同步进入全局排除。"
+            : "自动清理会先将本地直播间移入回收站；恢复后保持未启动状态，永久删除只清除本机数据。"
           : "全局排除会从中心库清除直播间及红包数据，并拦截其他客户端再次上传；解除后恢复为未启动直播间。"}
       </p>
       <div class="room-recycle-list">

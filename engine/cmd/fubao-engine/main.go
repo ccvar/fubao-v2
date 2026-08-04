@@ -1022,7 +1022,12 @@ func main() {
 					continue
 				}
 			}
-			result, err := roomStore.ExecuteCleanup(params.Cursor, params.Limit, time.Now())
+			result, err := roomStore.ExecuteCleanupScoped(
+				params.Cursor,
+				params.Limit,
+				time.Now(),
+				permanentCenterRoomAccess(licenseManager),
+			)
 			if err != nil {
 				writeError(encoder, req.ID, "room_cleanup_failed", err.Error())
 				continue
@@ -1037,6 +1042,10 @@ func main() {
 		case "room.center_exclusions":
 			if roomStoreErr != nil {
 				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			if !permanentCenterRoomAccess(licenseManager) {
+				_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: []rooms.CenterExclusion{}})
 				continue
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: roomStore.CenterExclusions()})
@@ -1113,11 +1122,12 @@ func main() {
 				writeError(encoder, req.ID, "invalid_params", "永久删除直播间参数无效")
 				continue
 			}
-			if err := roomStore.DeleteRecycled(params.RoomID); err != nil {
+			allowCenterExclusion := permanentCenterRoomAccess(licenseManager)
+			if err := roomStore.DeleteRecycledScoped(params.RoomID, allowCenterExclusion); err != nil {
 				writeError(encoder, req.ID, "room_delete_failed", err.Error())
 				continue
 			}
-			if remoteSyncManager != nil && remoteSyncManagerErr == nil && remoteSyncPullScope(licenseManager) == remotesync.PullAll {
+			if allowCenterExclusion && remoteSyncManager != nil && remoteSyncManagerErr == nil && remoteSyncPullScope(licenseManager) == remotesync.PullAll {
 				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 				err := remoteSyncManager.SyncCenterExclusions(ctx, roomStore)
 				cancel()
@@ -1904,6 +1914,10 @@ func remoteSyncPullScope(manager *license.Manager) remotesync.PullScope {
 		return remotesync.PullAll
 	}
 	return remotesync.PullRedPackets
+}
+
+func permanentCenterRoomAccess(manager *license.Manager) bool {
+	return remoteSyncPullScope(manager) == remotesync.PullAll
 }
 
 func browserInstanceCreateLimit(manager *license.Manager) int {

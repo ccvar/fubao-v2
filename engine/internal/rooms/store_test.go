@@ -313,6 +313,74 @@ func TestExecuteCleanupUsesDefinitiveStateAndSupportsPaging(t *testing.T) {
 	}
 }
 
+func TestExecuteCleanupScopedKeepsCenterRowsAndCleansUnprobedLocalImports(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ImportIDs("123456789012"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MergeCenter([]CenterRoom{{
+		WebRID: "987654321098", MetricsVersion: 1, LiveSessionCount: 0, RedPacketCount: 0,
+		LiveStatus: "offline", CenterUpdatedAt: time.Now().Format(time.RFC3339Nano),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	settings := store.Settings()
+	settings.AutoRecycleImportedNoPacketEnabled = true
+	if _, err := store.SetSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.ExecuteCleanupScoped("", 100, time.Now(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Recycled != 1 || result.Excluded != 0 || result.Cleaned != 1 {
+		t.Fatalf("unexpected local-only cleanup result: %+v", result)
+	}
+	if got := store.RecycleBin(); len(got) != 1 || got[0].WebRID != "123456789012" {
+		t.Fatalf("local import should enter recycle bin: %+v", got)
+	}
+	if got := store.List(); len(got) != 1 || got[0].WebRID != "987654321098" {
+		t.Fatalf("center row must remain active without permanent authority: %+v", got)
+	}
+	if got := store.CenterExclusions(); len(got) != 0 {
+		t.Fatalf("local-only cleanup must not create center exclusions: %+v", got)
+	}
+}
+
+func TestDeleteRecycledScopedCanRemainLocalOnly(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := CenterRoom{WebRID: "665544332211", ActualRoomID: "112233445566", Title: "本地覆盖的中心房间"}
+	if _, err := store.MergeCenter([]CenterRoom{item}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ImportIDs(item.WebRID); err != nil {
+		t.Fatal(err)
+	}
+	settings := store.Settings()
+	settings.AutoRecycleImportedNoPacketEnabled = true
+	if _, err := store.SetSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ExecuteCleanupScoped("", 100, time.Now(), false); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteRecycledScoped(item.WebRID, false); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.All()) != 0 {
+		t.Fatal("local recycled row should be permanently removed")
+	}
+	if exclusions := store.CenterExclusions(); len(exclusions) != 0 {
+		t.Fatalf("local-only deletion must not create a center tombstone: %+v", exclusions)
+	}
+}
+
 func TestGlobalCenterExclusionsRemoveCenterRoomsWithoutResurrection(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {

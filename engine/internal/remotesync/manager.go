@@ -599,7 +599,12 @@ func (m *Manager) SyncSnapshot(roomItems []rooms.Room, monitorItems []redpacket.
 		if monitor.ID == "" {
 			monitor = monitorsByRoom[webRID]
 		}
-		if room.Source == "center" && monitor.AccountID == "" && monitor.LastCheckedAt == "" {
+		// Center data is learned from other clients and must never be echoed
+		// back. A local room only becomes eligible after this client has
+		// completed a definitive live probe that observed at least one live
+		// session. Imports and unknown/error probes therefore stay local until
+		// they have real local live evidence.
+		if !roomHasObservedLocalLive(room) {
 			continue
 		}
 		updatedAt := latestTime(room.UpdatedAt, monitor.UpdatedAt)
@@ -628,6 +633,10 @@ func (m *Manager) SyncSnapshot(roomItems []rooms.Room, monitorItems []redpacket.
 		}
 	}
 	return m.enqueue(items)
+}
+
+func roomHasObservedLocalLive(room rooms.Room) bool {
+	return room.HasDefinitiveProbe && room.LiveSessionCount > 0
 }
 
 func (m *Manager) EnqueueEvent(event redpacket.Event) error {

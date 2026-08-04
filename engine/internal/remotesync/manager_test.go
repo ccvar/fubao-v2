@@ -29,7 +29,7 @@ func TestSnapshotOutboxContainsOnlySafeRoomAndPacketData(t *testing.T) {
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	err = manager.SyncSnapshot(
-		[]rooms.Room{{ID: "room-local", WebRID: "123456", ActualRoomID: "actual-1", Name: "直播间", StreamerName: "主播", UpdatedAt: now}},
+		[]rooms.Room{{ID: "room-local", WebRID: "123456", ActualRoomID: "actual-1", Name: "直播间", StreamerName: "主播", UpdatedAt: now, HasDefinitiveProbe: true, LiveSessionCount: 1, LastDefinitiveLiveState: "live"}},
 		[]redpacket.Monitor{{ID: "room_room-local", RoomID: "room-local", WebRID: "123456", LiveStatus: "live", AccountID: "secret-account", AccountName: "不应上传", UpdatedAt: now}},
 		[]redpacket.Event{{ID: "room_room-local:packet-1", WebRID: "123456", PacketID: "packet-1", AccountID: "secret-account", AccountName: "不应上传", Title: "红包", DetectedAt: now, ActualRoomID: "private-actual", JoinBoxID: "private-box", AnchorID: "private-anchor"}},
 	)
@@ -52,6 +52,39 @@ func TestSnapshotOutboxContainsOnlySafeRoomAndPacketData(t *testing.T) {
 	}
 	if len(stored.Items) != 2 {
 		t.Fatalf("outbox items = %d, want 2", len(stored.Items))
+	}
+}
+
+func TestSnapshotSkipsRoomsWithoutLocalObservedLive(t *testing.T) {
+	dataDir := t.TempDir()
+	content, _ := json.Marshal(Config{Version: configVersion, Enabled: true, Endpoint: syncprotocol.DefaultEndpoint, DeviceToken: "device-test-token"})
+	if err := os.WriteFile(filepath.Join(dataDir, "remote_sync.json"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	roomsToSync := []rooms.Room{
+		{ID: "observed", WebRID: "111111", HasDefinitiveProbe: true, LiveSessionCount: 1, LastDefinitiveLiveState: "offline", UpdatedAt: now},
+		{ID: "never-live", WebRID: "222222", HasDefinitiveProbe: false, UpdatedAt: now},
+		// A center-derived live count is not local monitoring evidence.
+		{ID: "center-only", WebRID: "333333", Source: "center", CenterMetricsVersion: 1, CenterLiveSessionCount: 8, UpdatedAt: now},
+	}
+	if err := manager.SyncSnapshot(roomsToSync, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	outbox, err := os.ReadFile(filepath.Join(dataDir, "remote_sync_outbox.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var stored outboxFile
+	if err := json.Unmarshal(outbox, &stored); err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Items) != 1 || stored.Items[0].IdempotencyKey != "room:111111" {
+		t.Fatalf("snapshot uploaded rooms without local observed live: %+v", stored.Items)
 	}
 }
 
@@ -116,7 +149,7 @@ func TestUnchangedSnapshotKeepsStableOutboxPayload(t *testing.T) {
 		t.Fatal(err)
 	}
 	updatedAt := "2026-08-02T09:30:00Z"
-	roomItems := []rooms.Room{{ID: "room-local", WebRID: "123456", Name: "直播间", UpdatedAt: updatedAt}}
+	roomItems := []rooms.Room{{ID: "room-local", WebRID: "123456", Name: "直播间", UpdatedAt: updatedAt, HasDefinitiveProbe: true, LiveSessionCount: 1, LastDefinitiveLiveState: "live"}}
 	monitorItems := []redpacket.Monitor{{ID: "room_room-local", RoomID: "room-local", WebRID: "123456", LiveStatus: "live", UpdatedAt: updatedAt}}
 	if err := manager.SyncSnapshot(roomItems, monitorItems, nil); err != nil {
 		t.Fatal(err)
@@ -409,6 +442,9 @@ func TestPullOnceImportsOtherClientDataWithoutEchoingIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := roomStoreA.ImportIDs("123456789012"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := roomStoreA.RecordLiveResult("123456789012", "live", time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)

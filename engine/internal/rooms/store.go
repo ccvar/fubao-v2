@@ -27,6 +27,10 @@ type Settings struct {
 	AutoRecycleMaxLiveSessions  int  `json:"auto_recycle_max_live_sessions"`
 	AutoRecycleNoPacketEnabled  bool `json:"auto_recycle_no_packet_enabled"`
 	AutoRecycleNoPacketDays     int  `json:"auto_recycle_no_packet_days"`
+	// AutoRecycleImportedNoPacketEnabled is an explicit manual-cleanup rule.
+	// It applies only to locally imported rooms that have never produced a
+	// red-packet event, including records that have not completed a probe yet.
+	AutoRecycleImportedNoPacketEnabled bool `json:"auto_recycle_imported_no_packet_enabled"`
 }
 
 type ListPage struct {
@@ -752,10 +756,18 @@ func (s *Store) SetSettings(settings Settings) (Settings, error) {
 }
 
 // ExecuteCleanup scans a bounded stable slice of the current room store and
-// applies the persisted cleanup rules to rooms with an already definitive
-// offline result. It never performs network probes and therefore cannot turn
-// unknown or transient failures into destructive cleanup evidence.
+// applies the persisted cleanup rules. Network-derived rules require an
+// already definitive offline result; the explicit local-import/no-packet rule
+// may also clean unprobed imports. No rule performs a network probe here.
 func (s *Store) ExecuteCleanup(cursor string, limit int, checkedAt time.Time) (CleanupProgress, error) {
+	return s.ExecuteCleanupScoped(cursor, limit, checkedAt, true)
+}
+
+// ExecuteCleanupScoped applies the cleanup rules while keeping center-library
+// deletion authority outside the store. Non-permanent clients pass false so
+// center-only rows are never removed or converted into global exclusions;
+// locally imported rows can still be recycled normally.
+func (s *Store) ExecuteCleanupScoped(cursor string, limit int, checkedAt time.Time, allowCenterExclusions bool) (CleanupProgress, error) {
 	if limit <= 0 {
 		limit = 500
 	}
@@ -796,13 +808,17 @@ func (s *Store) ExecuteCleanup(cursor string, limit int, checkedAt time.Time) (C
 	for _, id := range ids {
 		room := s.rooms[id]
 		result.Scanned++
+		centerOnly := strings.EqualFold(strings.TrimSpace(room.Source), "center") && len(room.FollowSources) == 0
+		if centerOnly && !allowCenterExclusions {
+			result.Skipped++
+			continue
+		}
 		reason, ok := s.cleanupReasonLocked(room, checkedAt)
 		if !ok {
 			result.Skipped++
 			continue
 		}
 		changedRooms[id] = *room
-		centerOnly := strings.EqualFold(strings.TrimSpace(room.Source), "center") && len(room.FollowSources) == 0
 		if centerOnly {
 			if previous, exists := s.centerExclusions[room.WebRID]; exists && previous != nil {
 				copy := *previous
@@ -858,6 +874,13 @@ func (s *Store) cleanupReasonLocked(room *Room, checkedAt time.Time) (string, bo
 		liveSessionCount = room.CenterLiveSessionCount
 		liveMetricsKnown = room.CenterMetricsVersion > 0
 		definitivelyOffline = strings.EqualFold(strings.TrimSpace(room.CenterLiveStatus), "offline")
+	}
+	if s.settings.AutoRecycleImportedNoPacketEnabled && roomPageSource(room) == "imported" {
+		localPacketMissing := strings.TrimSpace(room.LastRedPacketAt) == ""
+		centerPacketMissing := strings.TrimSpace(room.CenterLastEventAt) == "" && (room.CenterMetricsVersion == 0 || room.CenterRedPacketCount == 0)
+		if localPacketMissing && centerPacketMissing {
+			return "本地导入后从未发现红包，手动执行自动清理", true
+		}
 	}
 	if !definitivelyOffline {
 		return "", false
@@ -1068,6 +1091,12 @@ func (s *Store) Restore(roomID string) (Room, error) {
 }
 
 func (s *Store) DeleteRecycled(roomID string) error {
+	return s.DeleteRecycledScoped(roomID, true)
+}
+
+// DeleteRecycledScoped permanently removes a local recycled record. Only a
+// permanent client may turn that deletion into a shared center tombstone.
+func (s *Store) DeleteRecycledScoped(roomID string, allowCenterExclusion bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	roomID = strings.TrimSpace(roomID)
@@ -1075,7 +1104,9 @@ func (s *Store) DeleteRecycled(roomID string) error {
 	if room == nil || !room.Recycled {
 		return errors.New("回收站中的直播间不存在")
 	}
-	s.excludeCenterRoomLocked(room, firstNonEmpty(room.RecycleReason, "从回收站永久删除"), time.Now())
+	if allowCenterExclusion {
+		s.excludeCenterRoomLocked(room, firstNonEmpty(room.RecycleReason, "从回收站永久删除"), time.Now())
+	}
 	delete(s.rooms, roomID)
 	return s.saveLocked()
 }
