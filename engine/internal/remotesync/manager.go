@@ -610,7 +610,7 @@ func (m *Manager) SyncSnapshot(roomItems []rooms.Room, monitorItems []redpacket.
 			LiveStatus: monitor.LiveStatus, LiveStatusSource: monitor.LiveStatusSource,
 			LiveStartedAt: monitor.LiveStartedAt, LastSeenLiveAt: room.LastSeenLiveAt,
 			LastCheckedAt: monitor.LastCheckedAt, LastRedPacketCheckedAt: monitor.LastRedPacketCheckedAt,
-			LastEventAt: monitor.LastEventAt, UpdatedAt: updatedAt,
+			LastEventAt: monitor.LastEventAt, LiveSessionCount: room.LiveSessionCount, UpdatedAt: updatedAt,
 		}
 		item, err := makeItem(syncprotocol.ItemRoomState, "room:"+webRID, updatedAt, payload)
 		if err != nil {
@@ -821,7 +821,9 @@ func (m *Manager) pullType(ctx context.Context, roomStore *rooms.Store, redPacke
 					WebRID: item.WebRID, ActualRoomID: item.ActualRoomID, Title: item.Title,
 					StreamerName: item.StreamerName, LiveStatus: item.LiveStatus,
 					LiveStartedAt: item.LiveStartedAt, LastSeenLiveAt: item.LastSeenLiveAt,
-					LastEventAt: item.LastEventAt, CenterUpdatedAt: item.UpdatedAt,
+					LastEventAt: item.LastEventAt, MetricsVersion: item.MetricsVersion,
+					LiveSessionCount: item.LiveSessionCount, RedPacketCount: item.RedPacketCount,
+					CenterUpdatedAt: item.UpdatedAt,
 				})
 			case syncprotocol.ItemRedPacket:
 				var item syncprotocol.RedPacket

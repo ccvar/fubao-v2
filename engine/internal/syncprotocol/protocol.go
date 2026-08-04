@@ -92,6 +92,9 @@ type RoomState struct {
 	LastCheckedAt          string `json:"last_checked_at,omitempty"`
 	LastRedPacketCheckedAt string `json:"last_red_packet_checked_at,omitempty"`
 	LastEventAt            string `json:"last_event_at,omitempty"`
+	MetricsVersion         int    `json:"metrics_version,omitempty"`
+	LiveSessionCount       int    `json:"live_session_count,omitempty"`
+	RedPacketCount         int    `json:"red_packet_count,omitempty"`
 	UpdatedAt              string `json:"updated_at"`
 }
 

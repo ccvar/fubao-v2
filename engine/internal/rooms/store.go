@@ -34,6 +34,17 @@ type ListPage struct {
 	Total int    `json:"total"`
 }
 
+type CleanupProgress struct {
+	Total      int    `json:"total"`
+	Scanned    int    `json:"scanned"`
+	Cleaned    int    `json:"cleaned"`
+	Recycled   int    `json:"recycled"`
+	Excluded   int    `json:"excluded"`
+	Skipped    int    `json:"skipped"`
+	NextCursor string `json:"next_cursor,omitempty"`
+	HasMore    bool   `json:"has_more"`
+}
+
 // FollowSource records which participation account reported a broadcaster as
 // currently live. It contains safe attribution metadata only; credentials
 // remain inside the account store.
@@ -55,15 +66,18 @@ type FollowingLiveRoom struct {
 }
 
 type CenterRoom struct {
-	WebRID          string
-	ActualRoomID    string
-	Title           string
-	StreamerName    string
-	LiveStatus      string
-	LiveStartedAt   string
-	LastSeenLiveAt  string
-	LastEventAt     string
-	CenterUpdatedAt string
+	WebRID           string
+	ActualRoomID     string
+	Title            string
+	StreamerName     string
+	LiveStatus       string
+	LiveStartedAt    string
+	LastSeenLiveAt   string
+	LastEventAt      string
+	MetricsVersion   int
+	LiveSessionCount int
+	RedPacketCount   int
+	CenterUpdatedAt  string
 }
 
 // CenterExclusion is a safe persistent tombstone for a room removed from the
@@ -96,6 +110,9 @@ type Room struct {
 	CenterLiveStatus        string         `json:"center_live_status,omitempty"`
 	CenterLiveAt            string         `json:"center_live_at,omitempty"`
 	CenterLastEventAt       string         `json:"center_last_event_at,omitempty"`
+	CenterMetricsVersion    int            `json:"center_metrics_version,omitempty"`
+	CenterLiveSessionCount  int            `json:"center_live_session_count,omitempty"`
+	CenterRedPacketCount    int            `json:"center_red_packet_count,omitempty"`
 	CenterLinked            bool           `json:"center_linked,omitempty"`
 	Recycled                bool           `json:"recycled,omitempty"`
 	RecycledAt              string         `json:"recycled_at,omitempty"`
@@ -170,6 +187,12 @@ func (s *Store) MergeCenter(items []CenterRoom) (MigrationResult, error) {
 		}
 		if value := strings.TrimSpace(item.LastEventAt); value != "" && value > room.LastRedPacketAt {
 			room.LastRedPacketAt = value
+			changed = true
+		}
+		if item.MetricsVersion > 0 && (room.CenterMetricsVersion != item.MetricsVersion || room.CenterLiveSessionCount != item.LiveSessionCount || room.CenterRedPacketCount != item.RedPacketCount) {
+			room.CenterMetricsVersion = item.MetricsVersion
+			room.CenterLiveSessionCount = max(0, item.LiveSessionCount)
+			room.CenterRedPacketCount = max(0, item.RedPacketCount)
 			changed = true
 		}
 		centerLiveAt := firstNonEmpty(item.LastSeenLiveAt, item.LiveStartedAt, item.CenterUpdatedAt)
@@ -728,6 +751,132 @@ func (s *Store) SetSettings(settings Settings) (Settings, error) {
 	return s.settings, nil
 }
 
+// ExecuteCleanup scans a bounded stable slice of the current room store and
+// applies the persisted cleanup rules to rooms with an already definitive
+// offline result. It never performs network probes and therefore cannot turn
+// unknown or transient failures into destructive cleanup evidence.
+func (s *Store) ExecuteCleanup(cursor string, limit int, checkedAt time.Time) (CleanupProgress, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	if limit > 2000 {
+		limit = 2000
+	}
+	if checkedAt.IsZero() {
+		checkedAt = time.Now()
+	}
+	cursor = strings.TrimSpace(cursor)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ids := make([]string, 0, len(s.rooms))
+	for id, room := range s.rooms {
+		if room != nil && !room.Recycled && id > cursor {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	total := 0
+	for _, room := range s.rooms {
+		if room != nil && !room.Recycled {
+			total++
+		}
+	}
+	result := CleanupProgress{Total: total}
+	if len(ids) == 0 {
+		return result, nil
+	}
+	if len(ids) > limit {
+		result.HasMore = true
+		ids = ids[:limit]
+	}
+	result.NextCursor = ids[len(ids)-1]
+	changedRooms := make(map[string]Room)
+	changedExclusions := make(map[string]*CenterExclusion)
+	for _, id := range ids {
+		room := s.rooms[id]
+		result.Scanned++
+		reason, ok := s.cleanupReasonLocked(room, checkedAt)
+		if !ok {
+			result.Skipped++
+			continue
+		}
+		changedRooms[id] = *room
+		centerOnly := strings.EqualFold(strings.TrimSpace(room.Source), "center") && len(room.FollowSources) == 0
+		if centerOnly {
+			if previous, exists := s.centerExclusions[room.WebRID]; exists && previous != nil {
+				copy := *previous
+				changedExclusions[room.WebRID] = &copy
+			} else {
+				changedExclusions[room.WebRID] = nil
+			}
+			s.excludeCenterRoomLocked(room, reason, checkedAt)
+			delete(s.rooms, id)
+			result.Excluded++
+		} else {
+			room.Recycled = true
+			room.RecycledAt = checkedAt.Format(time.RFC3339Nano)
+			room.RecycleReason = reason
+			room.Enabled = false
+			room.MonitorStatus = "stopped"
+			room.ConnectionStatus = "disconnected"
+			room.UpdatedAt = checkedAt.Format(time.RFC3339Nano)
+			result.Recycled++
+		}
+		result.Cleaned++
+	}
+	if result.Cleaned == 0 {
+		return result, nil
+	}
+	if err := s.saveLocked(); err != nil {
+		for id, room := range changedRooms {
+			copy := room
+			s.rooms[id] = &copy
+		}
+		for webRID, exclusion := range changedExclusions {
+			if exclusion == nil {
+				delete(s.centerExclusions, webRID)
+			} else {
+				copy := *exclusion
+				s.centerExclusions[webRID] = &copy
+			}
+		}
+		return CleanupProgress{}, err
+	}
+	return result, nil
+}
+
+func (s *Store) cleanupReasonLocked(room *Room, checkedAt time.Time) (string, bool) {
+	if room == nil || room.Recycled {
+		return "", false
+	}
+	centerOnly := strings.EqualFold(strings.TrimSpace(room.Source), "center") && len(room.FollowSources) == 0
+	liveSessionCount := room.LiveSessionCount
+	liveMetricsKnown := room.HasDefinitiveProbe
+	definitivelyOffline := room.HasDefinitiveProbe && room.LastDefinitiveLiveState == "offline"
+	if centerOnly {
+		liveSessionCount = room.CenterLiveSessionCount
+		liveMetricsKnown = room.CenterMetricsVersion > 0
+		definitivelyOffline = strings.EqualFold(strings.TrimSpace(room.CenterLiveStatus), "offline")
+	}
+	if !definitivelyOffline {
+		return "", false
+	}
+	if s.settings.AutoRecycleLowLiveEnabled && liveMetricsKnown && liveSessionCount <= s.settings.AutoRecycleMaxLiveSessions {
+		return fmt.Sprintf("累计确认开播 %d 次，不超过设置的 %d 次，手动执行自动清理", liveSessionCount, s.settings.AutoRecycleMaxLiveSessions), true
+	}
+	if s.settings.AutoRecycleNoPacketEnabled && s.settings.AutoRecycleNoPacketDays > 0 {
+		baseline := firstNonEmpty(room.LastRedPacketAt, room.FirstDefinitiveProbeAt)
+		if centerOnly {
+			baseline = firstNonEmpty(room.CenterLastEventAt, room.FirstDefinitiveProbeAt)
+		}
+		if since, ok := parseStoredTime(baseline); ok && checkedAt.Sub(since) >= time.Duration(s.settings.AutoRecycleNoPacketDays)*24*time.Hour {
+			return fmt.Sprintf("近 %d 天未发现红包，手动执行自动清理", s.settings.AutoRecycleNoPacketDays), true
+		}
+	}
+	return "", false
+}
+
 // RecordLiveResult applies only a definitive successful live probe. Unknown,
 // error, and network outcomes are ignored by design. An offline calendar day
 // is counted at most once; a transition into live counts one independent live
@@ -793,8 +942,14 @@ func (s *Store) RecordLiveResult(roomID, status string, checkedAt time.Time) (bo
 			changed = true
 		}
 		reason := ""
-		if s.settings.AutoRecycleLowLiveEnabled && room.LiveSessionCount <= s.settings.AutoRecycleMaxLiveSessions {
-			reason = fmt.Sprintf("累计确认开播 %d 次，不超过设置的 %d 次，系统自动清理", room.LiveSessionCount, s.settings.AutoRecycleMaxLiveSessions)
+		liveSessionCount := room.LiveSessionCount
+		liveMetricsKnown := true
+		if strings.EqualFold(strings.TrimSpace(room.Source), "center") && len(room.FollowSources) == 0 {
+			liveSessionCount = room.CenterLiveSessionCount
+			liveMetricsKnown = room.CenterMetricsVersion > 0
+		}
+		if s.settings.AutoRecycleLowLiveEnabled && liveMetricsKnown && liveSessionCount <= s.settings.AutoRecycleMaxLiveSessions {
+			reason = fmt.Sprintf("累计确认开播 %d 次，不超过设置的 %d 次，系统自动清理", liveSessionCount, s.settings.AutoRecycleMaxLiveSessions)
 		}
 		if reason == "" && s.settings.AutoRecycleNoPacketEnabled && s.settings.AutoRecycleNoPacketDays > 0 {
 			baseline := firstNonEmpty(room.LastRedPacketAt, room.FirstDefinitiveProbeAt)

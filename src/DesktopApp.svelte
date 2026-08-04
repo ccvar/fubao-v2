@@ -72,6 +72,17 @@
     auto_recycle_no_packet_days: number;
   };
 
+  type RoomCleanupProgress = {
+    total: number;
+    scanned: number;
+    cleaned: number;
+    recycled: number;
+    excluded: number;
+    skipped: number;
+    next_cursor?: string;
+    has_more: boolean;
+  };
+
   type MonitoringSettings = {
     global_request_interval_ms: number;
     account_request_interval_ms: number;
@@ -745,6 +756,9 @@
   let roomCleanupMenuOpen = false;
   let roomCleanupSettingsBusy = false;
   let roomCleanupSettingsError = "";
+  let roomCleanupProgress: RoomCleanupProgress | null = null;
+  let roomCleanupProcessed = 0;
+  let roomCleanupTotal = 0;
   let redPacketBatchAction: "start" | "stop" | "" = "";
   let redPacketMonitorActionId = "";
   let monitorRuntimeLogs: MonitorRuntimeLog[] = [];
@@ -3159,6 +3173,11 @@
   function toggleRoomCleanupMenu() {
     roomCleanupMenuOpen = !roomCleanupMenuOpen;
     roomCleanupSettingsError = "";
+    if (!roomCleanupSettingsBusy) {
+      roomCleanupProgress = null;
+      roomCleanupProcessed = 0;
+      roomCleanupTotal = 0;
+    }
     roomSortMenuOpen = false;
     roomSourceMenuOpen = false;
     statusMenuOpen = false;
@@ -3166,7 +3185,7 @@
     accountSortMenuOpen = false;
   }
 
-  async function saveRoomCleanupSettings() {
+  async function executeRoomCleanup() {
     if (roomCleanupSettingsBusy) return;
     const nextRoomSettings: RoomSettings = {
       ...roomSettings,
@@ -3175,12 +3194,53 @@
     };
     roomCleanupSettingsBusy = true;
     roomCleanupSettingsError = "";
+    roomCleanupProgress = null;
+    roomCleanupProcessed = 0;
+    roomCleanupTotal = 0;
     try {
       roomSettings = isTauriDesktop()
         ? await engineRequest<RoomSettings>("room.set_settings", nextRoomSettings)
         : nextRoomSettings;
-      roomCleanupMenuOpen = false;
-      showToast("直播间自动清理设置已保存");
+      let cursor = "";
+      let aggregate: RoomCleanupProgress = {
+        total: rooms.length,
+        scanned: 0,
+        cleaned: 0,
+        recycled: 0,
+        excluded: 0,
+        skipped: 0,
+        has_more: false,
+      };
+      if (isTauriDesktop()) {
+        do {
+          const step = await engineRequest<RoomCleanupProgress>("room.execute_cleanup", { cursor, limit: 500 });
+          if (roomCleanupTotal === 0) roomCleanupTotal = step.total;
+          roomCleanupProcessed += step.scanned;
+          aggregate = {
+            total: roomCleanupTotal,
+            scanned: roomCleanupProcessed,
+            cleaned: aggregate.cleaned + step.cleaned,
+            recycled: aggregate.recycled + step.recycled,
+            excluded: aggregate.excluded + step.excluded,
+            skipped: aggregate.skipped + step.skipped,
+            next_cursor: step.next_cursor,
+            has_more: step.has_more,
+          };
+          roomCleanupProgress = aggregate;
+          cursor = step.next_cursor || "";
+          await tick();
+        } while (aggregate.has_more && cursor);
+      } else {
+        roomCleanupTotal = rooms.length;
+        roomCleanupProcessed = rooms.length;
+        aggregate.scanned = rooms.length;
+        aggregate.skipped = rooms.length;
+        roomCleanupProgress = aggregate;
+      }
+      await Promise.all([loadRooms(false), loadRoomRecycleBin(), loadSidebarActivities()]);
+      showToast(aggregate.cleaned > 0
+        ? `清理完成：处理 ${aggregate.cleaned} 个直播间`
+        : "清理完成，没有符合当前规则的直播间");
     } catch (error) {
       roomCleanupSettingsError = error instanceof Error ? error.message : String(error);
     } finally {
@@ -5988,10 +6048,21 @@
                       <span>未发红包</span>
                     </label>
                     <small>从首次有效检测或最后发现红包开始计算</small>
+                    {#if roomCleanupSettingsBusy || roomCleanupProgress}
+                      <div class="room-cleanup-progress" aria-live="polite">
+                        <div><span>执行进度</span><strong>{roomCleanupTotal > 0 ? Math.min(100, Math.round(roomCleanupProcessed / roomCleanupTotal * 100)) : 100}%</strong></div>
+                        <progress max={Math.max(1, roomCleanupTotal)} value={roomCleanupTotal > 0 ? Math.min(roomCleanupProcessed, roomCleanupTotal) : 1}></progress>
+                        {#if roomCleanupProgress}
+                          <small>已扫描 {roomCleanupProgress.scanned} 个，已处理 {roomCleanupProgress.cleaned} 个（回收站 {roomCleanupProgress.recycled}，中心库清除 {roomCleanupProgress.excluded}）</small>
+                        {:else}
+                          <small>正在保存规则并扫描直播间…</small>
+                        {/if}
+                      </div>
+                    {/if}
                     {#if roomCleanupSettingsError}<p>{roomCleanupSettingsError}</p>{/if}
                     <div class="room-cleanup-menu-footer">
                       <button type="button" disabled={roomCleanupSettingsBusy} onclick={() => (roomCleanupMenuOpen = false)}>取消</button>
-                      <button type="button" class="primary" disabled={roomCleanupSettingsBusy} onclick={() => void saveRoomCleanupSettings()}>{roomCleanupSettingsBusy ? "保存中…" : "保存"}</button>
+                      <button type="button" class="primary" disabled={roomCleanupSettingsBusy} onclick={() => void executeRoomCleanup()}>{roomCleanupSettingsBusy ? "执行中…" : roomCleanupProgress ? "再次执行" : "执行清理"}</button>
                     </div>
                   </div>
                 {/if}

@@ -1007,6 +1007,27 @@ func main() {
 				continue
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
+		case "room.execute_cleanup":
+			if roomStoreErr != nil {
+				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			var params struct {
+				Cursor string `json:"cursor"`
+				Limit  int    `json:"limit"`
+			}
+			if len(req.Params) > 0 {
+				if err := json.Unmarshal(req.Params, &params); err != nil {
+					writeError(encoder, req.ID, "invalid_params", "直播间自动清理参数无效")
+					continue
+				}
+			}
+			result, err := roomStore.ExecuteCleanup(params.Cursor, params.Limit, time.Now())
+			if err != nil {
+				writeError(encoder, req.ID, "room_cleanup_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
 		case "room.recycle_bin":
 			if roomStoreErr != nil {
 				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())

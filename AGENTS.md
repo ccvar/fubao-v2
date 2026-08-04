@@ -102,6 +102,8 @@ When an account has both roles, each role-removal cross belongs inside its own r
 
 Commands that dynamically create Tauri child WebViews must be asynchronous so Windows WebView2 environment creation never blocks the main-thread IPC/message pump. On Windows, every account-keyed WebView2 profile lives under the application LocalAppData directory rather than roaming AppData; macOS continues to use account-keyed WKWebView data-store identifiers. Raw login data remains native-only on every platform.
 
+Center-library cumulative live-session and red-packet counts are authoritative server aggregates. The server deduplicates live sessions and packet identities, republishes the canonical metrics with an explicit metrics version, and clients use those values for center-only automatic cleanup. Missing or legacy metrics are unknown and must never trigger destructive low-live cleanup.
+
 Completing a CK rebind must confirm the authenticated state in the native Douyin page, retry the native Cookie-manager read briefly for Windows WebView2 propagation, persist the fresh browser-login signal in Go, and return the safe updated account view immediately. Never leave the frontend's previous expired badge in place merely because a subsequent online validation is temporarily unavailable, and never allow a transient validator result to override the just-confirmed native login state.
 
 The main top-bar refresh action must reload the current page's real Go-backed data, including account health on participation and monitoring tabs. It must never be a decorative timer or update only browser-side demo state.

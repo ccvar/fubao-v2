@@ -69,12 +69,17 @@ func TestRegisterAndSyncBatch(t *testing.T) {
 	if changes.Version != syncprotocol.Version || changes.NextCursor == 0 || len(changes.Changes) != 2 {
 		t.Fatalf("unexpected center changes: %+v", changes)
 	}
-	if changes.Changes[0].OriginClientID != registration.ClientID || changes.Changes[1].OriginClientID != registration.ClientID {
-		t.Fatalf("change origin was not retained: %+v", changes.Changes)
-	}
 	var syncedPacket syncprotocol.RedPacket
 	for _, change := range changes.Changes {
-		if change.Type == syncprotocol.ItemRedPacket {
+		switch change.Type {
+		case syncprotocol.ItemRoomState:
+			if change.OriginClientID != centerServerOriginClientID {
+				t.Fatalf("canonical room change did not use server origin: %+v", change)
+			}
+		case syncprotocol.ItemRedPacket:
+			if change.OriginClientID != registration.ClientID {
+				t.Fatalf("packet origin was not retained: %+v", change)
+			}
 			if err := json.Unmarshal(change.Payload, &syncedPacket); err != nil {
 				t.Fatal(err)
 			}

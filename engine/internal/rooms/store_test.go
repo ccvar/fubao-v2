@@ -185,7 +185,7 @@ func TestCenterOnlyCleanupPersistsExclusionUntilRestored(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	item := CenterRoom{WebRID: "888888888888", Title: "中心库直播间", CenterUpdatedAt: "2026-08-04T09:00:00+08:00"}
+	item := CenterRoom{WebRID: "888888888888", Title: "中心库直播间", MetricsVersion: 1, LiveSessionCount: 0, CenterUpdatedAt: "2026-08-04T09:00:00+08:00"}
 	if _, err := store.MergeCenter([]CenterRoom{item}); err != nil {
 		t.Fatal(err)
 	}
@@ -224,6 +224,92 @@ func TestCenterOnlyCleanupPersistsExclusionUntilRestored(t *testing.T) {
 	}
 	if len(reloaded.CenterExclusions()) != 0 || len(reloaded.List()) != 1 {
 		t.Fatal("restoring exclusion must recreate the stopped local room")
+	}
+}
+
+func TestCenterLowLiveCleanupRequiresAuthoritativeMetrics(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := CenterRoom{WebRID: "888888888889", Title: "旧协议中心直播间", CenterUpdatedAt: "2026-08-04T09:00:00+08:00"}
+	if _, err := store.MergeCenter([]CenterRoom{item}); err != nil {
+		t.Fatal(err)
+	}
+	settings := store.Settings()
+	settings.AutoRecycleOfflineDays = 0
+	settings.AutoRecycleLowLiveEnabled = true
+	settings.AutoRecycleMaxLiveSessions = 0
+	if _, err := store.SetSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	if cleaned, err := store.RecordLiveResult(item.WebRID, "offline", time.Now()); err != nil || cleaned {
+		t.Fatalf("center room without authoritative metrics must not be cleaned: cleaned=%v err=%v", cleaned, err)
+	}
+	if len(store.All()) != 1 || len(store.CenterExclusions()) != 0 {
+		t.Fatal("unknown center metrics created a destructive exclusion")
+	}
+	item.MetricsVersion = 1
+	item.LiveSessionCount = 4
+	if _, err := store.MergeCenter([]CenterRoom{item}); err != nil {
+		t.Fatal(err)
+	}
+	if cleaned, err := store.RecordLiveResult(item.WebRID, "offline", time.Now().Add(time.Hour)); err != nil || cleaned {
+		t.Fatalf("center authoritative live count above threshold must be retained: cleaned=%v err=%v", cleaned, err)
+	}
+}
+
+func TestExecuteCleanupUsesDefinitiveStateAndSupportsPaging(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ImportIDs("710000000001"); err != nil {
+		t.Fatal(err)
+	}
+	checkedAt := time.Date(2026, 8, 4, 10, 0, 0, 0, time.Local)
+	if cleaned, err := store.RecordLiveResult("710000000001", "offline", checkedAt); err != nil || cleaned {
+		t.Fatalf("room should only collect definitive evidence before the rule is enabled: cleaned=%v err=%v", cleaned, err)
+	}
+	center := CenterRoom{
+		WebRID:           "710000000002",
+		Title:            "中心库待清理直播间",
+		LiveStatus:       "offline",
+		MetricsVersion:   1,
+		LiveSessionCount: 0,
+		CenterUpdatedAt:  checkedAt.Format(time.RFC3339Nano),
+	}
+	if _, err := store.MergeCenter([]CenterRoom{center}); err != nil {
+		t.Fatal(err)
+	}
+	unknown := CenterRoom{WebRID: "710000000003", Title: "中心库未知直播间", MetricsVersion: 1, CenterUpdatedAt: checkedAt.Format(time.RFC3339Nano)}
+	if _, err := store.MergeCenter([]CenterRoom{unknown}); err != nil {
+		t.Fatal(err)
+	}
+	settings := store.Settings()
+	settings.AutoRecycleOfflineDays = 0
+	settings.AutoRecycleLowLiveEnabled = true
+	settings.AutoRecycleMaxLiveSessions = 0
+	if _, err := store.SetSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := store.ExecuteCleanup("", 1, checkedAt.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Scanned != 1 || !first.HasMore || first.Cleaned != 1 {
+		t.Fatalf("unexpected first cleanup page: %+v", first)
+	}
+	second, err := store.ExecuteCleanup(first.NextCursor, 10, checkedAt.Add(time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Scanned != 2 || second.HasMore || first.Cleaned+second.Cleaned != 2 || first.Excluded+second.Excluded != 1 || first.Skipped+second.Skipped != 1 {
+		t.Fatalf("unexpected second cleanup page: %+v", second)
+	}
+	if len(store.RecycleBin()) != 1 || len(store.CenterExclusions()) != 1 || len(store.List()) != 1 {
+		t.Fatalf("unexpected cleanup result: active=%+v recycled=%+v exclusions=%+v", store.List(), store.RecycleBin(), store.CenterExclusions())
 	}
 }
 

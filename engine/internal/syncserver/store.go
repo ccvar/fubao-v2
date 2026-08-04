@@ -36,6 +36,8 @@ type DeviceAuthorization struct {
 	AccessMode string
 }
 
+const centerServerOriginClientID = "center-server"
+
 func OpenStore(path string) (*Store, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -90,8 +92,18 @@ func (s *Store) migrate(ctx context.Context) error {
 			last_checked_at TEXT NOT NULL DEFAULT '',
 			last_red_packet_checked_at TEXT NOT NULL DEFAULT '',
 			last_event_at TEXT NOT NULL DEFAULT '',
+			metrics_version INTEGER NOT NULL DEFAULT 1,
+			live_session_count INTEGER NOT NULL DEFAULT 0,
+			red_packet_count INTEGER NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL,
 			last_client_id TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS room_live_sessions (
+			web_rid TEXT NOT NULL,
+			session_key TEXT NOT NULL,
+			first_seen_at TEXT NOT NULL,
+			PRIMARY KEY (web_rid, session_key),
+			FOREIGN KEY (web_rid) REFERENCES rooms(web_rid) ON DELETE CASCADE
 		)`,
 		`CREATE TABLE IF NOT EXISTS red_packet_events (
 			web_rid TEXT NOT NULL,
@@ -147,6 +159,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS sync_changes_seq_idx ON sync_changes(seq)`,
 		`CREATE INDEX IF NOT EXISTS sync_changes_entity_idx ON sync_changes(item_type, entity_key, seq DESC)`,
 		`CREATE INDEX IF NOT EXISTS room_exclusions_actual_room_idx ON room_exclusions(actual_room_id)`,
+		`CREATE INDEX IF NOT EXISTS room_live_sessions_room_idx ON room_live_sessions(web_rid)`,
 	}
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
@@ -161,7 +174,37 @@ func (s *Store) migrate(ctx context.Context) error {
 			return err
 		}
 	}
-	return s.backfillChanges(ctx)
+	for column, definition := range map[string]string{
+		"metrics_version":    "INTEGER NOT NULL DEFAULT 1",
+		"live_session_count": "INTEGER NOT NULL DEFAULT 0",
+		"red_packet_count":   "INTEGER NOT NULL DEFAULT 0",
+	} {
+		if err := s.ensureColumn(ctx, "rooms", column, definition); err != nil {
+			return err
+		}
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE rooms SET red_packet_count = (
+			SELECT COUNT(*) FROM red_packet_events WHERE red_packet_events.web_rid = rooms.web_rid
+		), metrics_version = 1`); err != nil {
+		return fmt.Errorf("回填中心库直播间统计失败: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT OR IGNORE INTO room_live_sessions(web_rid, session_key, first_seen_at)
+		SELECT web_rid, 'started:' || live_started_at, COALESCE(NULLIF(last_seen_live_at, ''), updated_at)
+		FROM rooms WHERE live_status = 'live' AND live_started_at <> ''`); err != nil {
+		return fmt.Errorf("回填中心库开播场次失败: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		UPDATE rooms SET live_session_count = MAX(live_session_count, (
+			SELECT COUNT(*) FROM room_live_sessions WHERE room_live_sessions.web_rid = rooms.web_rid
+		))`); err != nil {
+		return fmt.Errorf("回填中心库开播次数失败: %w", err)
+	}
+	if err := s.backfillChanges(ctx); err != nil {
+		return err
+	}
+	return s.refreshRoomMetricChanges(ctx)
 }
 
 func (s *Store) ensureColumn(ctx context.Context, table, column, definition string) error {
@@ -298,7 +341,7 @@ func (s *Store) ApplyBatch(ctx context.Context, clientID string, req syncprotoco
 			if err != nil {
 				return syncprotocol.BatchResponse{}, err
 			}
-			if err := appendChangeTx(ctx, tx, syncprotocol.ItemRoomState, canonical.WebRID, clientID, canonical.UpdatedAt, canonical); err != nil {
+			if err := appendChangeTx(ctx, tx, syncprotocol.ItemRoomState, canonical.WebRID, centerServerOriginClientID, canonical.UpdatedAt, canonical); err != nil {
 				return syncprotocol.BatchResponse{}, err
 			}
 		case syncprotocol.ItemRedPacket:
@@ -318,6 +361,14 @@ func (s *Store) ApplyBatch(ctx context.Context, clientID string, req syncprotoco
 				return syncprotocol.BatchResponse{}, err
 			}
 			if err := appendChangeTx(ctx, tx, syncprotocol.ItemRedPacket, canonical.WebRID+"\x00"+canonical.PacketID, clientID, s.now().UTC().Format(time.RFC3339Nano), canonical); err != nil {
+				return syncprotocol.BatchResponse{}, err
+			}
+			room, err := readRoomTx(ctx, tx, canonical.WebRID)
+			if err == nil {
+				if err := appendChangeTx(ctx, tx, syncprotocol.ItemRoomState, room.WebRID, centerServerOriginClientID, s.now().UTC().Format(time.RFC3339Nano), room); err != nil {
+					return syncprotocol.BatchResponse{}, err
+				}
+			} else if !errors.Is(err, sql.ErrNoRows) {
 				return syncprotocol.BatchResponse{}, err
 			}
 		}
@@ -347,9 +398,18 @@ func upsertRoom(ctx context.Context, tx *sql.Tx, clientID string, room syncproto
 	if err != nil || excluded {
 		return false, err
 	}
+	var priorLiveStatus, priorLiveStartedAt, priorUpdatedAt string
+	var priorLiveSessionCount int
+	priorErr := tx.QueryRowContext(ctx, `SELECT live_status, live_started_at, live_session_count, updated_at FROM rooms WHERE web_rid = ?`, room.WebRID).
+		Scan(&priorLiveStatus, &priorLiveStartedAt, &priorLiveSessionCount, &priorUpdatedAt)
+	if priorErr != nil && !errors.Is(priorErr, sql.ErrNoRows) {
+		return false, priorErr
+	}
+	stateAccepted := errors.Is(priorErr, sql.ErrNoRows) || room.UpdatedAt >= priorUpdatedAt
+	seedLiveSessionCount := max(0, room.LiveSessionCount)
 	_, err = tx.ExecContext(ctx, `
-		INSERT INTO rooms(web_rid, actual_room_id, title, streamer_name, monitor_status, connection_status, live_status, live_status_source, live_started_at, last_seen_live_at, last_checked_at, last_red_packet_checked_at, last_event_at, updated_at, last_client_id)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO rooms(web_rid, actual_room_id, title, streamer_name, monitor_status, connection_status, live_status, live_status_source, live_started_at, last_seen_live_at, last_checked_at, last_red_packet_checked_at, last_event_at, metrics_version, live_session_count, red_packet_count, updated_at, last_client_id)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, (SELECT COUNT(*) FROM red_packet_events WHERE web_rid = ?), ?, ?)
 		ON CONFLICT(web_rid) DO UPDATE SET
 			actual_room_id=COALESCE(NULLIF(excluded.actual_room_id, ''), rooms.actual_room_id),
 			title=COALESCE(NULLIF(excluded.title, ''), rooms.title),
@@ -363,11 +423,37 @@ func upsertRoom(ctx context.Context, tx *sql.Tx, clientID string, room syncproto
 			last_checked_at=COALESCE(NULLIF(excluded.last_checked_at, ''), rooms.last_checked_at),
 			last_red_packet_checked_at=COALESCE(NULLIF(excluded.last_red_packet_checked_at, ''), rooms.last_red_packet_checked_at),
 			last_event_at=COALESCE(NULLIF(excluded.last_event_at, ''), rooms.last_event_at),
+			metrics_version=1,
+			live_session_count=MAX(rooms.live_session_count, excluded.live_session_count),
+			red_packet_count=MAX(rooms.red_packet_count, excluded.red_packet_count),
 			updated_at=excluded.updated_at,
 			last_client_id=excluded.last_client_id
 		WHERE excluded.updated_at >= rooms.updated_at`,
-		room.WebRID, safeText(room.ActualRoomID, 64), safeText(room.Title, 500), safeText(room.StreamerName, 200), safeText(room.MonitorStatus, 40), safeText(room.ConnectionStatus, 40), safeText(room.LiveStatus, 40), safeText(room.LiveStatusSource, 80), room.LiveStartedAt, room.LastSeenLiveAt, room.LastCheckedAt, room.LastRedPacketCheckedAt, room.LastEventAt, room.UpdatedAt, clientID)
-	return err == nil, err
+		room.WebRID, safeText(room.ActualRoomID, 64), safeText(room.Title, 500), safeText(room.StreamerName, 200), safeText(room.MonitorStatus, 40), safeText(room.ConnectionStatus, 40), safeText(room.LiveStatus, 40), safeText(room.LiveStatusSource, 80), room.LiveStartedAt, room.LastSeenLiveAt, room.LastCheckedAt, room.LastRedPacketCheckedAt, room.LastEventAt, seedLiveSessionCount, room.WebRID, room.UpdatedAt, clientID)
+	if err != nil || !stateAccepted || strings.ToLower(strings.TrimSpace(room.LiveStatus)) != "live" {
+		return err == nil, err
+	}
+	newSession := false
+	startedAt := strings.TrimSpace(room.LiveStartedAt)
+	if startedAt != "" {
+		result, insertErr := tx.ExecContext(ctx, `INSERT OR IGNORE INTO room_live_sessions(web_rid, session_key, first_seen_at) VALUES(?, ?, ?)`, room.WebRID, "started:"+startedAt, room.UpdatedAt)
+		if insertErr != nil {
+			return false, insertErr
+		}
+		inserted, insertErr := result.RowsAffected()
+		if insertErr != nil {
+			return false, insertErr
+		}
+		newSession = inserted > 0 && (priorLiveStatus != "live" || priorLiveStartedAt != startedAt || priorLiveSessionCount == 0)
+	} else {
+		newSession = priorLiveStatus != "live"
+	}
+	if newSession && seedLiveSessionCount <= priorLiveSessionCount {
+		if _, err := tx.ExecContext(ctx, `UPDATE rooms SET live_session_count = ? WHERE web_rid = ?`, priorLiveSessionCount+1, room.WebRID); err != nil {
+			return false, err
+		}
+	}
+	return true, nil
 }
 
 func appendChangeTx(ctx context.Context, tx *sql.Tx, itemType syncprotocol.ItemType, entityKey, clientID, changedAt string, payload any) error {
@@ -399,11 +485,12 @@ func readRoomTx(ctx context.Context, tx *sql.Tx, webRID string) (syncprotocol.Ro
 	err := tx.QueryRowContext(ctx, `
 		SELECT web_rid, actual_room_id, title, streamer_name, monitor_status, connection_status,
 			live_status, live_status_source, live_started_at, last_seen_live_at, last_checked_at,
-			last_red_packet_checked_at, last_event_at, updated_at
+			last_red_packet_checked_at, last_event_at, metrics_version, live_session_count, red_packet_count, updated_at
 		FROM rooms WHERE web_rid = ?`, strings.TrimSpace(webRID)).Scan(
 		&room.WebRID, &room.ActualRoomID, &room.Title, &room.StreamerName, &room.MonitorStatus,
 		&room.ConnectionStatus, &room.LiveStatus, &room.LiveStatusSource, &room.LiveStartedAt,
-		&room.LastSeenLiveAt, &room.LastCheckedAt, &room.LastRedPacketCheckedAt, &room.LastEventAt, &room.UpdatedAt,
+		&room.LastSeenLiveAt, &room.LastCheckedAt, &room.LastRedPacketCheckedAt, &room.LastEventAt,
+		&room.MetricsVersion, &room.LiveSessionCount, &room.RedPacketCount, &room.UpdatedAt,
 	)
 	return room, err
 }
@@ -463,7 +550,17 @@ func upsertRedPacket(ctx context.Context, tx *sql.Tx, clientID string, packet sy
 		safeNumericText(packet.ActualRoomID, 32), safeNumericText(packet.JoinBoxID, 32), safeNumericText(packet.AnchorID, 32),
 		safeNumericText(packet.BoxType, 16), safeNumericText(packet.SendTime, 32), safeNumericText(packet.DelayTime, 32),
 		safeText(packet.RoomName, 500), safeText(packet.StreamerName, 200), safeText(packet.Title, 500), safeText(packet.Prize, 500), safeText(packet.Source, 80), packet.DetectedAt, packet.DrawAt, packet.ExpiresAt, packet.ParticipantCount, packet.TotalDiamonds, packet.ShareCount, seenAt, clientID)
-	return err == nil, err
+	if err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE rooms SET metrics_version = 1,
+			red_packet_count = (SELECT COUNT(*) FROM red_packet_events WHERE red_packet_events.web_rid = rooms.web_rid),
+			last_event_at = CASE WHEN last_event_at = '' OR last_event_at < ? THEN ? ELSE last_event_at END
+		WHERE web_rid = ?`, packet.DetectedAt, packet.DetectedAt, packet.WebRID); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func centerRoomExcludedTx(ctx context.Context, tx *sql.Tx, webRID, actualRoomID string) (bool, error) {
@@ -646,7 +743,8 @@ func (s *Store) backfillChanges(ctx context.Context) error {
 	roomRows, err := s.db.QueryContext(ctx, `
 		SELECT web_rid, actual_room_id, title, streamer_name, monitor_status, connection_status,
 			live_status, live_status_source, live_started_at, last_seen_live_at, last_checked_at,
-			last_red_packet_checked_at, last_event_at, updated_at, last_client_id FROM rooms ORDER BY web_rid`)
+			last_red_packet_checked_at, last_event_at, metrics_version, live_session_count, red_packet_count,
+			updated_at, last_client_id FROM rooms ORDER BY web_rid`)
 	if err != nil {
 		return err
 	}
@@ -655,11 +753,12 @@ func (s *Store) backfillChanges(ctx context.Context) error {
 		var clientID string
 		if err := roomRows.Scan(&room.WebRID, &room.ActualRoomID, &room.Title, &room.StreamerName, &room.MonitorStatus,
 			&room.ConnectionStatus, &room.LiveStatus, &room.LiveStatusSource, &room.LiveStartedAt, &room.LastSeenLiveAt,
-			&room.LastCheckedAt, &room.LastRedPacketCheckedAt, &room.LastEventAt, &room.UpdatedAt, &clientID); err != nil {
+			&room.LastCheckedAt, &room.LastRedPacketCheckedAt, &room.LastEventAt, &room.MetricsVersion,
+			&room.LiveSessionCount, &room.RedPacketCount, &room.UpdatedAt, &clientID); err != nil {
 			roomRows.Close()
 			return err
 		}
-		seeds = append(seeds, seed{itemType: syncprotocol.ItemRoomState, entityKey: room.WebRID, clientID: clientID, at: room.UpdatedAt, payload: room})
+		seeds = append(seeds, seed{itemType: syncprotocol.ItemRoomState, entityKey: room.WebRID, clientID: centerServerOriginClientID, at: room.UpdatedAt, payload: room})
 	}
 	if err := roomRows.Close(); err != nil {
 		return err
@@ -694,6 +793,53 @@ func (s *Store) backfillChanges(ctx context.Context) error {
 	defer tx.Rollback()
 	for _, item := range seeds {
 		if err := appendChangeTx(ctx, tx, item.itemType, item.entityKey, item.clientID, item.at, item.payload); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// refreshRoomMetricChanges republishes canonical room payloads after schema
+// upgrades and aggregate changes. appendChangeTx is content-aware, so normal
+// restarts do not advance cursors unless the safe room payload actually
+// changed.
+func (s *Store) refreshRoomMetricChanges(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT web_rid, actual_room_id, title, streamer_name, monitor_status, connection_status,
+			live_status, live_status_source, live_started_at, last_seen_live_at, last_checked_at,
+			last_red_packet_checked_at, last_event_at, metrics_version, live_session_count, red_packet_count,
+			updated_at, last_client_id FROM rooms ORDER BY web_rid`)
+	if err != nil {
+		return err
+	}
+	type roomChange struct {
+		room     syncprotocol.RoomState
+		clientID string
+	}
+	changes := make([]roomChange, 0)
+	for rows.Next() {
+		var change roomChange
+		room := &change.room
+		if err := rows.Scan(&room.WebRID, &room.ActualRoomID, &room.Title, &room.StreamerName, &room.MonitorStatus,
+			&room.ConnectionStatus, &room.LiveStatus, &room.LiveStatusSource, &room.LiveStartedAt, &room.LastSeenLiveAt,
+			&room.LastCheckedAt, &room.LastRedPacketCheckedAt, &room.LastEventAt, &room.MetricsVersion,
+			&room.LiveSessionCount, &room.RedPacketCount, &room.UpdatedAt, &change.clientID); err != nil {
+			rows.Close()
+			return err
+		}
+		changes = append(changes, change)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	changedAt := s.now().UTC().Format(time.RFC3339Nano)
+	for _, change := range changes {
+		if err := appendChangeTx(ctx, tx, syncprotocol.ItemRoomState, change.room.WebRID, centerServerOriginClientID, changedAt, change.room); err != nil {
 			return err
 		}
 	}
