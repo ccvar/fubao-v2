@@ -172,6 +172,42 @@ fn wait_for_engine_exit(handle_value: usize) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn stop_stale_engine_processes() -> Result<(), String> {
+    use std::{os::windows::process::CommandExt, process::Command, thread, time::Duration};
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const ENGINE_IMAGE: &str = "fubao-engine.exe";
+
+    // A previous client can have left its sidecar alive after a tray restart
+    // or an interrupted update. The updater only knows about the current
+    // Tauri child handle, so explicitly terminate any stale copy of our
+    // uniquely-named bundled sidecar before NSIS tries to replace it.
+    let _ = Command::new("taskkill")
+        .args(["/F", "/T", "/IM", ENGINE_IMAGE])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|error| format!("清理旧 Go 引擎失败：{error}"))?;
+
+    for _ in 0..100 {
+        let output = Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq fubao-engine.exe", "/FO", "CSV", "/NH"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|error| format!("检查 Go 引擎残留失败：{error}"))?;
+        let listing = String::from_utf8_lossy(&output.stdout);
+        if !listing
+            .lines()
+            .any(|line| line.to_ascii_lowercase().contains(ENGINE_IMAGE))
+        {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    Err("仍有旧 Go 引擎进程占用更新文件，请关闭其他福宝客户端后重试".into())
+}
+
 #[tauri::command]
 async fn prepare_app_update(runtime: tauri::State<'_, Arc<EngineRuntime>>) -> Result<(), String> {
     let child = runtime.child.lock().map_err(|_| "引擎状态锁不可用")?.take();
@@ -192,6 +228,9 @@ async fn prepare_app_update(runtime: tauri::State<'_, Arc<EngineRuntime>>) -> Re
         #[cfg(not(windows))]
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+
+    #[cfg(windows)]
+    stop_stale_engine_processes()?;
 
     runtime.online.store(false, Ordering::SeqCst);
     if let Ok(mut pending) = runtime.pending.lock() {
