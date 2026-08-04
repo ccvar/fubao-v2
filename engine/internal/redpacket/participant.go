@@ -178,6 +178,7 @@ type Participant struct {
 
 	mu        sync.Mutex
 	attempted map[string]struct{}
+	delayed   map[string]struct{}
 	accounts  map[string]*sync.Mutex
 	resolving map[string]struct{}
 }
@@ -225,6 +226,7 @@ func newParticipant(store ParticipationStore, concurrency int, factory participa
 		retryDelay:          250 * time.Millisecond,
 		followPriorityDelay: 2 * time.Second,
 		attempted:           map[string]struct{}{},
+		delayed:             map[string]struct{}{},
 		accounts:            map[string]*sync.Mutex{},
 		resolving:           map[string]struct{}{},
 	}
@@ -301,8 +303,41 @@ func followDecisionAllows(decision participationFollowDecision) bool {
 
 func (p *Participant) scheduleDispatch(event Event, credential accounts.RedPacketParticipationCredential, allowPriorityDelay bool) {
 	settings := p.settingsForAccount(credential.AccountID)
-	if !eventParticipationOpenAt(event, settings, time.Now()) ||
-		!p.matchesPacketType(event, credential.AccountID) || !p.meetsMinimumDiamonds(event, credential.AccountID) {
+	if !p.matchesPacketType(event, credential.AccountID) || !p.meetsMinimumDiamonds(event, credential.AccountID) {
+		return
+	}
+	now := time.Now()
+	if !eventParticipationOpenAt(event, settings, now) {
+		// A non-zero countdown is a final-seconds admission window, not a
+		// minimum-validity requirement. If the event is still too early, defer
+		// this account/event pair until the window opens instead of dropping the
+		// one-shot discovery callback forever.
+		if deadline, ok := eventDeadline(event); ok {
+			window := time.Duration(settings.ParticipationCountdownSeconds) * time.Second
+			if window > 0 {
+				wait := deadline.Sub(now) - window
+				if wait > 0 {
+					key := credential.AccountID + "\x00" + event.ID
+					p.mu.Lock()
+					_, alreadyDelayed := p.delayed[key]
+					if !alreadyDelayed {
+						p.delayed[key] = struct{}{}
+					}
+					p.mu.Unlock()
+					if alreadyDelayed {
+						return
+					}
+					time.AfterFunc(wait, func() {
+						p.mu.Lock()
+						delete(p.delayed, key)
+						p.mu.Unlock()
+						if eventOpenAt(event, time.Now()) {
+							p.scheduleDispatch(event, credential, false)
+						}
+					})
+				}
+			}
+		}
 		return
 	}
 	decision := p.followDecision(event, credential.AccountID)
@@ -334,9 +369,11 @@ func eventOpenAt(event Event, now time.Time) bool {
 
 // eventParticipationOpenAt applies the account/task snapshot immediately
 // before dispatch. The packet must still be open and, unless the user chose
-// zero, retain at least the configured number of seconds in its validity
-// countdown. This is deliberately native-side eligibility rather than a UI
-// filter, so a late callback can never issue a join after the threshold.
+// zero, be inside the configured final-countdown window. For example, a value
+// of 2 means that the account is admitted only while two seconds (or less)
+// remain before the packet deadline. This is deliberately native-side
+// eligibility rather than a UI filter, so a late callback can never issue a
+// join outside the user's countdown rule.
 func eventParticipationOpenAt(event Event, settings ParticipationSettings, now time.Time) bool {
 	deadline, ok := eventDeadline(event)
 	if !ok {
@@ -347,7 +384,7 @@ func eventParticipationOpenAt(event Event, settings ParticipationSettings, now t
 		return false
 	}
 	minimum := time.Duration(settings.ParticipationCountdownSeconds) * time.Second
-	return minimum <= 0 || remaining >= minimum
+	return minimum <= 0 || remaining <= minimum
 }
 
 func eventDeadline(event Event) (time.Time, bool) {
@@ -620,7 +657,7 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 	if scoped, ok := p.recordStore.(participationAccountSettingsStore); ok {
 		settings = scoped.ParticipationSettingsForEvent(event.ID, accountID)
 	}
-	queryAt := drawQueryStart(event, settings.DrawResultDelaySeconds)
+	queryAt := drawQueryStart(settings.DrawResultDelaySeconds)
 	if delay := time.Until(queryAt); delay > 0 {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
@@ -863,18 +900,19 @@ func followDecisionRank(decision participationFollowDecision) int {
 	return 2
 }
 
-func drawQueryStart(event Event, delaySeconds int) time.Time {
+func drawQueryStart(delaySeconds int) time.Time {
 	now := time.Now()
 	delay := time.Duration(delaySeconds) * time.Second
 	if delay < 0 {
 		delay = 0
 	}
-	// DrawAt is the only event timestamp that explicitly denotes the opening
-	// result point. ExpiresAt is the packet validity window and can be a minute
-	// away; using it here was the source of long-lived “等待开奖” rows.
-	if parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(event.DrawAt)); err == nil && parsed.After(now) {
-		return parsed.Add(delay)
-	}
+	// Result polling is relative to the accepted join, not to a packet payload
+	// timestamp. DrawAt/ExpiresAt are server-side event metadata and may refer
+	// to the packet's validity window (or be delayed/stale); waiting for either
+	// one can leave a joined record stuck at “等待开奖” for a full minute. The
+	// caller invokes this immediately after the native join, so the configured
+	// delay is the only intentional wait. On restart ResolvePendingDraws also
+	// uses the same bounded delay before resuming the native receive query.
 	return now.Add(delay)
 }
 

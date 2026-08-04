@@ -58,6 +58,7 @@
   type ParticipationGroupFilter = "all" | "ungrouped" | string;
   type RoomSortMode = "default" | "instance-first" | "live-first" | "recent-live" | "recent-redpacket";
   type RoomSourceFilter = "all" | "following" | "imported" | "center";
+  type RedPacketSourceSortMode = "default" | "following" | "imported" | "center";
   type MonitoringAccountSortMode = "default" | "total-requests" | "today-requests" | "last-request" | "created-at";
   type ParticipationAccountSortMode = "default" | "available-first" | "join-count" | "win-count" | "created-at";
   type AccountSortMode = MonitoringAccountSortMode | ParticipationAccountSortMode;
@@ -771,6 +772,8 @@
   let participationRecordRenderLimit = 300;
   let redPacketClock = Date.now();
   let redPacketHistoryVisible = false;
+  let redPacketSourceSortMode: RedPacketSourceSortMode = "default";
+  let redPacketSourceSortMenuOpen = false;
   let roomSortMode: RoomSortMode = "default";
   let roomSortMenuOpen = false;
   let roomSourceFilter: RoomSourceFilter = "all";
@@ -953,13 +956,24 @@
 	$: scopedRedPacketEvents = redPacketEvents.filter((event) => redPacketHistoryVisible
 		? !redPacketEventInLibraryWindow(event, redPacketClock)
 		: redPacketEventInLibraryWindow(event, redPacketClock));
-  $: filteredRedPacketEvents = scopedRedPacketEvents.filter((event) => {
+  $: filteredRedPacketEvents = (() => {
     const needle = query.trim().toLowerCase();
-    if (!needle) return true;
-    return [event.title, event.prize, event.room_name, event.streamer_name, event.web_rid, event.room_id]
-      .filter(Boolean)
-      .some((value) => String(value).toLowerCase().includes(needle));
-  });
+    const filtered = scopedRedPacketEvents.filter((event) => {
+      if (!needle) return true;
+      return [event.title, event.prize, event.room_name, event.streamer_name, event.web_rid, event.room_id]
+        .filter(Boolean)
+        .some((value) => String(value).toLowerCase().includes(needle));
+    });
+    if (redPacketSourceSortMode === "default") return filtered;
+    return filtered
+      .map((event, index) => ({ event, index }))
+      .sort((left, right) => {
+        const leftPriority = redPacketEventSource(left.event, rooms) === redPacketSourceSortMode ? 0 : 1;
+        const rightPriority = redPacketEventSource(right.event, rooms) === redPacketSourceSortMode ? 0 : 1;
+        return leftPriority - rightPriority || left.index - right.index;
+      })
+      .map(({ event }) => event);
+  })();
   $: visibleRedPacketEvents = filteredRedPacketEvents.slice(0, redPacketRenderLimit);
   $: filteredParticipationRecords = participationRecords.filter((record) => {
     const needle = query.trim().toLowerCase();
@@ -2265,6 +2279,57 @@
     return `关注来源：${sources.map((source) => source.account_name).join("、")}`;
   }
 
+  function redPacketEventSource(event: RedPacketEvent, roomItems: RoomItem[] = rooms): Exclude<RedPacketSourceSortMode, "default"> | "crawl" {
+    const explicitSource = String((event as RedPacketEvent & { room_source?: string; source_type?: string }).room_source
+      || (event as RedPacketEvent & { source_type?: string }).source_type
+      || event.data_source
+      || "").trim().toLowerCase();
+    if (explicitSource.includes("center") || explicitSource.includes("中心库")) return "center";
+    if (explicitSource.includes("follow") || explicitSource.includes("关注")) return "following";
+    if (explicitSource.includes("import") || explicitSource.includes("manual") || explicitSource.includes("legacy")
+      || explicitSource.includes("dy-kiro") || explicitSource.includes("导入")) return "imported";
+
+    const identifiers = new Set([event.room_id, event.web_rid].filter(Boolean).map((value) => String(value)));
+    const room = roomItems.find((item) => identifiers.has(item.id) || identifiers.has(item.web_rid || "") || identifiers.has(item.actual_room_id || ""));
+    if (!room) return "crawl";
+    if (room.source === "center") return "center";
+    if (roomFollowSources(room).length > 0 || room.source === "following-live") return "following";
+    if (["manual", "imported", "dy-kiro", "legacy"].includes((room.source || "").toLowerCase())) return "imported";
+    return "crawl";
+  }
+
+  function redPacketSourceSortModeLabel(mode: RedPacketSourceSortMode) {
+    if (mode === "following") return "关注列表优先";
+    if (mode === "imported") return "导入优先";
+    if (mode === "center") return "中心库优先";
+    return "默认排序";
+  }
+
+  function redPacketSourceSortOptions(): [RedPacketSourceSortMode, string][] {
+    return [
+      ["default", "默认排序"],
+      ["following", "关注列表优先"],
+      ["imported", "导入优先"],
+      ["center", "中心库优先"],
+    ];
+  }
+
+  function selectRedPacketSourceSortMode(mode: RedPacketSourceSortMode) {
+    redPacketSourceSortMode = mode;
+    redPacketSourceSortMenuOpen = false;
+  }
+
+  function toggleRedPacketSourceSortMenu() {
+    redPacketSourceSortMenuOpen = !redPacketSourceSortMenuOpen;
+    roomSortMenuOpen = false;
+    roomSourceMenuOpen = false;
+    roomCleanupMenuOpen = false;
+    statusMenuOpen = false;
+    importMenuOpen = false;
+    accountSortMenuOpen = false;
+    participationGroupMenuOpen = false;
+  }
+
   async function openRoomLiveRoom(room: RoomItem, monitor?: RedPacketMonitor) {
     await openLiveRoomByWebRID(roomOpenWebRID(room, monitor));
   }
@@ -3053,6 +3118,7 @@
     accountSortMenuOpen = false;
     roomSortMenuOpen = false;
     roomSourceMenuOpen = false;
+    redPacketSourceSortMenuOpen = false;
     statusMenuOpen = false;
     participationGroupMenuOpen = false;
     accountGroupMenuId = "";
@@ -3250,6 +3316,7 @@
     importGroupMenuOpen = false;
     statusMenuOpen = false;
     accountSortMenuOpen = false;
+	redPacketSourceSortMenuOpen = false;
 	participationGroupMenuOpen = false;
 	void closeParticipationTaskMenu();
   }
@@ -3259,6 +3326,7 @@
     importMenuOpen = false;
     accountSortMenuOpen = false;
 	roomSourceMenuOpen = false;
+	redPacketSourceSortMenuOpen = false;
 	participationGroupMenuOpen = false;
 	void closeParticipationTaskMenu();
   }
@@ -3275,6 +3343,7 @@
       roomSortMenuOpen = false;
       roomSourceMenuOpen = false;
       roomCleanupMenuOpen = false;
+      redPacketSourceSortMenuOpen = false;
       accountSortMenuOpen = false;
 	  participationGroupMenuOpen = false;
 	  accountGroupMenuId = "";
@@ -3296,6 +3365,7 @@
     statusMenuOpen = false;
     importMenuOpen = false;
     accountSortMenuOpen = false;
+    redPacketSourceSortMenuOpen = false;
   }
 
   async function executeRoomCleanup() {
@@ -3442,6 +3512,7 @@
     roomSourceMenuOpen = false;
     statusMenuOpen = false;
     importMenuOpen = false;
+	redPacketSourceSortMenuOpen = false;
   }
 
   function roomSortModeLabel(mode: RoomSortMode) {
@@ -3463,6 +3534,7 @@
     statusMenuOpen = false;
     importMenuOpen = false;
     accountSortMenuOpen = false;
+    redPacketSourceSortMenuOpen = false;
   }
 
   function permanentCenterRoomAccess() {
@@ -3515,6 +3587,7 @@
     statusMenuOpen = false;
     importMenuOpen = false;
     accountSortMenuOpen = false;
+    redPacketSourceSortMenuOpen = false;
   }
 
   async function pasteAccountCookie() {
@@ -6343,7 +6416,38 @@
             {:else}
               <div class="red-packet-event-list">
                 <div class="red-packet-event-head">
-				  <span>红包</span><span>直播间 / 监测账号</span><span>奖品与时效</span><span>发现时间</span><span>参与人数</span>
+                  <span>红包</span>
+                  <span class="red-packet-event-source-head menu-anchor">
+                    <span>直播间 / 监测账号</span>
+                    <button
+                      type="button"
+                      class:active={redPacketSourceSortMode !== "default"}
+                      class="room-live-sort-button"
+                      aria-label={`红包来源排序：${redPacketSourceSortModeLabel(redPacketSourceSortMode)}`}
+                      aria-haspopup="menu"
+                      aria-expanded={redPacketSourceSortMenuOpen}
+                      data-tooltip={redPacketSourceSortMenuOpen ? undefined : redPacketSourceSortModeLabel(redPacketSourceSortMode)}
+                      data-tooltip-placement="bottom"
+                      onclick={toggleRedPacketSourceSortMenu}
+                    ><ArrowsDownUp size={11} weight="bold" /></button>
+                    {#if redPacketSourceSortMenuOpen}
+                      <div class="floating-menu room-sort-menu red-packet-source-sort-menu" role="menu" aria-label="红包来源排序">
+                        {#each redPacketSourceSortOptions() as option}
+                          <button
+                            type="button"
+                            class:active={redPacketSourceSortMode === option[0]}
+                            role="menuitemradio"
+                            aria-checked={redPacketSourceSortMode === option[0]}
+                            onclick={() => selectRedPacketSourceSortMode(option[0])}
+                          >
+                            <span>{option[1]}</span>
+                            {#if redPacketSourceSortMode === option[0]}<CheckCircle size={13} weight="fill" />{/if}
+                          </button>
+                        {/each}
+                      </div>
+                    {/if}
+                  </span>
+                  <span>奖品与时效</span><span>发现时间</span><span>参与人数</span>
                 </div>
                 {#each visibleRedPacketEvents as event}
                   {@const expiry = redPacketEventExpiryParts(event, redPacketClock)}
@@ -7021,7 +7125,7 @@
             <span class="number-field"><input type="number" min="1" max="1000000" step="1" bind:value={participationSettings.minimum_diamonds} /><em>钻</em></span>
           </label>
           <label class="participation-setting-row">
-            <span><strong>参与倒计时</strong><small>红包有效期剩余少于该秒数时不参与；填 0 表示不限制，但已过期红包仍不会参与</small></span>
+            <span><strong>参与倒计时</strong><small>仅在红包有效期剩余不超过该秒数时参与；填 0 表示不限制，但已过期红包仍不会参与</small></span>
             <span class="number-field"><input type="number" min="0" max="300" step="1" bind:value={participationSettings.participation_countdown_seconds} /><em>秒</em></span>
           </label>
           <label class="participation-setting-row">
@@ -7037,7 +7141,7 @@
             <span class="number-field"><input type="number" min="0" max="100000" step="1" bind:value={participationSettings.stop_after_wins} /><em>次</em></span>
           </label>
           <label class="participation-setting-row">
-            <span><strong>开奖后查询</strong><small>开奖后等待指定秒数再查询开奖结果；填 0 表示立即查询</small></span>
+            <span><strong>开奖后查询</strong><small>参与请求受理后等待指定秒数再查询开奖结果；填 0 表示立即查询</small></span>
             <span class="number-field"><input type="number" min="0" max="60" step="1" bind:value={participationSettings.draw_result_delay_seconds} /><em>秒</em></span>
           </label>
           <label class="participation-setting-row">

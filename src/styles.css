@@ -3299,6 +3299,20 @@ label.browser-column-control[data-tooltip]:focus-within {
   letter-spacing: 0;
 }
 
+.red-packet-event-source-head {
+  position: relative;
+  display: inline-flex;
+  width: max-content;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.red-packet-source-sort-menu {
+  z-index: 70;
+  min-width: 116px;
+}
+
 .room-sort-menu button,
 .account-sort-menu button {
   min-height: 25px;

@@ -318,8 +318,8 @@ func TestParticipantMinimumDiamondsOnlyBlocksKnownBelowThreshold(t *testing.T) {
 	}
 }
 
-func TestParticipantCountdownRequiresMinimumRemainingValidity(t *testing.T) {
-	t.Run("default ten seconds blocks late packet", func(t *testing.T) {
+func TestParticipantCountdownUsesFinalSecondsWindow(t *testing.T) {
+	t.Run("default ten seconds admits only late packet", func(t *testing.T) {
 		recordStore, err := NewStore(t.TempDir())
 		if err != nil {
 			t.Fatal(err)
@@ -340,8 +340,90 @@ func TestParticipantCountdownRequiresMinimumRemainingValidity(t *testing.T) {
 		poster.mu.Lock()
 		calls := poster.calls
 		poster.mu.Unlock()
-		if calls != 0 {
-			t.Fatalf("packet with less than the default ten seconds remaining was sent: %d", calls)
+		if calls != 1 {
+			t.Fatalf("packet inside the default ten-second final window was not sent: %d", calls)
+		}
+	})
+
+	t.Run("two seconds blocks an early packet and admits a late packet", func(t *testing.T) {
+		recordStore, err := NewStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := recordStore.SetParticipationSettings(ParticipationSettings{ParticipationCountdownSeconds: 2}); err != nil {
+			t.Fatal(err)
+		}
+		if err := recordStore.RecordParticipationStarted("countdown-two", "两秒账号"); err != nil {
+			t.Fatal(err)
+		}
+		store := &fakeParticipationStore{
+			credentials: []accounts.RedPacketParticipationCredential{{AccountID: "countdown-two", Cookie: "sessionid_ss=ok"}},
+			notify:      make(chan struct{}, 2),
+		}
+		poster := &fakePoster{responses: []*http.Response{
+			jsonResponse(200, `{"status_code":0,"data":{"succeed":true}}`),
+			jsonResponse(200, `{"status_code":0,"data":{"succeed":true}}`),
+		}}
+		participant := newParticipant(store, 1, func(Event, accounts.RedPacketParticipationCredential) signedPoster { return poster }, recordStore)
+		participant.HandleEvent(Event{
+			ID: "countdown-two-early", PacketID: "countdown-two-early", JoinBoxID: "countdown-two-early", ActualRoomID: "7001",
+			Title: "钻石红包", ExpiresAt: time.Now().Add(4 * time.Second).Format(time.RFC3339Nano),
+		})
+		time.Sleep(30 * time.Millisecond)
+		poster.mu.Lock()
+		earlyCalls := poster.calls
+		poster.mu.Unlock()
+		if earlyCalls != 0 {
+			t.Fatalf("packet with more than two seconds remaining was sent: %d", earlyCalls)
+		}
+		participant.HandleEvent(Event{
+			ID: "countdown-two-late", PacketID: "countdown-two-late", JoinBoxID: "countdown-two-late", ActualRoomID: "7001",
+			Title: "钻石红包", ExpiresAt: time.Now().Add(1500 * time.Millisecond).Format(time.RFC3339Nano),
+		})
+		select {
+		case <-store.notify:
+		case <-time.After(time.Second):
+			t.Fatal("packet inside the two-second final window was not sent")
+		}
+		poster.mu.Lock()
+		defer poster.mu.Unlock()
+		if poster.calls != 1 {
+			t.Fatalf("expected only the late packet to be sent, calls=%d", poster.calls)
+		}
+	})
+
+	t.Run("early discovery is deferred into the final window", func(t *testing.T) {
+		recordStore, err := NewStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := recordStore.SetParticipationSettings(ParticipationSettings{ParticipationCountdownSeconds: 1}); err != nil {
+			t.Fatal(err)
+		}
+		if err := recordStore.RecordParticipationStarted("countdown-deferred", "延迟账号"); err != nil {
+			t.Fatal(err)
+		}
+		store := &fakeParticipationStore{
+			credentials: []accounts.RedPacketParticipationCredential{{AccountID: "countdown-deferred", Cookie: "sessionid_ss=ok"}},
+			notify:      make(chan struct{}, 1),
+		}
+		poster := &fakePoster{responses: []*http.Response{jsonResponse(200, `{"status_code":0,"data":{"succeed":true}}`)}}
+		participant := newParticipant(store, 1, func(Event, accounts.RedPacketParticipationCredential) signedPoster { return poster }, recordStore)
+		participant.HandleEvent(Event{
+			ID: "countdown-deferred-event", PacketID: "countdown-deferred-event", JoinBoxID: "countdown-deferred-event", ActualRoomID: "7001",
+			Title: "钻石红包", ExpiresAt: time.Now().Add(1200 * time.Millisecond).Format(time.RFC3339Nano),
+		})
+		time.Sleep(50 * time.Millisecond)
+		poster.mu.Lock()
+		initialCalls := poster.calls
+		poster.mu.Unlock()
+		if initialCalls != 0 {
+			t.Fatalf("early packet was sent before the final window: %d", initialCalls)
+		}
+		select {
+		case <-store.notify:
+		case <-time.After(2 * time.Second):
+			t.Fatal("deferred packet was not sent when the final window opened")
 		}
 	})
 
@@ -1037,6 +1119,7 @@ func TestDrawQueryDoesNotWaitForPacketExpiry(t *testing.T) {
 	event := Event{
 		ID: "event-query-now", WebRID: "123456", ActualRoomID: "700001", JoinBoxID: "7669063194534955828",
 		ExpiresAt: time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+		DrawAt:    time.Now().Add(time.Minute).Format(time.RFC3339Nano),
 	}
 	if reserved, err := recordStore.ReserveParticipation(event, "account-query-now", "查询账号"); err != nil || !reserved {
 		t.Fatalf("reserve: %v %v", reserved, err)

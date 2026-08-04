@@ -253,9 +253,9 @@ type ParticipationSettings struct {
 	StopAfterJoins  int `json:"stop_after_joins"`
 	CooldownSeconds int `json:"cooldown_seconds"`
 	StopAfterWins   int `json:"stop_after_wins"`
-	// DrawResultDelaySeconds is the native delay after the known draw point
-	// (or after the accepted join when the event has no draw timestamp) before
-	// querying luckybox/receive.
+	// DrawResultDelaySeconds is the native delay after the accepted join before
+	// querying luckybox/receive. Event timestamps are metadata only and must
+	// not make a joined record wait for a later validity-window deadline.
 	DrawResultDelaySeconds int `json:"draw_result_delay_seconds"`
 	// DrawResultMaxAttempts bounds result queries. Once the attempts are
 	// exhausted the wallet-delta fallback runs before an abnormal result is
@@ -264,9 +264,10 @@ type ParticipationSettings struct {
 	// DrawResultTimeoutSeconds is retained only for migration compatibility with
 	// older stores/frontends. New scheduling uses delay + max attempts.
 	DrawResultTimeoutSeconds int `json:"draw_result_timeout_seconds,omitempty"`
-	// ParticipationCountdownSeconds is the minimum amount of validity time
-	// that must remain before a new join can be assigned. Zero disables this
-	// extra gate; an already expired packet is still never eligible.
+	// ParticipationCountdownSeconds is the final validity window in which a
+	// new join can be assigned. For example, 2 admits only when two seconds or
+	// less remain. Zero disables this extra gate; an already expired packet is
+	// still never eligible.
 	ParticipationCountdownSeconds int    `json:"participation_countdown_seconds"`
 	MinimumDiamonds               int    `json:"minimum_diamonds"`
 	PacketType                    string `json:"packet_type"`
