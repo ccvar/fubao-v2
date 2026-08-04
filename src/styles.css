@@ -4381,6 +4381,27 @@ label.browser-column-control[data-tooltip]:focus-within {
   border-radius: 18px;
   background: #fff;
   box-shadow: 0 28px 70px rgb(44 35 25 / 22%);
+  /* Keep dialog scrolling as quiet and compact as the sidebar scrollbar. */
+  scrollbar-color: #c8c3bb transparent;
+  scrollbar-width: thin;
+}
+
+.modal::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+.modal::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.modal::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: #c8c3bb;
+}
+
+.modal::-webkit-scrollbar-thumb:hover {
+  background: #aaa69f;
 }
 
 .instance-modal {
@@ -4402,9 +4423,77 @@ label.browser-column-control[data-tooltip]:focus-within {
 
 .participation-settings-modal {
   width: min(520px, 100%);
+  height: calc(100vh - 44px);
   max-height: calc(100vh - 44px);
   padding: 18px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-sizing: border-box;
+}
+
+.settings-modal-scroll-shell {
+  position: relative;
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: visible;
+}
+
+.settings-modal-scroll {
+  height: 100%;
+  min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+
+.settings-modal-scroll::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
+}
+
+.modal-scrollbar {
+  position: absolute;
+  z-index: 4;
+  top: 0;
+  /* The scroll viewport sits inside the dialog's 18px padding. Keep the
+     invisible hit area and the visible thumb aligned with the dialog edge,
+     like the sidebar scrollbar, instead of leaving an inset rail. */
+  right: -15px;
+  bottom: 0;
+  width: 9px;
+  border-radius: 999px;
+  background: transparent;
+  cursor: pointer;
+  pointer-events: auto;
+}
+
+.modal-scrollbar > span {
+  position: absolute;
+  right: 0;
+  left: 0;
+  min-height: 42px;
+  background: transparent;
+  cursor: grab;
+  touch-action: none;
+}
+
+.modal-scrollbar > span::before {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 5px;
+  width: 3px;
+  border-radius: 999px;
+  background: #c2beb7;
+  content: "";
+  transition: background 120ms ease;
+}
+
+.modal-scrollbar > span:hover::before,
+.modal-scrollbar > span.dragging::before {
+  background: #aaa69f;
 }
 
 .room-recycle-modal {

@@ -28,6 +28,27 @@ type fakeParticipationStore struct {
 	notify      chan struct{}
 }
 
+type fakeWalletParticipationStore struct {
+	*fakeParticipationStore
+	mu       sync.Mutex
+	balances []accounts.RedPacketWalletBalance
+	reads    int
+}
+
+func (s *fakeWalletParticipationStore) RefreshRedPacketWalletBalance(context.Context, string) (accounts.RedPacketWalletBalance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.balances) == 0 {
+		return accounts.RedPacketWalletBalance{}, errors.New("wallet unavailable")
+	}
+	index := s.reads
+	if index >= len(s.balances) {
+		index = len(s.balances) - 1
+	}
+	s.reads++
+	return s.balances[index], nil
+}
+
 type fakeParticipationFollowMatcher struct {
 	known   map[string]bool
 	matches map[string]map[string]bool
@@ -295,6 +316,68 @@ func TestParticipantMinimumDiamondsOnlyBlocksKnownBelowThreshold(t *testing.T) {
 	if perShare, known := eventDiamondsPerShare(Event{Prize: "总40钻，15份红包"}); !known || perShare != 40.0/15.0 {
 		t.Fatalf("total/share prize not parsed: value=%v known=%v", perShare, known)
 	}
+}
+
+func TestParticipantCountdownRequiresMinimumRemainingValidity(t *testing.T) {
+	t.Run("default ten seconds blocks late packet", func(t *testing.T) {
+		recordStore, err := NewStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := recordStore.RecordParticipationStarted("countdown-account", "倒计时账号"); err != nil {
+			t.Fatal(err)
+		}
+		store := &fakeParticipationStore{
+			credentials: []accounts.RedPacketParticipationCredential{{AccountID: "countdown-account", Cookie: "sessionid_ss=ok"}},
+		}
+		poster := &fakePoster{responses: []*http.Response{jsonResponse(200, `{"status_code":0,"data":{"succeed":true}}`)}}
+		participant := newParticipant(store, 1, func(Event, accounts.RedPacketParticipationCredential) signedPoster { return poster }, recordStore)
+		participant.HandleEvent(Event{
+			ID: "countdown-late", PacketID: "countdown-late", JoinBoxID: "countdown-late", ActualRoomID: "7001",
+			Title: "钻石红包", ExpiresAt: time.Now().Add(5 * time.Second).Format(time.RFC3339Nano),
+		})
+		time.Sleep(30 * time.Millisecond)
+		poster.mu.Lock()
+		calls := poster.calls
+		poster.mu.Unlock()
+		if calls != 0 {
+			t.Fatalf("packet with less than the default ten seconds remaining was sent: %d", calls)
+		}
+	})
+
+	t.Run("zero disables the additional gate but not expiry", func(t *testing.T) {
+		recordStore, err := NewStore(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := recordStore.SetParticipationSettings(ParticipationSettings{ParticipationCountdownSeconds: 0}); err != nil {
+			t.Fatal(err)
+		}
+		if err := recordStore.RecordParticipationStarted("countdown-zero", "零门槛账号"); err != nil {
+			t.Fatal(err)
+		}
+		store := &fakeParticipationStore{
+			credentials: []accounts.RedPacketParticipationCredential{{AccountID: "countdown-zero", Cookie: "sessionid_ss=ok"}},
+			notify:      make(chan struct{}, 1),
+		}
+		poster := &fakePoster{responses: []*http.Response{jsonResponse(200, `{"status_code":0,"data":{"succeed":true}}`)}}
+		participant := newParticipant(store, 1, func(Event, accounts.RedPacketParticipationCredential) signedPoster { return poster }, recordStore)
+		participant.HandleEvent(Event{
+			ID: "countdown-zero-event", PacketID: "countdown-zero-event", JoinBoxID: "countdown-zero-event", ActualRoomID: "7001",
+			Title: "钻石红包", ExpiresAt: time.Now().Add(500 * time.Millisecond).Format(time.RFC3339Nano),
+		})
+		select {
+		case <-store.notify:
+		case <-time.After(time.Second):
+			t.Fatal("zero countdown did not allow a still-open packet")
+		}
+		poster.mu.Lock()
+		calls := poster.calls
+		poster.mu.Unlock()
+		if calls != 1 {
+			t.Fatalf("expected one request with zero countdown, got %d", calls)
+		}
+	})
 }
 
 func TestParticipantFiltersConfiguredPacketTypeBeforeDispatch(t *testing.T) {
@@ -837,7 +920,7 @@ func TestReceiveResponseClassification(t *testing.T) {
 		alias    string
 		fallback bool
 	}{
-		{name: "empty result stays pending", body: `{"status_code":0,"data":{"receive_info":[]}}`},
+		{name: "empty result is a definitive loss", body: `{"status_code":0,"data":{"receive_info":[]}}`, status: "not_won", message: "未中奖"},
 		{name: "explicit loss", body: `{"status_code":0,"data":{"receive_info":[{"box_id_str":"box-1","succeed":false}]}}`, status: "not_won", message: "未中奖"},
 		{name: "diamond win", body: `{"status_code":0,"data":{"receive_info":[{"box_id_str":"box-1","succeed":true,"diamond_count":8}]}}`, status: "won", message: "已中8钻", award: "8钻"},
 		{name: "gift win", body: `{"status_code":0,"data":{"receive_info":[{"box_id_str":"box-1","succeed":true,"gift_name":"小心心","gift_count":2}]}}`, status: "won", message: "已中2个小心心", award: "2个小心心"},
@@ -870,7 +953,7 @@ func TestDrawResultTimeoutMarksErrorAndReleasesNextRound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{DrawResultTimeoutSeconds: 1}); err != nil {
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{DrawResultDelaySeconds: 0, DrawResultMaxAttempts: 3}); err != nil {
 		t.Fatal(err)
 	}
 	if err := recordStore.RecordParticipationStarted("account-timeout", "超时账号"); err != nil {
@@ -894,7 +977,7 @@ func TestDrawResultTimeoutMarksErrorAndReleasesNextRound(t *testing.T) {
 	participant := NewPageParticipant(store, executor, recordStore)
 	participant.resolveDraw(event, "account-timeout", "超时账号")
 	records := recordStore.ParticipationRecords()
-	if len(records) != 1 || records[0].Status != "draw_error" || !strings.Contains(records[0].Message, "1 秒") {
+	if len(records) != 1 || records[0].Status != "draw_error" || !strings.Contains(records[0].Message, "3 次") {
 		t.Fatalf("draw timeout was not persisted as abnormal: %+v", records)
 	}
 	state := recordStore.GetParticipationState("account-timeout", time.Now())
@@ -904,6 +987,158 @@ func TestDrawResultTimeoutMarksErrorAndReleasesNextRound(t *testing.T) {
 	if allowed, _ := recordStore.ParticipationPolicy("account-timeout", time.Now()); !allowed {
 		t.Fatal("draw timeout must release the account for the next round")
 	}
+}
+
+func TestEmptyReceiveInfoRecordsNoWinInsteadOfDrawError(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{DrawResultDelaySeconds: 0, DrawResultMaxAttempts: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationStarted("account-empty-receive", "空结果账号"); err != nil {
+		t.Fatal(err)
+	}
+	event := Event{
+		ID: "event-empty-receive", WebRID: "123456", ActualRoomID: "700001", JoinBoxID: "7669063194534955828",
+		ExpiresAt: time.Now().Add(-100 * time.Millisecond).Format(time.RFC3339Nano),
+	}
+	if reserved, err := recordStore.ReserveParticipation(event, "account-empty-receive", "空结果账号"); err != nil || !reserved {
+		t.Fatalf("reserve empty receive draw: %v %v", reserved, err)
+	}
+	if err := recordStore.CompleteParticipation(event.ID, "account-empty-receive", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeParticipationStore{credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-empty-receive"}}}
+	executor := &fakePageParticipationExecutor{
+		ready:    true,
+		response: PageParticipationResponse{Endpoint: "receive", HTTPStatus: 200, Body: `{"status_code":0,"data":{"receive_info":[]}}`, Attempts: 1},
+	}
+	participant := NewPageParticipant(store, executor, recordStore)
+	participant.resolveDraw(event, "account-empty-receive", "空结果账号")
+	records := recordStore.ParticipationRecords()
+	if len(records) != 1 || records[0].Status != "not_won" || records[0].Message != "未中奖" {
+		t.Fatalf("empty receive result was not recorded as no win: %+v", records)
+	}
+}
+
+func TestDrawQueryDoesNotWaitForPacketExpiry(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{DrawResultDelaySeconds: 0, DrawResultMaxAttempts: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationStarted("account-query-now", "查询账号"); err != nil {
+		t.Fatal(err)
+	}
+	event := Event{
+		ID: "event-query-now", WebRID: "123456", ActualRoomID: "700001", JoinBoxID: "7669063194534955828",
+		ExpiresAt: time.Now().Add(time.Minute).Format(time.RFC3339Nano),
+	}
+	if reserved, err := recordStore.ReserveParticipation(event, "account-query-now", "查询账号"); err != nil || !reserved {
+		t.Fatalf("reserve: %v %v", reserved, err)
+	}
+	if err := recordStore.CompleteParticipation(event.ID, "account-query-now", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeParticipationStore{credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-query-now"}}}
+	executor := &fakePageParticipationExecutor{ready: true, response: PageParticipationResponse{
+		Endpoint: "receive", HTTPStatus: 200, Body: `{"status_code":0,"data":{"receive_info":[]}}`, Attempts: 1,
+	}}
+	participant := NewPageParticipant(store, executor, recordStore)
+	started := time.Now()
+	participant.resolveDraw(event, "account-query-now", "查询账号")
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("result query waited for packet expiry: %v", elapsed)
+	}
+	if records := recordStore.ParticipationRecords(); len(records) != 1 || records[0].Status != "not_won" {
+		t.Fatalf("expected immediate no-win result after query, got %+v", records)
+	}
+}
+
+func TestDrawQueryFallsBackToWalletAfterAttempts(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{DrawResultDelaySeconds: 0, DrawResultMaxAttempts: 2}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationStarted("account-query-wallet", "增量账号"); err != nil {
+		t.Fatal(err)
+	}
+	event := Event{ID: "event-query-wallet", WebRID: "123456", ActualRoomID: "700001", JoinBoxID: "7669063194534955828"}
+	if reserved, err := recordStore.ReserveParticipation(event, "account-query-wallet", "增量账号"); err != nil || !reserved {
+		t.Fatalf("reserve: %v %v", reserved, err)
+	}
+	if err := recordStore.CompleteParticipation(event.ID, "account-query-wallet", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationWalletBaseline(event.ID, "account-query-wallet", 10); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeWalletParticipationStore{
+		fakeParticipationStore: &fakeParticipationStore{credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-query-wallet"}}},
+		balances:               []accounts.RedPacketWalletBalance{{Diamond: 11}},
+	}
+	executor := &fakePageParticipationExecutor{ready: true, response: PageParticipationResponse{
+		Endpoint: "receive", HTTPStatus: 200, Body: `{"status_code":0,"data":{}}`, Attempts: 1,
+	}}
+	participant := NewPageParticipant(store, executor, recordStore)
+	started := time.Now()
+	participant.resolveDraw(event, "account-query-wallet", "增量账号")
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("wallet fallback took too long: %v", elapsed)
+	}
+	records := recordStore.ParticipationRecords()
+	if len(records) != 1 || records[0].Status != "won" || records[0].WalletDiamondDelta != 1 || records[0].ResultSource != "wallet_delta" {
+		t.Fatalf("wallet fallback was not persisted after attempts: %+v", records)
+	}
+}
+
+func TestWalletDeltaConfirmsWinWhenReceiveInfoIsEmpty(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{DrawResultDelaySeconds: 0, DrawResultMaxAttempts: 3, ParticipationCountdownSeconds: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationStarted("account-wallet", "钱包账号"); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeWalletParticipationStore{
+		fakeParticipationStore: &fakeParticipationStore{
+			credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-wallet", Cookie: "native-only"}},
+			notify:      make(chan struct{}, 1),
+		},
+		balances: []accounts.RedPacketWalletBalance{{Diamond: 10}, {Diamond: 11}},
+	}
+	executor := &fakePageParticipationExecutor{
+		ready:    true,
+		response: PageParticipationResponse{Endpoint: "join", HTTPStatus: 200, Body: `{"status_code":0,"data":{"succeed":true}}`, Attempts: 1},
+	}
+	participant := NewPageParticipant(store, executor, recordStore)
+	event := Event{
+		ID: "event-wallet", WebRID: "123456", ActualRoomID: "700001", JoinBoxID: "7669063194534955828",
+		Title: "钻石红包", DrawAt: time.Now().Add(100 * time.Millisecond).Format(time.RFC3339Nano),
+	}
+	participant.HandleEvent(event)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		records := recordStore.ParticipationRecords()
+		if len(records) == 1 && records[0].Status == "won" {
+			if records[0].WalletDiamondDelta != 1 || records[0].ResultSource != "wallet_delta" || records[0].Award != "1钻" {
+				t.Fatalf("wallet fallback metadata incorrect: %+v", records[0])
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("wallet delta did not confirm empty receive result: %+v", recordStore.ParticipationRecords())
 }
 
 func TestParticipationParamsKeepRushFieldsNative(t *testing.T) {

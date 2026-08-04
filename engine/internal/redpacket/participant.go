@@ -23,12 +23,15 @@ var (
 )
 
 const (
-	redPacketJoinURL          = "https://live.douyin.com/webcast/luckybox/join/"
-	redPacketRushURL          = "https://live.douyin.com/webcast/luckybox/rush/"
-	defaultJoinConcurrency    = 4
-	defaultRiskCooldown       = 5 * time.Minute
-	defaultNetworkCooldown    = 30 * time.Second
-	defaultParticipantTimeout = 12 * time.Second
+	redPacketJoinURL                = "https://live.douyin.com/webcast/luckybox/join/"
+	redPacketRushURL                = "https://live.douyin.com/webcast/luckybox/rush/"
+	defaultJoinConcurrency          = 4
+	defaultRiskCooldown             = 5 * time.Minute
+	defaultNetworkCooldown          = 30 * time.Second
+	defaultParticipantTimeout       = 12 * time.Second
+	defaultWalletProbeTimeout       = 3 * time.Second
+	defaultDrawResultRequestTimeout = 3 * time.Second
+	defaultDrawResultRetryInterval  = time.Second
 )
 
 // ParticipationStore is the private account-store surface used by the
@@ -86,6 +89,16 @@ type participationAccountStopper interface {
 
 type participationDrawAccountStore interface {
 	RecordRedPacketDrawResult(accountID, message string, won bool)
+}
+
+type participationWalletStore interface {
+	RefreshRedPacketWalletBalance(context.Context, string) (accounts.RedPacketWalletBalance, error)
+}
+
+type participationWalletRecordStore interface {
+	RecordParticipationWalletBaseline(eventID, accountID string, diamond int64) error
+	ParticipationWalletBaseline(eventID, accountID string) (int64, bool)
+	RecordParticipationWalletResult(eventID, accountID string, after, delta int64, source string) error
 }
 
 type participationRetryStore interface {
@@ -287,7 +300,9 @@ func followDecisionAllows(decision participationFollowDecision) bool {
 }
 
 func (p *Participant) scheduleDispatch(event Event, credential accounts.RedPacketParticipationCredential, allowPriorityDelay bool) {
-	if !p.matchesPacketType(event, credential.AccountID) || !p.meetsMinimumDiamonds(event, credential.AccountID) {
+	settings := p.settingsForAccount(credential.AccountID)
+	if !eventParticipationOpenAt(event, settings, time.Now()) ||
+		!p.matchesPacketType(event, credential.AccountID) || !p.meetsMinimumDiamonds(event, credential.AccountID) {
 		return
 	}
 	decision := p.followDecision(event, credential.AccountID)
@@ -300,7 +315,7 @@ func (p *Participant) scheduleDispatch(event Event, credential accounts.RedPacke
 			delay = time.Millisecond
 		}
 		time.AfterFunc(delay, func() {
-			if eventOpenAt(event, time.Now()) {
+			if eventParticipationOpenAt(event, p.settingsForAccount(credential.AccountID), time.Now()) {
 				p.scheduleDispatch(event, credential, false)
 			}
 		})
@@ -310,12 +325,40 @@ func (p *Participant) scheduleDispatch(event Event, credential accounts.RedPacke
 }
 
 func eventOpenAt(event Event, now time.Time) bool {
-	for _, value := range []string{event.ExpiresAt, event.DrawAt} {
-		if deadline, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value)); err == nil {
-			return now.Before(deadline)
-		}
+	deadline, ok := eventDeadline(event)
+	if !ok {
+		return true
 	}
-	return true
+	return now.Before(deadline)
+}
+
+// eventParticipationOpenAt applies the account/task snapshot immediately
+// before dispatch. The packet must still be open and, unless the user chose
+// zero, retain at least the configured number of seconds in its validity
+// countdown. This is deliberately native-side eligibility rather than a UI
+// filter, so a late callback can never issue a join after the threshold.
+func eventParticipationOpenAt(event Event, settings ParticipationSettings, now time.Time) bool {
+	deadline, ok := eventDeadline(event)
+	if !ok {
+		return true
+	}
+	remaining := deadline.Sub(now)
+	if remaining <= 0 {
+		return false
+	}
+	minimum := time.Duration(settings.ParticipationCountdownSeconds) * time.Second
+	return minimum <= 0 || remaining >= minimum
+}
+
+func eventDeadline(event Event) (time.Time, bool) {
+	for _, value := range []string{event.ExpiresAt, event.DrawAt} {
+		parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value))
+		if err != nil {
+			continue
+		}
+		return parsed, true
+	}
+	return time.Time{}, false
 }
 
 func (p *Participant) matchesPacketType(event Event, accountID string) bool {
@@ -479,6 +522,10 @@ func (p *Participant) run(event Event, credential accounts.RedPacketParticipatio
 			return
 		}
 	}
+	// Capture a native-only wallet baseline immediately before the join. A
+	// temporary wallet failure never blocks participation; it only disables the
+	// later balance-delta fallback for this account/event pair.
+	p.captureWalletBaseline(event, credential.AccountID)
 
 	result := p.attempt(event, credential, decision)
 	if result.joined && result.cooldown <= 0 {
@@ -569,37 +616,31 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 	if !ok || p.pageExecutor == nil {
 		return
 	}
-	target := drawResultTime(event)
-	timeout := 10 * time.Second
 	settings := p.settingsForAccount(accountID)
 	if scoped, ok := p.recordStore.(participationAccountSettingsStore); ok {
 		settings = scoped.ParticipationSettingsForEvent(event.ID, accountID)
 	}
-	if seconds := settings.DrawResultTimeoutSeconds; seconds > 0 {
-		timeout = time.Duration(seconds) * time.Second
-	}
-	deadline := target.Add(timeout)
-	if delay := time.Until(target); delay > 0 {
+	queryAt := drawQueryStart(event, settings.DrawResultDelaySeconds)
+	if delay := time.Until(queryAt); delay > 0 {
 		timer := time.NewTimer(delay)
 		defer timer.Stop()
 		<-timer.C
 	}
+	maxAttempts := settings.DrawResultMaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 3
+	}
 	attempts := 0
-	for time.Now().Before(deadline) {
+	walletFallbackAllowed := true
+	for attempts < maxAttempts {
 		if !p.pageExecutor.Ready(accountID) {
-			if wait := minDuration(time.Second, time.Until(deadline)); wait > 0 {
-				time.Sleep(wait)
+			attempts++
+			if attempts < maxAttempts {
+				time.Sleep(defaultDrawResultRetryInterval)
 			}
 			continue
 		}
-		requestTimeout := time.Until(deadline)
-		if requestTimeout > 25*time.Second {
-			requestTimeout = 25 * time.Second
-		}
-		if requestTimeout <= 0 {
-			break
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+		ctx, cancel := context.WithTimeout(context.Background(), defaultDrawResultRequestTimeout)
 		task := PageParticipationTask{
 			Action: "receive", EventID: event.ID, AccountID: accountID, AccountName: accountName,
 			WebRID: event.WebRID, ActualRoomID: event.ActualRoomID, BoxID: event.JoinBoxID, PacketID: event.PacketID, AnchorID: event.AnchorID,
@@ -612,16 +653,19 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 		}
 		if response.LoginExpired || response.HTTPStatus == http.StatusUnauthorized || response.HTTPStatus == http.StatusForbidden || containsLoginFailure(strings.ToLower(response.Body)) {
 			p.store.RecordRedPacketParticipation(accountID, "login_expired", "CK 已失效：开奖结果接口返回未登录", false, false, 0, true)
-			if wait := time.Until(deadline); wait > 0 {
-				time.Sleep(wait)
-			}
+			walletFallbackAllowed = false
 			break
 		}
 		bodyLower := strings.ToLower(response.Body)
 		if response.ChallengeBlocked || containsChallengeFailure(bodyLower) || containsChallengeFlagJSON(response.Body) {
-			p.store.RecordRedPacketParticipation(accountID, "challenge_blocked", "验证码/安全验证拦截，已暂停接收新任务", false, false, 0, false)
+			message := "验证码/安全验证拦截，已暂停接收新任务"
+			p.store.RecordRedPacketParticipation(accountID, "challenge_blocked", message, false, false, 0, false)
+			_, _ = drawStore.ResolveParticipationDraw(event.ID, accountID, "challenge_blocked", message, "", attempts)
 			if stopper, ok := p.pageExecutor.(participationAccountStopper); ok {
 				stopper.StopAccount(accountID)
+			}
+			if lifecycle, ok := p.recordStore.(participationTaskLifecycleStore); ok {
+				_ = lifecycle.FinishParticipationTask(accountID, message)
 			}
 			return
 		}
@@ -629,14 +673,14 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 			p.store.RecordRedPacketParticipation(accountID, "risk_control", "开奖结果查询触发风控，账号已进入冷却", false, false, defaultRiskCooldown, false)
 		}
 		if response.ContextMissing {
-			if wait := minDuration(time.Second, time.Until(deadline)); wait > 0 {
-				time.Sleep(wait)
+			if attempts < maxAttempts {
+				time.Sleep(defaultDrawResultRetryInterval)
 			}
 			continue
 		}
 		if strings.TrimSpace(response.Error) != "" || response.HTTPStatus < 200 || response.HTTPStatus >= 300 {
-			if wait := minDuration(2*time.Second, time.Until(deadline)); wait > 0 {
-				time.Sleep(wait)
+			if attempts < maxAttempts {
+				time.Sleep(defaultDrawResultRetryInterval)
 			}
 			continue
 		}
@@ -645,9 +689,17 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 		// when Douyin rotates the receive-side box_id; multiple rows still require
 		// an exact request/event alias match.
 		outcome := classifyReceiveResponseWithSingleFallback(response.Body, event.JoinBoxID, event.PacketID)
+		walletDelta, walletOK := p.captureWalletResult(event, accountID)
+		if walletOK && walletDelta > 0 && (outcome.status == "" || outcome.status == "not_won") {
+			outcome = drawOutcome{
+				status:  "won",
+				message: fmt.Sprintf("已中%d钻（钱包增量确认）", walletDelta),
+				award:   fmt.Sprintf("%d钻", walletDelta),
+			}
+		}
 		if outcome.status == "" {
-			if wait := minDuration(2*time.Second, time.Until(deadline)); wait > 0 {
-				time.Sleep(wait)
+			if attempts < maxAttempts {
+				time.Sleep(defaultDrawResultRetryInterval)
 			}
 			continue
 		}
@@ -661,7 +713,24 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 		}
 		return
 	}
-	message := fmt.Sprintf("开奖异常：超过开奖时间 %d 秒仍未获取到结果", int(timeout/time.Second))
+	// Result polling is bounded by attempts rather than a wall-clock timeout.
+	// Always perform the native wallet read after the final failed query so an
+	// empty/missing receive response can still be reconciled by a positive
+	// diamond increment before an abnormal record is written.
+	if walletFallbackAllowed {
+		if walletDelta, walletOK := p.captureWalletResult(event, accountID); walletOK && walletDelta > 0 {
+			message := fmt.Sprintf("已中%d钻（钱包增量确认）", walletDelta)
+			if _, err := drawStore.ResolveParticipationDraw(event.ID, accountID, "won", message, fmt.Sprintf("%d钻", walletDelta), attempts); err == nil {
+				if accountStore, ok := p.store.(participationDrawAccountStore); ok {
+					accountStore.RecordRedPacketDrawResult(accountID, message, true)
+				}
+				p.retryCurrentEventsForAccount(accountID)
+				p.finishTaskIfComplete(accountID)
+			}
+			return
+		}
+	}
+	message := fmt.Sprintf("开奖查询失败：已尝试 %d 次，钻石增量未变化", attempts)
 	if traceStore, ok := p.recordStore.(participationTraceStore); ok {
 		_ = traceStore.RecordParticipationTrace(PageParticipationTask{
 			Action: "receive_timeout", EventID: event.ID, AccountID: accountID, AccountName: accountName,
@@ -672,6 +741,46 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 		p.retryCurrentEventsForAccount(accountID)
 		p.finishTaskIfComplete(accountID)
 	}
+}
+
+func (p *Participant) captureWalletBaseline(event Event, accountID string) {
+	wallet, walletOK := p.store.(participationWalletStore)
+	records, recordsOK := p.recordStore.(participationWalletRecordStore)
+	if !walletOK || !recordsOK {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultWalletProbeTimeout)
+	defer cancel()
+	balance, err := wallet.RefreshRedPacketWalletBalance(ctx, accountID)
+	if err != nil {
+		return
+	}
+	_ = records.RecordParticipationWalletBaseline(event.ID, accountID, balance.Diamond)
+}
+
+func (p *Participant) captureWalletResult(event Event, accountID string) (int64, bool) {
+	wallet, walletOK := p.store.(participationWalletStore)
+	records, recordsOK := p.recordStore.(participationWalletRecordStore)
+	if !walletOK || !recordsOK {
+		return 0, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), defaultWalletProbeTimeout)
+	defer cancel()
+	balance, err := wallet.RefreshRedPacketWalletBalance(ctx, accountID)
+	if err != nil {
+		return 0, false
+	}
+	baseline, baselineOK := records.ParticipationWalletBaseline(event.ID, accountID)
+	delta := int64(0)
+	if baselineOK && balance.Diamond > baseline {
+		delta = balance.Diamond - baseline
+	}
+	source := "wallet_snapshot"
+	if delta > 0 {
+		source = "wallet_delta"
+	}
+	_ = records.RecordParticipationWalletResult(event.ID, accountID, balance.Diamond, delta, source)
+	return delta, true
 }
 
 func minDuration(first, second time.Duration) time.Duration {
@@ -754,13 +863,19 @@ func followDecisionRank(decision participationFollowDecision) int {
 	return 2
 }
 
-func drawResultTime(event Event) time.Time {
-	for _, value := range []string{event.DrawAt, event.ExpiresAt} {
-		if parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value)); err == nil {
-			return parsed
-		}
+func drawQueryStart(event Event, delaySeconds int) time.Time {
+	now := time.Now()
+	delay := time.Duration(delaySeconds) * time.Second
+	if delay < 0 {
+		delay = 0
 	}
-	return time.Now().Add(5 * time.Second)
+	// DrawAt is the only event timestamp that explicitly denotes the opening
+	// result point. ExpiresAt is the packet validity window and can be a minute
+	// away; using it here was the source of long-lived “等待开奖” rows.
+	if parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(event.DrawAt)); err == nil && parsed.After(now) {
+		return parsed.Add(delay)
+	}
+	return now.Add(delay)
 }
 
 type drawOutcome struct {
@@ -789,10 +904,10 @@ func classifyReceiveResponseMode(body string, allowSingleFallback bool, boxIDs .
 	if !present {
 		return drawOutcome{}
 	}
-	// An empty/null receive_info is the normal intermediate response while
-	// Douyin has not published this account's personal draw result yet. It is
-	// deliberately not a loss; the caller keeps polling until the configured
-	// draw-result timeout and then records “开奖异常”.
+	// Douyin's signed receive endpoint uses an empty receive_info array as the
+	// definitive no-win result when the request parameters are valid. A missing
+	// field/null value is different: it is an incomplete response and remains
+	// pending so transport/page issues cannot be misreported as a loss.
 	if value == nil {
 		return drawOutcome{}
 	}
@@ -801,7 +916,7 @@ func classifyReceiveResponseMode(body string, allowSingleFallback bool, boxIDs .
 		return drawOutcome{}
 	}
 	if len(infos) == 0 {
-		return drawOutcome{}
+		return drawOutcome{status: "not_won", message: "未中奖"}
 	}
 	wanted := make(map[string]struct{}, len(boxIDs))
 	for _, boxID := range boxIDs {

@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	storeVersion         = 14
+	storeVersion         = 16
 	unknownProbeInterval = 10 * time.Second
 	offlineProbeInterval = 60 * time.Second
 	livePacketInterval   = 15 * time.Second
@@ -131,33 +131,38 @@ type CenterEvent struct {
 // ParticipationRecord is safe audit metadata for one account/event attempt.
 // It deliberately excludes Cookie values, signed URLs, headers and raw bodies.
 type ParticipationRecord struct {
-	ID            string                `json:"id"`
-	EventID       string                `json:"event_id"`
-	AccountID     string                `json:"account_id"`
-	AccountName   string                `json:"account_name"`
-	TaskID        string                `json:"task_id,omitempty"`
-	Settings      ParticipationSettings `json:"settings,omitempty"`
-	RoomID        string                `json:"room_id,omitempty"`
-	WebRID        string                `json:"web_rid,omitempty"`
-	ActualRoomID  string                `json:"actual_room_id,omitempty"`
-	RoomName      string                `json:"room_name,omitempty"`
-	StreamerName  string                `json:"streamer_name,omitempty"`
-	PacketID      string                `json:"packet_id"`
-	Title         string                `json:"title,omitempty"`
-	Prize         string                `json:"prize,omitempty"`
-	Award         string                `json:"award,omitempty"`
-	DrawAt        string                `json:"draw_at,omitempty"`
-	ExpiresAt     string                `json:"expires_at,omitempty"`
-	Endpoint      string                `json:"endpoint,omitempty"`
-	Status        string                `json:"status"`
-	Message       string                `json:"message,omitempty"`
-	AttemptCount  int                   `json:"attempt_count"`
-	Joined        bool                  `json:"joined"`
-	Won           bool                  `json:"won,omitempty"`
-	JoinedAt      string                `json:"joined_at,omitempty"`
-	CooldownUntil string                `json:"cooldown_until,omitempty"`
-	CreatedAt     string                `json:"created_at"`
-	UpdatedAt     string                `json:"updated_at"`
+	ID                     string                `json:"id"`
+	EventID                string                `json:"event_id"`
+	AccountID              string                `json:"account_id"`
+	AccountName            string                `json:"account_name"`
+	TaskID                 string                `json:"task_id,omitempty"`
+	Settings               ParticipationSettings `json:"settings,omitempty"`
+	RoomID                 string                `json:"room_id,omitempty"`
+	WebRID                 string                `json:"web_rid,omitempty"`
+	ActualRoomID           string                `json:"actual_room_id,omitempty"`
+	RoomName               string                `json:"room_name,omitempty"`
+	StreamerName           string                `json:"streamer_name,omitempty"`
+	PacketID               string                `json:"packet_id"`
+	Title                  string                `json:"title,omitempty"`
+	Prize                  string                `json:"prize,omitempty"`
+	Award                  string                `json:"award,omitempty"`
+	DrawAt                 string                `json:"draw_at,omitempty"`
+	ExpiresAt              string                `json:"expires_at,omitempty"`
+	Endpoint               string                `json:"endpoint,omitempty"`
+	Status                 string                `json:"status"`
+	Message                string                `json:"message,omitempty"`
+	AttemptCount           int                   `json:"attempt_count"`
+	Joined                 bool                  `json:"joined"`
+	Won                    bool                  `json:"won,omitempty"`
+	WalletBeforeDiamond    int64                 `json:"wallet_before_diamond,omitempty"`
+	WalletBaselineRecorded bool                  `json:"wallet_baseline_recorded,omitempty"`
+	WalletAfterDiamond     int64                 `json:"wallet_after_diamond,omitempty"`
+	WalletDiamondDelta     int64                 `json:"wallet_diamond_delta,omitempty"`
+	ResultSource           string                `json:"result_source,omitempty"`
+	JoinedAt               string                `json:"joined_at,omitempty"`
+	CooldownUntil          string                `json:"cooldown_until,omitempty"`
+	CreatedAt              string                `json:"created_at"`
+	UpdatedAt              string                `json:"updated_at"`
 }
 
 // ParticipationState explains why a browser account can or cannot accept new
@@ -242,15 +247,30 @@ type ParticipationTrace struct {
 }
 
 // ParticipationSettings are safe global limits applied independently to each
-// participation account. Zero keeps the corresponding limit disabled.
+// participation account. Zero keeps the user-facing stop/cooldown limits
+// disabled; result-query fields are normalized to bounded defaults.
 type ParticipationSettings struct {
-	StopAfterJoins           int    `json:"stop_after_joins"`
-	CooldownSeconds          int    `json:"cooldown_seconds"`
-	StopAfterWins            int    `json:"stop_after_wins"`
-	DrawResultTimeoutSeconds int    `json:"draw_result_timeout_seconds"`
-	MinimumDiamonds          int    `json:"minimum_diamonds"`
-	PacketType               string `json:"packet_type"`
-	FollowPolicy             string `json:"follow_policy"`
+	StopAfterJoins  int `json:"stop_after_joins"`
+	CooldownSeconds int `json:"cooldown_seconds"`
+	StopAfterWins   int `json:"stop_after_wins"`
+	// DrawResultDelaySeconds is the native delay after the known draw point
+	// (or after the accepted join when the event has no draw timestamp) before
+	// querying luckybox/receive.
+	DrawResultDelaySeconds int `json:"draw_result_delay_seconds"`
+	// DrawResultMaxAttempts bounds result queries. Once the attempts are
+	// exhausted the wallet-delta fallback runs before an abnormal result is
+	// recorded.
+	DrawResultMaxAttempts int `json:"draw_result_max_attempts"`
+	// DrawResultTimeoutSeconds is retained only for migration compatibility with
+	// older stores/frontends. New scheduling uses delay + max attempts.
+	DrawResultTimeoutSeconds int `json:"draw_result_timeout_seconds,omitempty"`
+	// ParticipationCountdownSeconds is the minimum amount of validity time
+	// that must remain before a new join can be assigned. Zero disables this
+	// extra gate; an already expired packet is still never eligible.
+	ParticipationCountdownSeconds int    `json:"participation_countdown_seconds"`
+	MinimumDiamonds               int    `json:"minimum_diamonds"`
+	PacketType                    string `json:"packet_type"`
+	FollowPolicy                  string `json:"follow_policy"`
 }
 
 // MonitoringSettings are safe, persisted throughput controls for the native
@@ -400,8 +420,11 @@ func NewStore(dataDir string) (*Store, error) {
 		activities:             map[string]*Activity{},
 		runtime:                map[string]context.CancelFunc{},
 		bulkIDs:                map[string]struct{}{},
-		settings:               normalizeParticipationSettings(ParticipationSettings{}),
-		monitoringSettings:     normalizeMonitoringSettings(MonitoringSettings{}),
+		settings: normalizeParticipationSettings(ParticipationSettings{
+			DrawResultDelaySeconds: 1, DrawResultMaxAttempts: 3,
+			ParticipationCountdownSeconds: 10,
+		}),
+		monitoringSettings: normalizeMonitoringSettings(MonitoringSettings{}),
 	}
 	s.probeSlots = make(chan struct{}, s.monitoringSettings.ProbeConcurrency)
 	if err := s.load(); err != nil {
@@ -494,31 +517,55 @@ func (s *Store) load() error {
 			s.participationSchedules[schedule.ID] = schedule
 		}
 	}
+	migrated := payload.Version < storeVersion
+	// Version 15 introduced the participation countdown. Older files could not
+	// express an explicit zero, so a missing/zero value on migration means the
+	// new default of ten seconds. New writes preserve an explicit zero.
+	if payload.Version < 15 && payload.ParticipationSettings.ParticipationCountdownSeconds == 0 {
+		payload.ParticipationSettings.ParticipationCountdownSeconds = 10
+		migrated = true
+	}
+	// Version 16 replaced the unbounded wall-clock draw timeout with an
+	// explicit query delay and attempt count. These fields were not present in
+	// older files, so only migration zero values receive the new defaults.
+	if payload.Version < 16 {
+		if payload.ParticipationSettings.DrawResultDelaySeconds == 0 {
+			payload.ParticipationSettings.DrawResultDelaySeconds = 1
+		}
+		if payload.ParticipationSettings.DrawResultMaxAttempts == 0 {
+			payload.ParticipationSettings.DrawResultMaxAttempts = 3
+		}
+		migrated = true
+	}
 	s.settings = normalizeParticipationSettings(payload.ParticipationSettings)
 	s.monitoringSettings = normalizeMonitoringSettings(payload.MonitoringSettings)
 	s.probeSlots = make(chan struct{}, s.monitoringSettings.ProbeConcurrency)
-	migrated := payload.Version < storeVersion
 	for _, record := range s.participations {
 		if !record.Joined || participationDrawTerminal(record.Status) {
 			continue
-		}
-		deadlineText := firstNonEmpty(record.DrawAt, record.ExpiresAt)
-		if deadlineText == "" {
-			if event := s.events[record.EventID]; event != nil {
-				deadlineText = firstNonEmpty(event.DrawAt, event.ExpiresAt)
-			}
 		}
 		settings := s.settings
 		if snapshot, ok := taskSettingsSnapshot(record.Settings); ok {
 			settings = snapshot
 		}
-		deadlineGrace := time.Duration(settings.DrawResultTimeoutSeconds) * time.Second
-		deadline, parseErr := time.Parse(time.RFC3339Nano, deadlineText)
-		if parseErr != nil || time.Now().Before(deadline.Add(deadlineGrace)) {
+		// A pending result is timed from the accepted join, not from the
+		// packet's expiry timestamp. The latter can be a one-minute validity
+		// window and must never leave a record waiting for a minute before its
+		// first receive query. The active participant performs the wallet
+		// fallback; reload reconciliation only cleans up records that are
+		// already beyond the bounded query window.
+		joinedAtText := firstNonEmpty(record.JoinedAt, record.CreatedAt)
+		joinedAt, parseErr := time.Parse(time.RFC3339Nano, joinedAtText)
+		if parseErr != nil {
+			continue
+		}
+		queryWindow := time.Duration(settings.DrawResultDelaySeconds)*time.Second +
+			time.Duration(settings.DrawResultMaxAttempts)*defaultDrawResultRequestTimeout
+		if time.Now().Before(joinedAt.Add(queryWindow)) {
 			continue
 		}
 		record.Status = "draw_error"
-		record.Message = fmt.Sprintf("开奖异常：超过开奖时间 %d 秒仍未获取到结果", settings.DrawResultTimeoutSeconds)
+		record.Message = fmt.Sprintf("开奖查询失败：已尝试 %d 次，钻石增量未变化", settings.DrawResultMaxAttempts)
 		record.Endpoint = "receive"
 		record.UpdatedAt = time.Now().Format(time.RFC3339Nano)
 		migrated = true
@@ -706,6 +753,60 @@ func (s *Store) CompleteParticipation(eventID, accountID, endpoint, status, mess
 	return s.saveLocked()
 }
 
+// RecordParticipationWalletBaseline stores the pre-join wallet balance for a
+// reserved account/event pair. It is safe aggregate data only and is used by
+// the native result fallback when luckybox/receive omits personal outcome.
+func (s *Store) RecordParticipationWalletBaseline(eventID, accountID string, diamond int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := s.participations[participationRecordID(accountID, eventID)]
+	if record == nil {
+		return errors.New("红包参与记录不存在")
+	}
+	if !record.WalletBaselineRecorded {
+		record.WalletBeforeDiamond = maxInt64(0, diamond)
+		record.WalletBaselineRecorded = true
+	}
+	record.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+	return s.saveLocked()
+}
+
+func (s *Store) ParticipationWalletBaseline(eventID, accountID string) (int64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := s.participations[participationRecordID(accountID, eventID)]
+	if record == nil || !record.WalletBaselineRecorded {
+		return 0, false
+	}
+	return record.WalletBeforeDiamond, true
+}
+
+// RecordParticipationWalletResult stores the post-draw wallet snapshot and
+// the computed positive delta. A wallet delta is a fallback result source, not
+// a replacement for an explicit luckybox/receive outcome.
+func (s *Store) RecordParticipationWalletResult(eventID, accountID string, after, delta int64, source string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := s.participations[participationRecordID(accountID, eventID)]
+	if record == nil {
+		return errors.New("红包参与记录不存在")
+	}
+	record.WalletAfterDiamond = maxInt64(0, after)
+	record.WalletDiamondDelta = maxInt64(0, delta)
+	if strings.TrimSpace(source) != "" {
+		record.ResultSource = strings.TrimSpace(source)
+	}
+	record.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+	return s.saveLocked()
+}
+
+func maxInt64(value, minimum int64) int64 {
+	if value < minimum {
+		return minimum
+	}
+	return value
+}
+
 func normalizeParticipationSettings(settings ParticipationSettings) ParticipationSettings {
 	switch strings.ToLower(strings.TrimSpace(settings.PacketType)) {
 	case ParticipationPacketTypeAll:
@@ -745,11 +846,26 @@ func normalizeParticipationSettings(settings ParticipationSettings) Participatio
 	if settings.StopAfterWins > 100000 {
 		settings.StopAfterWins = 100000
 	}
+	if settings.DrawResultDelaySeconds < 0 {
+		settings.DrawResultDelaySeconds = 0
+	}
+	if settings.DrawResultDelaySeconds > 60 {
+		settings.DrawResultDelaySeconds = 60
+	}
+	if settings.DrawResultMaxAttempts <= 0 {
+		settings.DrawResultMaxAttempts = 3
+	}
+	if settings.DrawResultMaxAttempts > 20 {
+		settings.DrawResultMaxAttempts = 20
+	}
 	if settings.DrawResultTimeoutSeconds <= 0 {
 		settings.DrawResultTimeoutSeconds = 10
 	}
-	if settings.DrawResultTimeoutSeconds > 300 {
-		settings.DrawResultTimeoutSeconds = 300
+	if settings.ParticipationCountdownSeconds < 0 {
+		settings.ParticipationCountdownSeconds = 0
+	}
+	if settings.ParticipationCountdownSeconds > 300 {
+		settings.ParticipationCountdownSeconds = 300
 	}
 	if settings.MinimumDiamonds <= 0 {
 		settings.MinimumDiamonds = 1
@@ -883,6 +999,7 @@ func taskSettingsSnapshot(settings ParticipationSettings) (ParticipationSettings
 	// distinguishable from an older zero-value task persisted by pre-snapshot
 	// versions.
 	if strings.TrimSpace(settings.PacketType) == "" && strings.TrimSpace(settings.FollowPolicy) == "" &&
+		settings.DrawResultDelaySeconds == 0 && settings.DrawResultMaxAttempts == 0 &&
 		settings.DrawResultTimeoutSeconds == 0 && settings.MinimumDiamonds == 0 {
 		return ParticipationSettings{}, false
 	}
@@ -1018,7 +1135,7 @@ func (s *Store) PendingDraws(accountID string) []Event {
 
 func participationDrawTerminal(status string) bool {
 	switch strings.TrimSpace(status) {
-	case "won", "not_won", "draw_error":
+	case "won", "not_won", "draw_error", "challenge_blocked":
 		return true
 	default:
 		return false

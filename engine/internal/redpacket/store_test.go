@@ -185,9 +185,10 @@ func TestParticipationTaskCapturesSettingsSnapshot(t *testing.T) {
 	}
 	want := ParticipationSettings{
 		StopAfterJoins: 2, CooldownSeconds: 30, StopAfterWins: 1,
-		DrawResultTimeoutSeconds: 21, MinimumDiamonds: 3,
+		DrawResultDelaySeconds: 2, DrawResultMaxAttempts: 5, MinimumDiamonds: 3,
 		PacketType: ParticipationPacketTypeGift, FollowPolicy: ParticipationFollowPolicyOnly,
 	}
+	want.DrawResultTimeoutSeconds = 10 // legacy compatibility field is normalized on write
 	if _, err := store.SetParticipationSettings(want); err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +197,7 @@ func TestParticipationTaskCapturesSettingsSnapshot(t *testing.T) {
 	}
 	changed := ParticipationSettings{
 		StopAfterJoins: 1, CooldownSeconds: 1, StopAfterWins: 9,
-		DrawResultTimeoutSeconds: 10, MinimumDiamonds: 1,
+		DrawResultDelaySeconds: 10, DrawResultMaxAttempts: 2, MinimumDiamonds: 1,
 		PacketType: ParticipationPacketTypeDiamond, FollowPolicy: ParticipationFollowPolicyAll,
 	}
 	if _, err := store.SetParticipationSettings(changed); err != nil {
@@ -223,13 +224,19 @@ func TestParticipationTaskCapturesSettingsSnapshot(t *testing.T) {
 	}
 }
 
-func TestParticipationSettingsDefaultDrawTimeoutAndSafeTrace(t *testing.T) {
+func TestParticipationSettingsDefaultDrawQueryAndSafeTrace(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := store.GetParticipationSettings().DrawResultTimeoutSeconds; got != 10 {
-		t.Fatalf("default draw-result timeout=%d, want 10", got)
+	if got := store.GetParticipationSettings().DrawResultDelaySeconds; got != 1 {
+		t.Fatalf("default draw-result delay=%d, want 1", got)
+	}
+	if got := store.GetParticipationSettings().DrawResultMaxAttempts; got != 3 {
+		t.Fatalf("default draw-result attempts=%d, want 3", got)
+	}
+	if got := store.GetParticipationSettings().ParticipationCountdownSeconds; got != 10 {
+		t.Fatalf("default participation countdown=%d, want 10", got)
 	}
 	if got := store.GetParticipationSettings().MinimumDiamonds; got != 1 {
 		t.Fatalf("default minimum diamonds=%d, want 1", got)
@@ -270,6 +277,28 @@ func TestParticipationSettingsDefaultDrawTimeoutAndSafeTrace(t *testing.T) {
 		if strings.Contains(string(encoded), forbidden) {
 			t.Fatalf("participation trace leaked %q: %s", forbidden, encoded)
 		}
+	}
+}
+
+func TestParticipationCountdownSettingsPersistAndAllowZero(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings, err := store.SetParticipationSettings(ParticipationSettings{ParticipationCountdownSeconds: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.ParticipationCountdownSeconds != 0 {
+		t.Fatalf("explicit zero countdown was normalized away: %+v", settings)
+	}
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.GetParticipationSettings().ParticipationCountdownSeconds; got != 0 {
+		t.Fatalf("explicit zero countdown did not persist: %d", got)
 	}
 }
 
@@ -667,6 +696,13 @@ func TestReloadMigratesOverduePendingDrawToError(t *testing.T) {
 	if err := store.CompleteParticipation(event.ID, "account-overdue", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
 		t.Fatal(err)
 	}
+	store.mu.Lock()
+	store.participations[participationRecordID("account-overdue", event.ID)].JoinedAt = time.Now().Add(-20 * time.Second).Format(time.RFC3339Nano)
+	if err := store.saveLocked(); err != nil {
+		store.mu.Unlock()
+		t.Fatal(err)
+	}
+	store.mu.Unlock()
 	if err := store.FinishParticipationTask("account-overdue", "客户端关闭"); err != nil {
 		t.Fatal(err)
 	}
@@ -675,7 +711,7 @@ func TestReloadMigratesOverduePendingDrawToError(t *testing.T) {
 		t.Fatal(err)
 	}
 	records := reloaded.ParticipationRecords()
-	if len(records) != 1 || records[0].Status != "draw_error" || !strings.Contains(records[0].Message, "10 秒") {
+	if len(records) != 1 || records[0].Status != "draw_error" || !strings.Contains(records[0].Message, "3 次") {
 		t.Fatalf("overdue pending draw was not migrated: %+v", records)
 	}
 }

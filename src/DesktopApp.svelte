@@ -152,9 +152,13 @@
 	red_packet_cooldown_until?: string;
 	last_red_packet_status?: string;
 	last_red_packet_message?: string;
-    join_count?: number;
-    win_count?: number;
-    last_join_at?: string;
+	join_count?: number;
+	win_count?: number;
+	diamond_balance?: number;
+	diamond_x10?: number;
+	diamond_checked_at?: string;
+	diamond_status?: string;
+	last_join_at?: string;
     proxy_id?: number;
     fingerprint_profile_id?: number;
     tags?: string[];
@@ -405,9 +409,13 @@
     status: string;
     message?: string;
     attempt_count: number;
-    joined: boolean;
+	joined: boolean;
 	won?: boolean;
-    cooldown_until?: string;
+	wallet_before_diamond?: number;
+	wallet_after_diamond?: number;
+	wallet_diamond_delta?: number;
+	result_source?: string;
+	cooldown_until?: string;
     created_at: string;
     updated_at: string;
   };
@@ -433,11 +441,13 @@
 	type ParticipationPacketType = "all" | "gift" | "diamond";
 	type ParticipationFollowPolicy = "all" | "follow_priority" | "follow_only";
 
-  type ParticipationSettings = {
+	type ParticipationSettings = {
 	stop_after_joins: number;
 	cooldown_seconds: number;
 	stop_after_wins: number;
-	draw_result_timeout_seconds: number;
+	draw_result_delay_seconds: number;
+	draw_result_max_attempts: number;
+	participation_countdown_seconds: number;
 	minimum_diamonds: number;
 	packet_type: ParticipationPacketType;
 	follow_policy: ParticipationFollowPolicy;
@@ -609,11 +619,13 @@
 	account_concurrency: 3,
 	probe_concurrency: 64,
   };
-  let participationSettings: ParticipationSettings = {
+	let participationSettings: ParticipationSettings = {
 	stop_after_joins: 0,
 	cooldown_seconds: 0,
 	stop_after_wins: 0,
-	draw_result_timeout_seconds: 10,
+	draw_result_delay_seconds: 1,
+	draw_result_max_attempts: 3,
+	participation_countdown_seconds: 10,
 	minimum_diamonds: 1,
 	packet_type: "diamond",
 	follow_policy: "follow_priority",
@@ -658,6 +670,14 @@
   let recentActivityScrollbarDragStartY = 0;
   let recentActivityScrollbarDragStartTop = 0;
   let recentActivityScrollbarTrack: HTMLDivElement | null = null;
+  let settingsModalScroller: HTMLDivElement | null = null;
+  let settingsModalScrollTop = 0;
+  let settingsModalClientHeight = 0;
+  let settingsModalScrollHeight = 0;
+  let settingsModalScrollbarDragPointer = -1;
+  let settingsModalScrollbarDragStartY = 0;
+  let settingsModalScrollbarDragStartTop = 0;
+  let settingsModalScrollbarTrack: HTMLDivElement | null = null;
   let sidebarActivityDetailID = "";
   let stoppingSidebarActivityID = "";
   $: licenseDaysRemaining = getLicenseDaysRemaining(licenseStatus.expires_at);
@@ -925,14 +945,14 @@
   $: liveRunningRedPacketMonitorCount = redPacketMonitorSummary.live_running;
   $: canStartAnyRedPacketMonitor = redPacketMonitorSummary.enabled > redPacketMonitorSummary.running;
   $: canStopAnyRedPacketMonitor = runningRedPacketMonitorCount > 0;
-	$: activeRedPacketCount = redPacketEvents.filter((event) => redPacketEventIsActive(event, redPacketClock)).length;
+	$: activeRedPacketCount = redPacketEvents.filter((event) => redPacketEventInLibraryWindow(event, redPacketClock)).length;
 	$: historicalRedPacketCount = redPacketEvents.length - activeRedPacketCount;
 	$: accountSubtitle = `${activeRedPacketCount} 个红包 · ${runningRedPacketMonitorCount} 个房间正在监测${runningRedPacketMonitorCount > 0 ? ` · ${redPacketMonitorSummary.first_checked} 个已完成首轮检测 · ${redPacketMonitorSummary.pending_first} 个待检测 · ${liveRunningRedPacketMonitorCount} 个正在直播` : ""} · ${participationAccounts.length} 个参与 · ${monitoringAccounts.length} 个监测`;
 	$: expiredParticipationAccountCount = participationAccounts.filter((account) => accountCookieStatus(account, "participation") === "expired").length;
 	$: expiredMonitoringAccountCount = monitoringAccounts.filter((account) => accountCookieStatus(account, "monitoring") === "expired").length;
 	$: scopedRedPacketEvents = redPacketEvents.filter((event) => redPacketHistoryVisible
-		? !redPacketEventIsActive(event, redPacketClock)
-		: redPacketEventIsActive(event, redPacketClock));
+		? !redPacketEventInLibraryWindow(event, redPacketClock)
+		: redPacketEventInLibraryWindow(event, redPacketClock));
   $: filteredRedPacketEvents = scopedRedPacketEvents.filter((event) => {
     const needle = query.trim().toLowerCase();
     if (!needle) return true;
@@ -1270,6 +1290,70 @@
 	window.removeEventListener("pointercancel", endRecentActivityScrollbarDrag);
   }
 
+  function syncSettingsModalScrollbar() {
+	if (!settingsModalScroller) return;
+	settingsModalScrollTop = settingsModalScroller.scrollTop;
+	settingsModalClientHeight = settingsModalScroller.clientHeight;
+	settingsModalScrollHeight = settingsModalScroller.scrollHeight;
+  }
+
+  function observeSettingsModalScroller(node: HTMLDivElement) {
+	settingsModalScroller = node;
+	const resizeObserver = new ResizeObserver(syncSettingsModalScrollbar);
+	const mutationObserver = new MutationObserver(syncSettingsModalScrollbar);
+	resizeObserver.observe(node);
+	mutationObserver.observe(node, { childList: true, subtree: true, characterData: true });
+	window.requestAnimationFrame(syncSettingsModalScrollbar);
+	return {
+		destroy() {
+			resizeObserver.disconnect();
+			mutationObserver.disconnect();
+			if (settingsModalScroller === node) settingsModalScroller = null;
+		},
+	};
+  }
+
+  function scrollSettingsModalFromTrack(event: MouseEvent) {
+	if (!settingsModalScroller || !settingsModalScrollbarTrack || event.target !== event.currentTarget) return;
+	const bounds = settingsModalScrollbarTrack.getBoundingClientRect();
+	const maxScroll = settingsModalScrollHeight - settingsModalClientHeight;
+	if (bounds.height <= 0 || maxScroll <= 0) return;
+	const thumbHeight = Math.max(42, bounds.height * settingsModalClientHeight / settingsModalScrollHeight);
+	const available = Math.max(1, bounds.height - thumbHeight);
+	const target = Math.max(0, Math.min(available, event.clientY - bounds.top - thumbHeight / 2));
+	settingsModalScroller.scrollTop = target / available * maxScroll;
+  }
+
+  function startSettingsModalScrollbarDrag(event: PointerEvent) {
+	if (event.button !== 0 || !settingsModalScroller) return;
+	event.preventDefault();
+	event.stopPropagation();
+	settingsModalScrollbarDragPointer = event.pointerId;
+	settingsModalScrollbarDragStartY = event.clientY;
+	settingsModalScrollbarDragStartTop = settingsModalScroller.scrollTop;
+	window.addEventListener("pointermove", moveSettingsModalScrollbarDrag);
+	window.addEventListener("pointerup", endSettingsModalScrollbarDrag);
+	window.addEventListener("pointercancel", endSettingsModalScrollbarDrag);
+  }
+
+  function moveSettingsModalScrollbarDrag(event: PointerEvent) {
+	if (event.pointerId !== settingsModalScrollbarDragPointer || !settingsModalScroller || !settingsModalScrollbarTrack) return;
+	const trackHeight = settingsModalScrollbarTrack.clientHeight;
+	const thumbHeight = Math.max(42, trackHeight * settingsModalClientHeight / settingsModalScrollHeight);
+	const available = Math.max(1, trackHeight - thumbHeight);
+	const maxScroll = Math.max(0, settingsModalScrollHeight - settingsModalClientHeight);
+	settingsModalScroller.scrollTop = Math.max(0, Math.min(maxScroll,
+		settingsModalScrollbarDragStartTop + (event.clientY - settingsModalScrollbarDragStartY) / available * maxScroll));
+  }
+
+  function endSettingsModalScrollbarDrag(event: PointerEvent) {
+	if (event.pointerId !== settingsModalScrollbarDragPointer) return;
+	settingsModalScrollbarDragPointer = -1;
+	window.removeEventListener("pointermove", moveSettingsModalScrollbarDrag);
+	window.removeEventListener("pointerup", endSettingsModalScrollbarDrag);
+	window.removeEventListener("pointercancel", endSettingsModalScrollbarDrag);
+  }
+
   function sidebarActivityAccountName(accountID: string) {
 	const account = accounts.find((item) => item.id === accountID);
 	return account?.nickname || account?.name || account?.user_id || `账号 ${accountID.slice(0, 8)}`;
@@ -1335,11 +1419,25 @@
 	if (!isTauriDesktop()) return;
 	participationSettingsBusy = true;
 	try {
-		[participationSettings, roomSettings, monitoringSettings] = await Promise.all([
+		const [loadedParticipationSettings, loadedRoomSettings, loadedMonitoringSettings] = await Promise.all([
 			engineRequest<ParticipationSettings>("red_packet_participation.settings"),
 			engineRequest<RoomSettings>("room.settings"),
 			engineRequest<MonitoringSettings>("red_packet_monitor.settings"),
 		]);
+		participationSettings = {
+			...loadedParticipationSettings,
+			draw_result_delay_seconds: Number.isFinite(loadedParticipationSettings.draw_result_delay_seconds)
+				? loadedParticipationSettings.draw_result_delay_seconds
+				: 1,
+			draw_result_max_attempts: Number.isFinite(loadedParticipationSettings.draw_result_max_attempts)
+				? loadedParticipationSettings.draw_result_max_attempts
+				: 3,
+			participation_countdown_seconds: Number.isFinite(loadedParticipationSettings.participation_countdown_seconds)
+				? loadedParticipationSettings.participation_countdown_seconds
+				: 10,
+		};
+		roomSettings = loadedRoomSettings;
+		monitoringSettings = loadedMonitoringSettings;
 	} catch (error) {
 		participationSettingsError = error instanceof Error ? error.message : String(error);
 	} finally {
@@ -1424,7 +1522,9 @@
 		stop_after_joins: normalizedParticipationSetting(participationSettings.stop_after_joins, 100000),
 		cooldown_seconds: normalizedParticipationSetting(participationSettings.cooldown_seconds, 86400),
 		stop_after_wins: normalizedParticipationSetting(participationSettings.stop_after_wins, 100000),
-		draw_result_timeout_seconds: Math.max(1, normalizedParticipationSetting(participationSettings.draw_result_timeout_seconds, 300)),
+		draw_result_delay_seconds: normalizedParticipationSetting(participationSettings.draw_result_delay_seconds, 60),
+		draw_result_max_attempts: Math.max(1, normalizedParticipationSetting(participationSettings.draw_result_max_attempts, 20)),
+		participation_countdown_seconds: normalizedParticipationSetting(participationSettings.participation_countdown_seconds, 300),
 		minimum_diamonds: Math.max(1, normalizedParticipationSetting(participationSettings.minimum_diamonds, 1000000)),
 		packet_type: (["all", "gift", "diamond"] as ParticipationPacketType[]).includes(participationSettings.packet_type)
 			? participationSettings.packet_type
@@ -2069,6 +2169,14 @@
   function redPacketEventIsActive(event: RedPacketEvent, clock = Date.now()) {
     const drawAt = eventTimestamp(event.expires_at || event.draw_at);
     return drawAt > clock;
+  }
+
+  // Keep a just-expired packet visible in the current red-packet library for
+  // thirty seconds. This is display/history behavior only: native Go
+  // participation still rejects packets after their actual deadline.
+  function redPacketEventInLibraryWindow(event: RedPacketEvent, clock = Date.now()) {
+    const drawAt = eventTimestamp(event.expires_at || event.draw_at);
+    return drawAt <= 0 || drawAt > clock - 30_000;
   }
 
   function redPacketEventIsDiamond(event: RedPacketEvent) {
@@ -3616,7 +3724,10 @@
     if (accountRole === "participation") {
       const profile = account.participation;
       const binding = profile?.fingerprint_profile_id ? `指纹 ${profile.fingerprint_profile_id}` : "未绑定指纹";
-      return `参与 ${profile?.join_count ?? 0} 次 · 中奖 ${profile?.win_count ?? 0} 次 · ${binding}`;
+      const diamond = profile?.diamond_status === "valid" && profile.diamond_checked_at
+        ? `${profile.diamond_balance ?? 0} 钻`
+        : "暂无";
+      return `参与 ${profile?.join_count ?? 0} 次 · 中奖 ${profile?.win_count ?? 0} 次 · 钻石 ${diamond} · ${binding}`;
     }
     const profile = account.monitoring;
     return `${profile?.total_request_count ?? 0} / ${profile?.today_request_count ?? 0} · ${accountLastRequestAgo(profile?.last_used_at)}`;
@@ -4455,11 +4566,24 @@
 	try {
 		const items = await engineRequest<BrowserParticipationContext[]>("red_packet_participation.contexts");
 		browserParticipationContexts = Object.fromEntries(items.map((item) => [item.instance_id, item]));
-		browserRedPacketContextIds = items.filter((item) => item.accepting).map((item) => item.instance_id);
+		// The card Gift control represents an active native participation
+		// context, not whether the scheduler can accept a new packet at this
+		// exact moment. During cooldown, while waiting for a draw, or after a
+		// temporary eligibility change, `accepting` can be false even though the
+		// task and its live-room context are still running. Keep this marker in
+		// lockstep with the top-bar runtime, which uses active + prepared.
+		browserRedPacketContextIds = items
+			.filter((item) => item.active && item.prepared)
+			.map((item) => item.instance_id);
 		scheduleEmbeddedBrowserSync();
 	} catch {
 		// Keep the last native context state during a transient sidecar refresh.
 	}
+  }
+
+  function browserParticipationContextEnabled(instanceID: string) {
+	const context = browserParticipationContexts[instanceID];
+	return Boolean((context?.active && context?.prepared) || browserRedPacketContextIds.includes(instanceID));
   }
 
   function updateBrowserColumns(event: Event) {
@@ -4789,7 +4913,7 @@
       showToast("红包页面参与仅支持桌面客户端");
       return;
     }
-    const enabled = browserRedPacketContextIds.includes(instance.id);
+	const enabled = browserParticipationContextEnabled(instance.id);
     if (enabled) {
       browserRedPacketPreparingIds = [...browserRedPacketPreparingIds, instance.id];
       browserError = "";
@@ -4821,6 +4945,7 @@
         instanceId: instance.id,
         webRid: target.webRID,
 		resultOnly: canResumePendingResult,
+		allowChallengeRecovery: challengeBlocked,
       });
       if (!participationContext?.stopped && !browserRedPacketContextIds.includes(instance.id)) {
         browserRedPacketContextIds = [...browserRedPacketContextIds, instance.id];
@@ -4843,7 +4968,7 @@
 	const context = browserParticipationContexts[instance.id];
 	if (context?.accepting || context?.active || context?.task_active || browserRedPacketContextIds.includes(instance.id)) return false;
 	const account = accounts.find((item) => item.id === instance.account_id);
-	if (!account || account.cookie_status === "expired" || !account.roles.includes("participation")) return false;
+	if (!account || account.cookie_status === "expired" || !account.roles.includes("participation") || account.participation?.last_red_packet_status === "challenge_blocked") return false;
 	const target = browserRedPacketLiveTarget(instance);
 	if (!target || browserRedPacketPreparingIds.includes(instance.id)) return false;
 	const apiWasEnabled = Boolean(account.participation?.red_packet_api_enabled);
@@ -4868,6 +4993,7 @@
 			instanceId: instance.id,
 			webRid: target.webRID,
 			resultOnly: false,
+			allowChallengeRecovery: false,
 		});
 		if (!browserRedPacketContextIds.includes(instance.id)) {
 			browserRedPacketContextIds = [...browserRedPacketContextIds, instance.id];
@@ -5775,7 +5901,7 @@
             {#each visibleBrowserInstances as item, index}
 			  {@const participationContext = browserParticipationContexts[item.id]}
 			  {@const participationStopped = Boolean(participationContext?.stopped)}
-			  {@const participationEnabled = browserRedPacketContextIds.includes(item.id)}
+			  {@const participationEnabled = browserParticipationContextEnabled(item.id)}
 			  {@const cookieExpired = browserCookieExpired(item)}
 			  {@const participationBlocked = browserParticipationBlocked(item)}
 			  {@const followedLive = followingLiveSnapshot(item)}
@@ -6844,13 +6970,20 @@
         <button class="icon-button" aria-label="关闭" disabled={participationSettingsBusy} onclick={closeParticipationSettings}><X size={17} /></button>
       </div>
 
-      <div class="general-settings-tabs" role="tablist" aria-label="设置分类">
-        <button type="button" role="tab" aria-selected={settingsTab === "participation"} class:active={settingsTab === "participation"} onclick={() => settingsTab = "participation"}><Gift size={13} />红包参与</button>
-        <button type="button" role="tab" aria-selected={settingsTab === "rooms"} class:active={settingsTab === "rooms"} onclick={() => settingsTab = "rooms"}><Radio size={13} />直播间</button>
-        <button type="button" role="tab" aria-selected={settingsTab === "monitoring"} class:active={settingsTab === "monitoring"} onclick={() => settingsTab = "monitoring"}><SlidersHorizontal size={13} />监测设置</button>
-      </div>
+      <div class="settings-modal-scroll-shell">
+        <div
+          id="settings-modal-scroll"
+          class="settings-modal-scroll"
+          use:observeSettingsModalScroller
+          onscroll={syncSettingsModalScrollbar}
+        >
+          <div class="general-settings-tabs" role="tablist" aria-label="设置分类">
+            <button type="button" role="tab" aria-selected={settingsTab === "participation"} class:active={settingsTab === "participation"} onclick={() => settingsTab = "participation"}><Gift size={13} />红包参与</button>
+            <button type="button" role="tab" aria-selected={settingsTab === "rooms"} class:active={settingsTab === "rooms"} onclick={() => settingsTab = "rooms"}><Radio size={13} />直播间</button>
+            <button type="button" role="tab" aria-selected={settingsTab === "monitoring"} class:active={settingsTab === "monitoring"} onclick={() => settingsTab = "monitoring"}><SlidersHorizontal size={13} />监测设置</button>
+          </div>
 
-      {#if settingsTab === "participation"}
+          {#if settingsTab === "participation"}
         <p class="participation-settings-intro">以下限制按每个参与账号独立计算，填 0 表示不限制。</p>
         <div class="participation-settings-list">
           <div class="participation-setting-row participation-packet-type-row">
@@ -6884,6 +7017,14 @@
             </div>
           </div>
           <label class="participation-setting-row">
+            <span><strong>最低钻石</strong><small>能明确计算每份红包钻石数时，低于该门槛不参与</small></span>
+            <span class="number-field"><input type="number" min="1" max="1000000" step="1" bind:value={participationSettings.minimum_diamonds} /><em>钻</em></span>
+          </label>
+          <label class="participation-setting-row">
+            <span><strong>参与倒计时</strong><small>红包有效期剩余少于该秒数时不参与；填 0 表示不限制，但已过期红包仍不会参与</small></span>
+            <span class="number-field"><input type="number" min="0" max="300" step="1" bind:value={participationSettings.participation_countdown_seconds} /><em>秒</em></span>
+          </label>
+          <label class="participation-setting-row">
             <span><strong>参与停止</strong><small>参与达到指定次数后，不再分配后续红包任务</small></span>
             <span class="number-field"><input type="number" min="0" max="100000" step="1" bind:value={participationSettings.stop_after_joins} /><em>次</em></span>
           </label>
@@ -6896,15 +7037,15 @@
             <span class="number-field"><input type="number" min="0" max="100000" step="1" bind:value={participationSettings.stop_after_wins} /><em>次</em></span>
           </label>
           <label class="participation-setting-row">
-            <span><strong>开奖异常等待</strong><small>超过开奖时间仍未取得结果时，标记开奖异常并继续下一轮</small></span>
-            <span class="number-field"><input type="number" min="1" max="300" step="1" bind:value={participationSettings.draw_result_timeout_seconds} /><em>秒</em></span>
+            <span><strong>开奖后查询</strong><small>开奖后等待指定秒数再查询开奖结果；填 0 表示立即查询</small></span>
+            <span class="number-field"><input type="number" min="0" max="60" step="1" bind:value={participationSettings.draw_result_delay_seconds} /><em>秒</em></span>
           </label>
           <label class="participation-setting-row">
-            <span><strong>最低钻石</strong><small>能明确计算每份红包钻石数时，低于该门槛不参与</small></span>
-            <span class="number-field"><input type="number" min="1" max="1000000" step="1" bind:value={participationSettings.minimum_diamonds} /><em>钻</em></span>
+            <span><strong>最多查询次数</strong><small>开奖结果最多查询指定次数，全部无结果后立即使用钻石增量兜底</small></span>
+            <span class="number-field"><input type="number" min="1" max="20" step="1" bind:value={participationSettings.draw_result_max_attempts} /><em>次</em></span>
           </label>
         </div>
-      {:else if settingsTab === "rooms"}
+          {:else if settingsTab === "rooms"}
         <p class="participation-settings-intro">直播间自动整理与参与任务预热均由 Go 引擎持久化执行，不依赖当前页面或实例卡片是否渲染。</p>
         <div class="participation-settings-list">
           <label class="participation-setting-row room-auto-recycle-setting">
@@ -6916,7 +7057,7 @@
             <span class="number-field"><input type="number" min="0" max="3650" step="1" bind:value={roomSettings.auto_recycle_offline_days} /><em>天</em></span>
           </label>
         </div>
-      {:else}
+          {:else}
         <p class="participation-settings-intro">以下参数由 Go 引擎持久化并热更新正在运行的监测池；降低间隔或提高并发会增加接口压力，遇到限流时账号仍会自动冷却。</p>
         <div class="participation-settings-list monitoring-settings-list">
           <label class="participation-setting-row">
@@ -6940,9 +7081,29 @@
             <span class="number-field"><input type="number" min="8" max="256" step="8" bind:value={monitoringSettings.probe_concurrency} /><em>个</em></span>
           </label>
         </div>
-      {/if}
+          {/if}
 
-      {#if participationSettingsError}<div class="license-error"><WarningCircle size={14} />{participationSettingsError}</div>{/if}
+          {#if participationSettingsError}<div class="license-error"><WarningCircle size={14} />{participationSettingsError}</div>{/if}
+        </div>
+        {#if settingsModalScrollHeight > settingsModalClientHeight + 1}
+          {@const thumbPercent = Math.min(1, settingsModalClientHeight / Math.max(settingsModalScrollHeight, 1))}
+          {@const scrollPercent = Math.min(1, settingsModalScrollTop / Math.max(settingsModalScrollHeight - settingsModalClientHeight, 1))}
+          <div bind:this={settingsModalScrollbarTrack} class="modal-scrollbar" aria-hidden="true" onclick={scrollSettingsModalFromTrack}>
+            <span
+              role="scrollbar"
+              aria-label="设置内容滚动条"
+              aria-controls="settings-modal-scroll"
+              aria-valuemin="0"
+              aria-valuemax={Math.max(0, settingsModalScrollHeight - settingsModalClientHeight)}
+              aria-valuenow={Math.round(settingsModalScrollTop)}
+              tabindex="0"
+              class:dragging={settingsModalScrollbarDragPointer !== -1}
+              style={`height:max(42px, ${thumbPercent * 100}%); top:${scrollPercent * 100}%; transform:translateY(-${scrollPercent * 100}%);`}
+              onpointerdown={startSettingsModalScrollbarDrag}
+            ></span>
+          </div>
+        {/if}
+      </div>
       <div class="modal-actions">
         <button class="secondary-button" disabled={participationSettingsBusy} onclick={closeParticipationSettings}>取消</button>
         <button class="primary-action" disabled={participationSettingsBusy} onclick={saveParticipationSettings}>

@@ -532,7 +532,7 @@ const RED_PACKET_RECEIVE_CAPTURE_SCRIPT: &str = r#"(() => {
   };
   const remember = (url, status, text) => {
     try {
-      if (!/\/webcast\/luckybox\/receive\//.test(String(url || ''))) return;
+      if (!/\/webcast\/luckybox\/receive(?:\/|$|\?)/.test(String(url || ''))) return;
       const parsed = JSON.parse(String(text || ''));
       const infos = parsed && parsed.data && parsed.data.receive_info;
       if (!Array.isArray(infos) || !infos.length) return;
@@ -560,7 +560,7 @@ const RED_PACKET_RECEIVE_CAPTURE_SCRIPT: &str = r#"(() => {
         const request = input && typeof input === 'object' ? input : null;
         const url = scalar(request && request.url || input);
         return originalFetch.call(this, input, init).then((response) => {
-          if (/\/webcast\/luckybox\/receive\//.test(url)) {
+          if (/\/webcast\/luckybox\/receive(?:\/|$|\?)/.test(url)) {
             try { response.clone().text().then((text) => remember(url, response.status, text)); } catch (_) {}
           }
           return response;
@@ -580,7 +580,11 @@ const RED_PACKET_RECEIVE_CAPTURE_SCRIPT: &str = r#"(() => {
       XHR.prototype.send = function() {
         this.addEventListener('load', () => {
           const url = scalar(this.__fubaoReceiveURL);
-          if (/\/webcast\/luckybox\/receive\//.test(url)) remember(url, this.status, this.responseText);
+          if (/\/webcast\/luckybox\/receive(?:\/|$|\?)/.test(url)) {
+            let body = '';
+            try { body = this.responseText || ''; } catch (_) {}
+            remember(url, this.status, body);
+          }
         });
         return send.apply(this, arguments);
       };
@@ -1270,6 +1274,12 @@ async fn execute_page_participation(
     webview: &tauri::Webview,
     task: &NativePageParticipationTask,
 ) -> NativePageParticipationResult {
+    // The capture hook is normally installed from the page-load callback, but
+    // scheduled/background tasks can be admitted after a SPA navigation has
+    // already completed. Re-evaluate the idempotent hook immediately before
+    // every native action so the page's own signed receive request is never
+    // missed merely because this task arrived late.
+    let _ = webview.eval(RED_PACKET_RECEIVE_CAPTURE_SCRIPT);
     let cookie_name = format!(
         "fubao_participation_probe_{}",
         task.task_id
@@ -1416,6 +1426,78 @@ async fn execute_page_participation(
               return true;
             }} catch (_) {{ return false; }}
           }};
+          const clickJoinSurface = () => {{
+            try {{
+              const packetIds = new Set([String(task.box_id || ''), String(task.packet_id || '')].filter(Boolean));
+              const visible = (element) => {{
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                  Number(style.opacity || 1) > 0.05 && rect.width > 4 && rect.height > 4;
+              }};
+              const actionText = /^(抢红包|领红包|领取红包|立即领取|开红包|拆红包|拆开红包|抢|开|领|领取|拆|拆开)$/;
+              const candidates = Array.from(document.querySelectorAll('button,[role="button"],a,div,span,[class*="button" i],[class*="btn" i]'))
+                .map((element) => {{
+                  const own = String(element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
+                  let parent = element;
+                  let context = own;
+                  for (let depth = 0; depth < 5 && parent; depth += 1, parent = parent.parentElement) {{
+                    context += ` ${{String(parent.innerText || '').slice(0, 500)}}`;
+                    for (const key of ['data-box-id', 'data-boxid', 'data-activity-id', 'data-packet-id', 'data-red-packet-id']) {{
+                      const value = String(parent.getAttribute && parent.getAttribute(key) || '').trim();
+                      if (value) context += ` ${{value}}`;
+                    }}
+                  }}
+                  const lowered = context.toLowerCase();
+                  if (!visible(element) || !actionText.test(own) || /福袋|抽奖|lottery/.test(lowered)) return null;
+                  const matchedId = Array.from(packetIds).some((id) => id && context.includes(id));
+                  const hasRedPacket = /红包|luckybox|red[ _-]?packet|钻石红包|礼物红包/i.test(context);
+                  if (!hasRedPacket && !matchedId) return null;
+                  return {{element, score: (matchedId ? 100 : 0) + (hasRedPacket ? 20 : 0)}};
+                }})
+                .filter(Boolean)
+                .sort((left, right) => right.score - left.score);
+              const candidate = candidates[0];
+              if (!candidate) return false;
+              try {{ candidate.element.scrollIntoView({{block: 'center', inline: 'center'}}); }} catch (_) {{}}
+              for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {{
+                try {{ candidate.element.dispatchEvent(new MouseEvent(type, {{bubbles: true, cancelable: true, view: window}})); }} catch (_) {{}}
+              }}
+              try {{ if (typeof candidate.element.click === 'function') candidate.element.click(); }} catch (_) {{}}
+              return true;
+            }} catch (_) {{ return false; }}
+          }};
+          const clickPacketSurface = () => {{
+            try {{
+              const packetIds = [String(task.box_id || ''), String(task.packet_id || '')].filter(Boolean);
+              const visible = (element) => {{
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                  Number(style.opacity || 1) > 0.05 && rect.width > 12 && rect.height > 12;
+              }};
+              const candidates = Array.from(document.querySelectorAll('div,section,li,[role="dialog"],[class*="packet" i],[class*="lucky" i]'))
+                .map((element) => {{
+                  if (!visible(element)) return null;
+                  const context = String(element.innerText || '').replace(/\s+/g, ' ').slice(0, 700);
+                  const descriptor = String(element.className || '') + ' ' + String(element.getAttribute('data-e2e') || '');
+                  if (/福袋|抽奖|lottery/.test(context + descriptor)) return null;
+                  const hasId = packetIds.some((id) => id && (context.includes(id) || descriptor.includes(id)));
+                  const hasPacketCopy = /钻石红包|礼物红包|红包/.test(context) && /(?:共|总)\s*\d+\s*(?:钻|份)/.test(context);
+                  if (!hasId && !hasPacketCopy) return null;
+                  const rect = element.getBoundingClientRect();
+                  if (rect.width > 520 || rect.height > 420) return null;
+                  return {{element, score: (hasId ? 100 : 0) + (hasPacketCopy ? 20 : 0) + Math.min(10, rect.width / 1000)}};
+                }})
+                .filter(Boolean)
+                .sort((left, right) => right.score - left.score);
+              const candidate = candidates[0];
+              if (!candidate) return false;
+              try {{ candidate.element.scrollIntoView({{block: 'center', inline: 'center'}}); }} catch (_) {{}}
+              candidate.element.click();
+              return true;
+            }} catch (_) {{ return false; }}
+          }};
           const send = async (endpoint) => {{
             const response = await fetch(requestURL(endpoint).toString(), {{
               method: 'POST', credentials: 'include', cache: 'no-store',
@@ -1466,6 +1548,26 @@ async fn execute_page_participation(
                   return;
                 }}
               }}
+              if (task.action !== 'receive') {{
+                const packetOpened = clickPacketSurface();
+                if (packetOpened) await new Promise((resolve) => setTimeout(resolve, 350));
+                if (!clickJoinSurface()) {{
+                  // Fall through to the signed page-context API fallback when
+                  // the live page does not expose a safe, targetable packet
+                  // control (for example while a different overlay is open).
+                }} else {{
+                // A real page click keeps the pending-red-packet panel open;
+                // Douyin then emits the signed receive request at draw time.
+                // Never click the packet entry again after this point because
+                // it toggles the panel closed and suppresses that request.
+                await new Promise((resolve) => setTimeout(resolve, 650));
+                const pageText = String(document.body && document.body.innerText || '');
+                if (/已参与|等待开奖|参与成功|成功参与/.test(pageText)) {{
+                  finish({{endpoint: 'page', http_status: 200, body: JSON.stringify({{status_code: 0, data: {{succeed: true, joined: true, page_join: true}}}}), error: '', attempts: 1, context_missing: false, login_expired: false, challenge_blocked: false}});
+                  return;
+                }}
+              }}
+              }}
               // A synthetic join -> rush fallback doubles account traffic and
               // Douyin reports the second request as rush_spam. One detected
               // packet therefore issues exactly one page-context join. A rush
@@ -1473,7 +1575,7 @@ async fn execute_page_participation(
               // whose complete request template was captured by the page.
               const action = task.action === 'receive' ? 'receive' : 'join';
               const response = await send(action);
-              if (action === 'receive' && /\\"receive_info\\"\\s*:\\s*\\[\\s*\\]/.test(response.text || '')) {{
+              if (action === 'receive' && /"receive_info"\s*:\s*\[\s*\]/.test(response.text || '')) {{
                 // Keep the page-native path alive: if the result panel is
                 // already present, opening it causes Douyin to issue its own
                 // signed receive request. The capture hook above then returns
@@ -2519,6 +2621,7 @@ async fn prepare_browser_red_packet_context(
     instance_id: String,
     web_rid: String,
     result_only: Option<bool>,
+    allow_challenge_recovery: Option<bool>,
 ) -> Result<String, String> {
     let instance_id = instance_id.trim().to_string();
     let web_rid = web_rid.trim().to_string();
@@ -2582,6 +2685,7 @@ async fn prepare_browser_red_packet_context(
             "instance_id": instance_id,
             "ready": true,
             "result_only": result_only.unwrap_or(false),
+            "allow_challenge_recovery": allow_challenge_recovery.unwrap_or(false),
             "secret": runtime.native_secret,
         }),
     )

@@ -18,8 +18,10 @@ import (
 // accounts intentionally default to off; participation must always be an
 // explicit user choice in this client.
 // The legacy app's counters describe a different runtime, so carrying them
-// across makes the current desktop numbers misleading.
-const storeVersion = 4
+// across makes the current desktop numbers misleading. Version 5 adds the
+// safe native wallet snapshot used to show current diamonds and reconcile a
+// missing luckybox result.
+const storeVersion = 5
 
 type Role string
 
@@ -57,6 +59,10 @@ type ParticipationProfile struct {
 	FingerprintProfileID   int      `json:"fingerprint_profile_id"`
 	Tags                   []string `json:"tags,omitempty"`
 	GroupID                string   `json:"group_id,omitempty"`
+	DiamondBalance         int64    `json:"diamond_balance"`
+	DiamondX10             int64    `json:"diamond_x10"`
+	DiamondCheckedAt       string   `json:"diamond_checked_at,omitempty"`
+	DiamondStatus          string   `json:"diamond_status,omitempty"`
 }
 
 const redPacketStatusChallengeBlocked = "challenge_blocked"

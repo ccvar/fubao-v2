@@ -1309,6 +1309,22 @@ func main() {
 				writeError(encoder, req.ID, "invalid_params", "红包参与设置参数无效")
 				continue
 			}
+			// Preserve newer persisted values when an older frontend omits fields it
+			// does not know yet. Explicit zero remains valid for the countdown and
+			// result delay; max attempts is normalized to a safe positive default.
+			var rawParams map[string]json.RawMessage
+			if err := json.Unmarshal(req.Params, &rawParams); err == nil {
+				if _, present := rawParams["participation_countdown_seconds"]; !present {
+					params.ParticipationCountdownSeconds = redPacketStore.GetParticipationSettings().ParticipationCountdownSeconds
+				}
+				stored := redPacketStore.GetParticipationSettings()
+				if _, present := rawParams["draw_result_delay_seconds"]; !present {
+					params.DrawResultDelaySeconds = stored.DrawResultDelaySeconds
+				}
+				if _, present := rawParams["draw_result_max_attempts"]; !present {
+					params.DrawResultMaxAttempts = stored.DrawResultMaxAttempts
+				}
+			}
 			result, err := redPacketStore.SetParticipationSettings(params)
 			if err != nil {
 				writeError(encoder, req.ID, "red_packet_settings_failed", err.Error())
@@ -1476,10 +1492,11 @@ func main() {
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{"account_ids": accountIDs}})
 		case "red_packet_participation.native_context":
 			var params struct {
-				InstanceID string `json:"instance_id"`
-				Ready      bool   `json:"ready"`
-				ResultOnly bool   `json:"result_only"`
-				Secret     string `json:"secret"`
+				InstanceID             string `json:"instance_id"`
+				Ready                  bool   `json:"ready"`
+				ResultOnly             bool   `json:"result_only"`
+				AllowChallengeRecovery bool   `json:"allow_challenge_recovery"`
+				Secret                 string `json:"secret"`
 			}
 			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.InstanceID) == "" {
 				writeError(encoder, req.ID, "invalid_params", "浏览器红包参与上下文参数无效")
@@ -1499,9 +1516,14 @@ func main() {
 				continue
 			}
 			accountName := "参与账号"
+			challengeBlocked := false
 			if accountStoreErr == nil {
 				for _, account := range accountStore.List(accounts.RoleParticipation) {
 					if account.ID == accountID {
+						if params.Ready && !params.ResultOnly && !params.AllowChallengeRecovery &&
+							account.Participation != nil && account.Participation.LastRedPacketStatus == "challenge_blocked" {
+							challengeBlocked = true
+						}
 						accountName = strings.TrimSpace(account.Nickname)
 						if accountName == "" {
 							accountName = strings.TrimSpace(account.Name)
@@ -1509,6 +1531,10 @@ func main() {
 						break
 					}
 				}
+			}
+			if challengeBlocked {
+				writeError(encoder, req.ID, "participation_challenge_blocked", "该账号当前处于验证拦截，请先处理验证后手动重新启动参与")
+				continue
 			}
 			if params.Ready && !params.ResultOnly {
 				if err := redPacketStore.RecordParticipationStarted(accountID, accountName); err != nil {
