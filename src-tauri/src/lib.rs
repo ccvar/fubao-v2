@@ -499,6 +499,94 @@ impl NativePageParticipationResult {
 }
 
 const DOUYIN_CHROME_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+// A personal luckybox result is emitted by the live page's signed
+// `luckybox/receive` request. An unsigned native retry commonly returns HTTP
+// 200 with `receive_info: []`, which is only an intermediate result. Keep a
+// small allow-listed capture queue in the native account WebView so Go can
+// consume the page result without exposing cookies, signatures, headers, or
+// raw response bodies to the frontend.
+const RED_PACKET_RECEIVE_CAPTURE_SCRIPT: &str = r#"(() => {
+  if (window.__fubaoRedPacketReceiveCaptureInstalled) return;
+  window.__fubaoRedPacketReceiveCaptureInstalled = true;
+  const queue = [];
+  const scalar = (value) => value === undefined || value === null ? '' : String(value);
+  const idsFor = (item) => {
+    if (!item || typeof item !== 'object') return [];
+    return [item.box_id_str, item.boxIdStr, item.box_id, item.boxId,
+      item.activity_id, item.activityId, item.red_packet_id,
+      item.redPacketId, item.lottery_id, item.lotteryId]
+      .map(scalar).map((value) => value.trim()).filter(Boolean);
+  };
+  const safeInfo = (item) => {
+    if (!item || typeof item !== 'object') return null;
+    const result = {};
+    for (const key of ['succeed', 'success', 'box_id', 'box_id_str', 'boxId', 'boxIdStr',
+      'activity_id', 'activityId', 'red_packet_id', 'redPacketId', 'lottery_id', 'lotteryId',
+      'box_type', 'boxType', 'diamond_count', 'cash_count', 'diamond', 'amount',
+      'gift_name', 'giftName', 'gift_count', 'giftCount', 'gift_num', 'giftNum', 'count',
+      'prize_name', 'prizeName', 'reward_name', 'rewardName']) {
+      if (Object.prototype.hasOwnProperty.call(item, key)) result[key] = item[key];
+    }
+    return result;
+  };
+  const remember = (url, status, text) => {
+    try {
+      if (!/\/webcast\/luckybox\/receive\//.test(String(url || ''))) return;
+      const parsed = JSON.parse(String(text || ''));
+      const infos = parsed && parsed.data && parsed.data.receive_info;
+      if (!Array.isArray(infos) || !infos.length) return;
+      const reduced = infos.map(safeInfo).filter(Boolean);
+      if (!reduced.length) return;
+      queue.push({status: Number(status || 200), ids: reduced.flatMap(idsFor), count: reduced.length,
+        body: JSON.stringify({status_code: parsed.status_code, status_msg: parsed.status_msg,
+          data: {receive_info: reduced}})});
+      while (queue.length > 24) queue.shift();
+    } catch (_) {}
+  };
+  window.__fubaoTakeRedPacketReceiveResult = (boxId, packetId) => {
+    const wanted = new Set([scalar(boxId).trim(), scalar(packetId).trim()].filter(Boolean));
+    let index = -1;
+    for (let i = queue.length - 1; i >= 0; i -= 1) {
+      if (queue[i].ids.some((id) => wanted.has(id))) { index = i; break; }
+    }
+    if (index < 0 && queue.length === 1) index = 0;
+    return index < 0 ? null : queue.splice(index, 1)[0] || null;
+  };
+  try {
+    const originalFetch = window.fetch;
+    if (typeof originalFetch === 'function') {
+      window.fetch = function(input, init) {
+        const request = input && typeof input === 'object' ? input : null;
+        const url = scalar(request && request.url || input);
+        return originalFetch.call(this, input, init).then((response) => {
+          if (/\/webcast\/luckybox\/receive\//.test(url)) {
+            try { response.clone().text().then((text) => remember(url, response.status, text)); } catch (_) {}
+          }
+          return response;
+        });
+      };
+    }
+  } catch (_) {}
+  try {
+    const XHR = window.XMLHttpRequest;
+    if (XHR && XHR.prototype) {
+      const open = XHR.prototype.open;
+      const send = XHR.prototype.send;
+      XHR.prototype.open = function(method, url) {
+        this.__fubaoReceiveURL = scalar(url);
+        return open.apply(this, arguments);
+      };
+      XHR.prototype.send = function() {
+        this.addEventListener('load', () => {
+          const url = scalar(this.__fubaoReceiveURL);
+          if (/\/webcast\/luckybox\/receive\//.test(url)) remember(url, this.status, this.responseText);
+        });
+        return send.apply(this, arguments);
+      };
+    }
+  } catch (_) {}
+})();"#;
 const DOUYIN_LOGIN_COOKIE_NAMES: [&str; 9] = [
     "sessionid_ss",
     "sessionid",
@@ -1218,13 +1306,50 @@ async fn execute_page_participation(
               url.searchParams.delete(key);
             }}
           }};
-          const detectsChallenge = (value) => {{
-            const source = String(value || '').slice(0, 120000);
+          const challengeCopy = /请完成(?:安全)?验证|请拖动滑块|拖动滑块|滑块验证|验证码拦截|安全验证拦截/;
+          const visibleElement = (element) => {{
+            if (!element) return false;
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden' &&
+              Number(style.opacity || 1) > 0.05 && rect.width > 2 && rect.height > 2;
+          }};
+          const detectsVisibleChallenge = () => {{
+            try {{
+              const selectors = [
+                'iframe[src*="captcha"]', 'iframe[src*="verify"]',
+                '[id*="captcha"]', '[class*="captcha"]',
+                '[id*="verify"]', '[class*="verify"]',
+                '[data-e2e*="captcha"]', '[data-testid*="captcha"]'
+              ].join(',');
+              for (const element of document.querySelectorAll(selectors)) {{
+                if (!visibleElement(element)) continue;
+                const copy = String(element.innerText || element.getAttribute('aria-label') || element.getAttribute('title') || '');
+                if (challengeCopy.test(copy) || /secsdk-captcha|verifycenter|verify_center/.test(String(element.outerHTML || '').toLowerCase())) return true;
+              }}
+              return challengeCopy.test(String(document.body && document.body.innerText || ''));
+            }} catch (error) {{ return false; }}
+          }};
+          const detectsResponseChallenge = (value) => {{
+            const source = String(value || '').slice(0, 16000);
             const lowered = source.toLowerCase();
-            return /验证码|安全验证|拖动滑块|滑块验证|验证中/.test(source) ||
-              lowered.includes('secsdk-captcha') || lowered.includes('captcha') ||
-              lowered.includes('verify_check') || lowered.includes('verifycenter') ||
-              lowered.includes('verify_center') || lowered.includes('need_verify');
+            if (challengeCopy.test(source) || /secsdk-captcha|captcha_required|challenge_required|verifycenter|verify_center/.test(lowered)) return true;
+            try {{
+              const parsed = JSON.parse(source);
+              const inspect = (item) => {{
+                if (!item || typeof item !== 'object') return false;
+                if (Array.isArray(item)) return item.some(inspect);
+                for (const key of ['need_verify', 'needVerify', 'captcha_required', 'captchaRequired', 'challenge_required', 'challengeRequired']) {{
+                  const value = item[key];
+                  if (value === true || (typeof value === 'number' && value !== 0) || (typeof value === 'string' && !['', '0', 'false', 'none', 'null'].includes(value.toLowerCase()))) return true;
+                }}
+                for (const key of ['status_msg', 'message', 'msg', 'toast', 'error']) {{
+                  if (challengeCopy.test(String(item[key] || ''))) return true;
+                }}
+                return Object.values(item).some(inspect);
+              }};
+              return inspect(parsed);
+            }} catch (error) {{ return false; }}
           }};
           const commonRequestURL = () => {{
             try {{
@@ -1261,6 +1386,35 @@ async fn execute_page_participation(
             if (!url.searchParams.has('browser_online')) url.searchParams.set('browser_online', String(navigator.onLine));
             if (!url.searchParams.has('cookie_enabled')) url.searchParams.set('cookie_enabled', String(navigator.cookieEnabled));
             return url;
+          }};
+          const takeCapturedReceive = () => {{
+            try {{
+              if (typeof window.__fubaoTakeRedPacketReceiveResult !== 'function') return null;
+              const item = window.__fubaoTakeRedPacketReceiveResult(task.box_id, task.packet_id);
+              if (!item || !item.body) return null;
+              return {{endpoint: 'receive', status: Number(item.status || 200), text: String(item.body)}};
+            }} catch (_) {{ return null; }}
+          }};
+          const clickResultSurface = () => {{
+            try {{
+              const exact = /^(查看结果|开奖结果|开红包|拆红包|拆开红包|打开红包|未中奖|已中奖)$/;
+              const visible = (element) => {{
+                const style = window.getComputedStyle(element);
+                const rect = element.getBoundingClientRect();
+                return style.display !== 'none' && style.visibility !== 'hidden' &&
+                  Number(style.opacity || 1) > 0.05 && rect.width > 4 && rect.height > 4;
+              }};
+              const candidates = Array.from(document.querySelectorAll('button,[role="button"],a'))
+                .map((element) => {{
+                  const text = String(element.innerText || element.textContent || '').replace(/\\s+/g, ' ').trim();
+                  return {{element, text}};
+                }})
+                .filter((item) => visible(item.element) && exact.test(item.text));
+              const candidate = candidates[0];
+              if (!candidate) return false;
+              candidate.element.click();
+              return true;
+            }} catch (_) {{ return false; }}
           }};
           const send = async (endpoint) => {{
             const response = await fetch(requestURL(endpoint).toString(), {{
@@ -1301,10 +1455,16 @@ async fn execute_page_participation(
                 finish({{endpoint: 'page', http_status: 0, body: '', error: '浏览器实例未进入目标直播间', attempts: 0, context_missing: true}});
                 return;
               }}
-              const pageChallengeSource = `${{document.body && document.body.innerText || ''}}\n${{document.documentElement && document.documentElement.innerHTML || ''}}`;
-              if (detectsChallenge(pageChallengeSource)) {{
+              if (detectsVisibleChallenge()) {{
                 finish({{endpoint: 'page', http_status: 0, body: '', error: '验证码/安全验证拦截，已暂停接收新任务', attempts: 0, context_missing: false, login_expired: false, challenge_blocked: true}});
                 return;
+              }}
+              if (task.action === 'receive') {{
+                const captured = takeCapturedReceive();
+                if (captured) {{
+                  finish({{endpoint: captured.endpoint, http_status: captured.status, body: captured.text, error: '', attempts: 1, context_missing: false, login_expired: false, challenge_blocked: false}});
+                  return;
+                }}
               }}
               // A synthetic join -> rush fallback doubles account traffic and
               // Douyin reports the second request as rush_spam. One detected
@@ -1313,7 +1473,20 @@ async fn execute_page_participation(
               // whose complete request template was captured by the page.
               const action = task.action === 'receive' ? 'receive' : 'join';
               const response = await send(action);
-              const challengeBlocked = detectsChallenge(response.text);
+              if (action === 'receive' && /\\"receive_info\\"\\s*:\\s*\\[\\s*\\]/.test(response.text || '')) {{
+                // Keep the page-native path alive: if the result panel is
+                // already present, opening it causes Douyin to issue its own
+                // signed receive request. The capture hook above then returns
+                // the definitive personal result on the next poll.
+                clickResultSurface();
+                await new Promise((resolve) => setTimeout(resolve, 700));
+                const captured = takeCapturedReceive();
+                if (captured) {{
+                  finish({{endpoint: captured.endpoint, http_status: captured.status, body: captured.text, error: '', attempts: 1, context_missing: false, login_expired: false, challenge_blocked: false}});
+                  return;
+                }}
+              }}
+              const challengeBlocked = detectsResponseChallenge(response.text);
               finish({{
                 endpoint: response.endpoint,
                 http_status: response.status,
@@ -1326,7 +1499,7 @@ async fn execute_page_participation(
               }});
             }} catch (error) {{
               const message = String(error && (error.message || error) || '直播页面红包请求失败');
-              const challengeBlocked = detectsChallenge(message);
+              const challengeBlocked = detectsResponseChallenge(message);
               finish({{endpoint: 'page', http_status: 0, body: '', error: challengeBlocked ? '验证码/安全验证拦截，已暂停接收新任务' : message, attempts: 1, context_missing: false, login_expired: false, challenge_blocked: challengeBlocked}});
             }}
           }})();
@@ -2129,6 +2302,12 @@ async fn ensure_browser_webview(
             let is_douyin = is_safe_douyin_location(payload.url());
             if is_douyin {
                 remember_browser_location(&page_runtime, &page_instance_id, payload.url());
+                if payload.event() == PageLoadEvent::Finished {
+                    // Install after every real Douyin document load. SPA room
+                    // switches keep the same document and therefore retain
+                    // the hook; full navigations get a fresh one here.
+                    let _ = webview.eval(RED_PACKET_RECEIVE_CAPTURE_SCRIPT);
+                }
             }
             if reveal_when_ready && payload.event() == PageLoadEvent::Finished && is_douyin {
                 // WKWebView can report navigation completion before the

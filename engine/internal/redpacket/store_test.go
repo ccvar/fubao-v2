@@ -178,6 +178,51 @@ func TestParticipationSettingsPolicyAndActivityPersist(t *testing.T) {
 	}
 }
 
+func TestParticipationTaskCapturesSettingsSnapshot(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ParticipationSettings{
+		StopAfterJoins: 2, CooldownSeconds: 30, StopAfterWins: 1,
+		DrawResultTimeoutSeconds: 21, MinimumDiamonds: 3,
+		PacketType: ParticipationPacketTypeGift, FollowPolicy: ParticipationFollowPolicyOnly,
+	}
+	if _, err := store.SetParticipationSettings(want); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordParticipationStarted("snapshot-account", "快照账号"); err != nil {
+		t.Fatal(err)
+	}
+	changed := ParticipationSettings{
+		StopAfterJoins: 1, CooldownSeconds: 1, StopAfterWins: 9,
+		DrawResultTimeoutSeconds: 10, MinimumDiamonds: 1,
+		PacketType: ParticipationPacketTypeDiamond, FollowPolicy: ParticipationFollowPolicyAll,
+	}
+	if _, err := store.SetParticipationSettings(changed); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.GetParticipationSettingsForAccount("snapshot-account"); got != want {
+		t.Fatalf("active task changed when global settings changed: got=%+v want=%+v", got, want)
+	}
+	event := Event{ID: "snapshot-event", ActualRoomID: "700001", JoinBoxID: "box-snapshot"}
+	if reserved, err := store.ReserveParticipation(event, "snapshot-account", "快照账号"); err != nil || !reserved {
+		t.Fatalf("reserve: reserved=%v err=%v", reserved, err)
+	}
+	if got := store.ParticipationSettingsForEvent(event.ID, "snapshot-account"); got != want {
+		t.Fatalf("record did not retain task settings: got=%+v want=%+v", got, want)
+	}
+	if err := store.CompleteParticipation(event.ID, "snapshot-account", "join", "joined", "已受理", 1, true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ResolveParticipationDraw(event.ID, "snapshot-account", "not_won", "未中奖", "", 1); err != nil {
+		t.Fatal(err)
+	}
+	if allowed, cooldown := store.ParticipationPolicy("snapshot-account", time.Now()); allowed || cooldown <= 29*time.Second || cooldown > 30*time.Second {
+		t.Fatalf("task policy did not retain cooldown snapshot: allowed=%v cooldown=%v", allowed, cooldown)
+	}
+}
+
 func TestParticipationSettingsDefaultDrawTimeoutAndSafeTrace(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {

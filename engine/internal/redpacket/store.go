@@ -131,32 +131,33 @@ type CenterEvent struct {
 // ParticipationRecord is safe audit metadata for one account/event attempt.
 // It deliberately excludes Cookie values, signed URLs, headers and raw bodies.
 type ParticipationRecord struct {
-	ID            string `json:"id"`
-	EventID       string `json:"event_id"`
-	AccountID     string `json:"account_id"`
-	AccountName   string `json:"account_name"`
-	TaskID        string `json:"task_id,omitempty"`
-	RoomID        string `json:"room_id,omitempty"`
-	WebRID        string `json:"web_rid,omitempty"`
-	ActualRoomID  string `json:"actual_room_id,omitempty"`
-	RoomName      string `json:"room_name,omitempty"`
-	StreamerName  string `json:"streamer_name,omitempty"`
-	PacketID      string `json:"packet_id"`
-	Title         string `json:"title,omitempty"`
-	Prize         string `json:"prize,omitempty"`
-	Award         string `json:"award,omitempty"`
-	DrawAt        string `json:"draw_at,omitempty"`
-	ExpiresAt     string `json:"expires_at,omitempty"`
-	Endpoint      string `json:"endpoint,omitempty"`
-	Status        string `json:"status"`
-	Message       string `json:"message,omitempty"`
-	AttemptCount  int    `json:"attempt_count"`
-	Joined        bool   `json:"joined"`
-	Won           bool   `json:"won,omitempty"`
-	JoinedAt      string `json:"joined_at,omitempty"`
-	CooldownUntil string `json:"cooldown_until,omitempty"`
-	CreatedAt     string `json:"created_at"`
-	UpdatedAt     string `json:"updated_at"`
+	ID            string                `json:"id"`
+	EventID       string                `json:"event_id"`
+	AccountID     string                `json:"account_id"`
+	AccountName   string                `json:"account_name"`
+	TaskID        string                `json:"task_id,omitempty"`
+	Settings      ParticipationSettings `json:"settings,omitempty"`
+	RoomID        string                `json:"room_id,omitempty"`
+	WebRID        string                `json:"web_rid,omitempty"`
+	ActualRoomID  string                `json:"actual_room_id,omitempty"`
+	RoomName      string                `json:"room_name,omitempty"`
+	StreamerName  string                `json:"streamer_name,omitempty"`
+	PacketID      string                `json:"packet_id"`
+	Title         string                `json:"title,omitempty"`
+	Prize         string                `json:"prize,omitempty"`
+	Award         string                `json:"award,omitempty"`
+	DrawAt        string                `json:"draw_at,omitempty"`
+	ExpiresAt     string                `json:"expires_at,omitempty"`
+	Endpoint      string                `json:"endpoint,omitempty"`
+	Status        string                `json:"status"`
+	Message       string                `json:"message,omitempty"`
+	AttemptCount  int                   `json:"attempt_count"`
+	Joined        bool                  `json:"joined"`
+	Won           bool                  `json:"won,omitempty"`
+	JoinedAt      string                `json:"joined_at,omitempty"`
+	CooldownUntil string                `json:"cooldown_until,omitempty"`
+	CreatedAt     string                `json:"created_at"`
+	UpdatedAt     string                `json:"updated_at"`
 }
 
 // ParticipationState explains why a browser account can or cannot accept new
@@ -182,10 +183,13 @@ type ParticipationTask struct {
 	AccountID       string `json:"account_id"`
 	AccountName     string `json:"account_name,omitempty"`
 	BatchActivityID string `json:"batch_activity_id,omitempty"`
-	Active          bool   `json:"active"`
-	StartedAt       string `json:"started_at"`
-	EndedAt         string `json:"ended_at,omitempty"`
-	EndReason       string `json:"end_reason,omitempty"`
+	// Settings is the immutable policy snapshot captured when this explicit
+	// task starts. Global settings edits affect only future tasks.
+	Settings  ParticipationSettings `json:"settings,omitempty"`
+	Active    bool                  `json:"active"`
+	StartedAt string                `json:"started_at"`
+	EndedAt   string                `json:"ended_at,omitempty"`
+	EndReason string                `json:"end_reason,omitempty"`
 }
 
 // ParticipationOverview is the safe all-time aggregate shown in the sidebar.
@@ -494,7 +498,6 @@ func (s *Store) load() error {
 	s.monitoringSettings = normalizeMonitoringSettings(payload.MonitoringSettings)
 	s.probeSlots = make(chan struct{}, s.monitoringSettings.ProbeConcurrency)
 	migrated := payload.Version < storeVersion
-	deadlineGrace := time.Duration(s.settings.DrawResultTimeoutSeconds) * time.Second
 	for _, record := range s.participations {
 		if !record.Joined || participationDrawTerminal(record.Status) {
 			continue
@@ -505,12 +508,17 @@ func (s *Store) load() error {
 				deadlineText = firstNonEmpty(event.DrawAt, event.ExpiresAt)
 			}
 		}
+		settings := s.settings
+		if snapshot, ok := taskSettingsSnapshot(record.Settings); ok {
+			settings = snapshot
+		}
+		deadlineGrace := time.Duration(settings.DrawResultTimeoutSeconds) * time.Second
 		deadline, parseErr := time.Parse(time.RFC3339Nano, deadlineText)
 		if parseErr != nil || time.Now().Before(deadline.Add(deadlineGrace)) {
 			continue
 		}
 		record.Status = "draw_error"
-		record.Message = fmt.Sprintf("开奖异常：超过开奖时间 %d 秒仍未获取到结果", s.settings.DrawResultTimeoutSeconds)
+		record.Message = fmt.Sprintf("开奖异常：超过开奖时间 %d 秒仍未获取到结果", settings.DrawResultTimeoutSeconds)
 		record.Endpoint = "receive"
 		record.UpdatedAt = time.Now().Format(time.RFC3339Nano)
 		migrated = true
@@ -657,7 +665,8 @@ func (s *Store) ReserveParticipation(event Event, accountID, accountName string)
 	s.participations[id] = &ParticipationRecord{
 		ID: id, EventID: event.ID,
 		AccountID: accountID, AccountName: strings.TrimSpace(accountName), TaskID: task.ID,
-		RoomID: event.RoomID, WebRID: event.WebRID, ActualRoomID: event.ActualRoomID,
+		Settings: task.Settings,
+		RoomID:   event.RoomID, WebRID: event.WebRID, ActualRoomID: event.ActualRoomID,
 		RoomName: event.RoomName, StreamerName: event.StreamerName,
 		PacketID: event.JoinBoxID, Title: event.Title, Prize: event.Prize,
 		DrawAt: event.DrawAt, ExpiresAt: event.ExpiresAt,
@@ -823,6 +832,63 @@ func (s *Store) GetParticipationSettings() ParticipationSettings {
 	return s.settings
 }
 
+// GetParticipationSettingsForAccount returns the policy snapshot belonging to
+// the account's active task. It intentionally falls back to the global policy
+// for legacy tasks written before task snapshots were introduced.
+func (s *Store) GetParticipationSettingsForAccount(accountID string) ParticipationSettings {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.participationSettingsForAccountLocked(accountID)
+}
+
+// ParticipationSettingsForEvent returns the immutable policy snapshot for the
+// task that reserved an account/event pair. This keeps delayed draw polling
+// tied to the task that accepted the packet, even after a new task starts.
+func (s *Store) ParticipationSettingsForEvent(eventID, accountID string) ParticipationSettings {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record := s.participations[participationRecordID(accountID, eventID)]
+	if record != nil {
+		if snapshot, ok := taskSettingsSnapshot(record.Settings); ok {
+			return snapshot
+		}
+		if task := s.participationTaskByIDLocked(record.AccountID, record.TaskID); task != nil {
+			if snapshot, ok := taskSettingsSnapshot(task.Settings); ok {
+				return snapshot
+			}
+		}
+	}
+	return s.settings
+}
+
+func (s *Store) participationSettingsForAccountLocked(accountID string) ParticipationSettings {
+	if task := s.participationTasks[strings.TrimSpace(accountID)]; task != nil {
+		if snapshot, ok := taskSettingsSnapshot(task.Settings); ok {
+			return snapshot
+		}
+	}
+	return s.settings
+}
+
+func (s *Store) participationTaskByIDLocked(accountID, taskID string) *ParticipationTask {
+	task := s.participationTasks[strings.TrimSpace(accountID)]
+	if task == nil || strings.TrimSpace(task.ID) != strings.TrimSpace(taskID) {
+		return nil
+	}
+	return task
+}
+
+func taskSettingsSnapshot(settings ParticipationSettings) (ParticipationSettings, bool) {
+	// PacketType, FollowPolicy, and the normalized defaults make a real snapshot
+	// distinguishable from an older zero-value task persisted by pre-snapshot
+	// versions.
+	if strings.TrimSpace(settings.PacketType) == "" && strings.TrimSpace(settings.FollowPolicy) == "" &&
+		settings.DrawResultTimeoutSeconds == 0 && settings.MinimumDiamonds == 0 {
+		return ParticipationSettings{}, false
+	}
+	return normalizeParticipationSettings(settings), true
+}
+
 // SetParticipationSettings persists global per-account participation limits.
 func (s *Store) SetParticipationSettings(settings ParticipationSettings) (ParticipationSettings, error) {
 	settings = normalizeParticipationSettings(settings)
@@ -838,8 +904,8 @@ func (s *Store) SetParticipationSettings(settings ParticipationSettings) (Partic
 }
 
 // ParticipationPolicy is re-checked immediately before each native request.
-// Counts are local durable records, so changing a limit takes effect without
-// leaking or re-reading browser credentials.
+// Counts are local durable records and limits come from the active task's
+// immutable snapshot, so later global edits cannot change a running task.
 func (s *Store) ParticipationPolicy(accountID string, now time.Time) (bool, time.Duration) {
 	state, cooldown := s.participationState(accountID, now)
 	return !state.Stopped && !state.WaitingDraw && state.CooldownUntil == "", cooldown
@@ -886,14 +952,15 @@ func (s *Store) participationStateLocked(accountID string, now time.Time) (Parti
 		}
 	}
 	state := ParticipationState{AccountID: accountID, TaskID: task.ID, Active: true, JoinCount: joins, WinCount: wins}
-	if s.settings.StopAfterJoins > 0 && joins >= s.settings.StopAfterJoins {
+	settings := s.participationSettingsForAccountLocked(accountID)
+	if settings.StopAfterJoins > 0 && joins >= settings.StopAfterJoins {
 		state.Stopped = true
-		state.StopReason = fmt.Sprintf("已达到参与停止上限（%d 次）", s.settings.StopAfterJoins)
+		state.StopReason = fmt.Sprintf("已达到参与停止上限（%d 次）", settings.StopAfterJoins)
 		return state, 0
 	}
-	if s.settings.StopAfterWins > 0 && wins >= s.settings.StopAfterWins {
+	if settings.StopAfterWins > 0 && wins >= settings.StopAfterWins {
 		state.Stopped = true
-		state.StopReason = fmt.Sprintf("已达到中奖停止上限（%d 次）", s.settings.StopAfterWins)
+		state.StopReason = fmt.Sprintf("已达到中奖停止上限（%d 次）", settings.StopAfterWins)
 		return state, 0
 	}
 	if waitingDraws > 0 {
@@ -901,7 +968,7 @@ func (s *Store) participationStateLocked(accountID string, now time.Time) (Parti
 		state.WaitingReason = "上一轮红包尚未开奖"
 		return state, 0
 	}
-	cooldown := time.Duration(s.settings.CooldownSeconds) * time.Second
+	cooldown := time.Duration(settings.CooldownSeconds) * time.Second
 	if cooldown > 0 && !lastJoined.IsZero() {
 		remaining := lastJoined.Add(cooldown).Sub(now)
 		if remaining > 0 {
@@ -1000,6 +1067,7 @@ func (s *Store) RecordParticipationStarted(accountID, accountName string) error 
 	defer s.mu.Unlock()
 	s.participationTasks[accountID] = &ParticipationTask{
 		ID: activity.ID, AccountID: accountID, AccountName: accountName, Active: true, StartedAt: now.Format(time.RFC3339Nano),
+		Settings: s.settings,
 	}
 	s.activities[activity.ID] = activity
 	return s.saveLocked()

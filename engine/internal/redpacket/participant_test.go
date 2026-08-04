@@ -799,6 +799,34 @@ func TestParticipantResponseClassification(t *testing.T) {
 	}
 }
 
+func TestParticipantChallengeDetectionDoesNotMatchGenericPageTerms(t *testing.T) {
+	for _, value := range []string{
+		`<script>const captcha = false; const challenge = false;</script>`,
+		`{"status_code":0,"data":{"captcha":false,"challenge":false,"blocked":false,"succeed":true}}`,
+		"验证码登录",
+	} {
+		if containsChallengeFailure(value) {
+			t.Fatalf("generic page/login text was classified as a challenge: %q", value)
+		}
+	}
+	for _, value := range []string{"请完成安全验证", "拖动滑块", `{"data":{"need_verify":true}}`} {
+		if value[0] == '{' {
+			result := classifyParticipationResponse(jsonResponse(200, value), nil, "join")
+			if result.status != "challenge_blocked" {
+				t.Fatalf("explicit verification flag was not blocked: %+v", result)
+			}
+			continue
+		}
+		if !containsChallengeFailure(value) {
+			t.Fatalf("explicit challenge copy was not detected: %q", value)
+		}
+	}
+	result := classifyParticipationResponse(jsonResponse(200, `{"status_code":0,"data":{"captcha":false,"challenge":false,"blocked":false,"succeed":true}}`), nil, "join")
+	if result.status != "joined" || !result.joined {
+		t.Fatalf("healthy response with generic challenge fields was misclassified: %+v", result)
+	}
+}
+
 func TestReceiveResponseClassification(t *testing.T) {
 	tests := []struct {
 		name     string

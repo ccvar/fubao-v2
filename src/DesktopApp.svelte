@@ -4772,11 +4772,16 @@
     if (browserRedPacketPreparingIds.includes(instance.id)) return;
 	if (browserCookieExpired(instance)) return;
 	const participationContext = browserParticipationContexts[instance.id];
+	const challengeBlocked = browserParticipationBlocked(instance);
 	const canResumePendingResult = Boolean(
 		participationContext?.resumable && !participationContext.prepared && participationContext.pending_draw_count &&
 		/^\d{6,20}$/.test(participationContext.pending_result_web_rid || ""),
 	);
-	if (participationContext?.stopped && !canResumePendingResult) {
+	// A challenge deliberately finishes the current Go task, but handling it
+	// in the native page is an explicit recovery action. Allow the Gift control
+	// to start a fresh task and clear that terminal challenge state; configured
+	// stop limits remain a hard block until the user changes their settings.
+	if (participationContext?.stopped && !canResumePendingResult && !challengeBlocked) {
 		showToast(participationContext.stop_reason || "已达到红包参与停止条件，请先调整参与设置");
 		return;
 	}

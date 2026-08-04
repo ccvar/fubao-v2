@@ -65,6 +65,11 @@ type participationSettingsStore interface {
 	GetParticipationSettings() ParticipationSettings
 }
 
+type participationAccountSettingsStore interface {
+	GetParticipationSettingsForAccount(accountID string) ParticipationSettings
+	ParticipationSettingsForEvent(eventID, accountID string) ParticipationSettings
+}
+
 // ParticipationFollowMatcher is the credential-free account-scoped follow
 // lookup consumed by the native scheduler.
 type ParticipationFollowMatcher interface {
@@ -236,15 +241,19 @@ func (p *Participant) HandleEvent(event Event) {
 		strings.TrimSpace(event.JoinBoxID) == "" || strings.TrimSpace(event.ActualRoomID) == "" {
 		return
 	}
-	if !p.matchesPacketType(event) {
-		return
-	}
-	if !p.meetsMinimumDiamonds(event) {
-		return
-	}
 	for _, credential := range p.store.RedPacketParticipationCredentials(time.Now()) {
 		p.scheduleDispatch(event, credential, true)
 	}
+}
+
+func (p *Participant) settingsForAccount(accountID string) ParticipationSettings {
+	if scoped, ok := p.recordStore.(participationAccountSettingsStore); ok {
+		return scoped.GetParticipationSettingsForAccount(accountID)
+	}
+	if global, ok := p.recordStore.(participationSettingsStore); ok {
+		return global.GetParticipationSettings()
+	}
+	return ParticipationSettings{}
 }
 
 type participationFollowDecision struct {
@@ -255,8 +264,9 @@ type participationFollowDecision struct {
 
 func (p *Participant) followDecision(event Event, accountID string) participationFollowDecision {
 	decision := participationFollowDecision{policy: ParticipationFollowPolicyAll}
-	if settingsStore, ok := p.recordStore.(participationSettingsStore); ok {
-		decision.policy = settingsStore.GetParticipationSettings().FollowPolicy
+	decision.policy = p.settingsForAccount(accountID).FollowPolicy
+	if decision.policy == "" {
+		decision.policy = ParticipationFollowPolicyAll
 	}
 	if decision.policy == ParticipationFollowPolicyAll {
 		return decision
@@ -277,6 +287,9 @@ func followDecisionAllows(decision participationFollowDecision) bool {
 }
 
 func (p *Participant) scheduleDispatch(event Event, credential accounts.RedPacketParticipationCredential, allowPriorityDelay bool) {
+	if !p.matchesPacketType(event, credential.AccountID) || !p.meetsMinimumDiamonds(event, credential.AccountID) {
+		return
+	}
 	decision := p.followDecision(event, credential.AccountID)
 	if !followDecisionAllows(decision) {
 		return
@@ -305,12 +318,11 @@ func eventOpenAt(event Event, now time.Time) bool {
 	return true
 }
 
-func (p *Participant) matchesPacketType(event Event) bool {
-	settingsStore, ok := p.recordStore.(participationSettingsStore)
-	if !ok {
+func (p *Participant) matchesPacketType(event Event, accountID string) bool {
+	wanted := p.settingsForAccount(accountID).PacketType
+	if wanted == "" {
 		return true
 	}
-	wanted := settingsStore.GetParticipationSettings().PacketType
 	if wanted == ParticipationPacketTypeAll {
 		return true
 	}
@@ -328,12 +340,8 @@ func eventParticipationPacketType(event Event) string {
 	return ""
 }
 
-func (p *Participant) meetsMinimumDiamonds(event Event) bool {
-	settingsStore, ok := p.recordStore.(participationSettingsStore)
-	if !ok {
-		return true
-	}
-	minimum := settingsStore.GetParticipationSettings().MinimumDiamonds
+func (p *Participant) meetsMinimumDiamonds(event Event, accountID string) bool {
+	minimum := p.settingsForAccount(accountID).MinimumDiamonds
 	if minimum <= 0 {
 		minimum = 1
 	}
@@ -563,11 +571,12 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 	}
 	target := drawResultTime(event)
 	timeout := 10 * time.Second
-	if settingsStore, ok := p.recordStore.(participationSettingsStore); ok {
-		seconds := settingsStore.GetParticipationSettings().DrawResultTimeoutSeconds
-		if seconds > 0 {
-			timeout = time.Duration(seconds) * time.Second
-		}
+	settings := p.settingsForAccount(accountID)
+	if scoped, ok := p.recordStore.(participationAccountSettingsStore); ok {
+		settings = scoped.ParticipationSettingsForEvent(event.ID, accountID)
+	}
+	if seconds := settings.DrawResultTimeoutSeconds; seconds > 0 {
+		timeout = time.Duration(seconds) * time.Second
 	}
 	deadline := target.Add(timeout)
 	if delay := time.Until(target); delay > 0 {
@@ -609,7 +618,7 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 			break
 		}
 		bodyLower := strings.ToLower(response.Body)
-		if response.ChallengeBlocked || containsChallengeFailure(bodyLower) {
+		if response.ChallengeBlocked || containsChallengeFailure(bodyLower) || containsChallengeFlagJSON(response.Body) {
 			p.store.RecordRedPacketParticipation(accountID, "challenge_blocked", "验证码/安全验证拦截，已暂停接收新任务", false, false, 0, false)
 			if stopper, ok := p.pageExecutor.(participationAccountStopper); ok {
 				stopper.StopAccount(accountID)
@@ -1047,7 +1056,11 @@ func classifyParticipationResponse(response *http.Response, requestErr error, en
 	if containsLoginFailure(combined) {
 		return participationResult{status: "login_expired", message: "CK 已失效：红包接口返回未登录", cookieExpired: true, terminal: true}
 	}
-	if flagOn(data, "need_verify", "needVerify", "captcha", "challenge", "blocked") || containsChallengeFailure(combined) {
+	// Only explicit verification flags are actionable. Generic `challenge` or
+	// `blocked` fields are common in unrelated Douyin payloads and previously
+	// caused healthy pages to be marked as intercepted.
+	if flagOn(data, "need_verify", "needVerify", "captcha", "captcha_required", "captchaRequired", "challenge_required", "challengeRequired") ||
+		containsChallengeFailure(combined) || containsChallengeFlagJSON(text) {
 		return participationResult{status: "challenge_blocked", message: firstNonEmpty(message, "验证码/安全验证拦截，已暂停接收新任务"), terminal: true}
 	}
 	if flagOn(data, "rush_spam", "rush_too_often", "risk", "risky") ||
@@ -1082,9 +1095,60 @@ func classifyParticipationResponse(response *http.Response, requestErr error, en
 }
 
 func containsChallengeFailure(value string) bool {
-	return containsAny(strings.ToLower(value),
-		"验证码", "安全验证", "拖动滑块", "滑块验证", "secsdk-captcha", "captcha",
-		"verify_check", "verifycenter", "verify_center", "challenge", "need_verify")
+	lower := strings.ToLower(strings.TrimSpace(value))
+	// Do not scan arbitrary page scripts for generic words such as captcha or
+	// challenge. Only explicit user-facing challenge copy and unambiguous
+	// platform markers can pause an account.
+	return containsAny(lower,
+		"请完成安全验证", "请完成验证", "拖动滑块", "滑块验证", "验证码拦截",
+		"安全验证拦截", "secsdk-captcha", "captcha_required", "challenge_required",
+		"verifycenter", "verify_center")
+}
+
+func containsChallengeFlagJSON(value string) bool {
+	var payload any
+	if json.Unmarshal([]byte(strings.TrimSpace(value)), &payload) != nil {
+		return false
+	}
+	var inspect func(any) bool
+	inspect = func(item any) bool {
+		switch value := item.(type) {
+		case []any:
+			for _, child := range value {
+				if inspect(child) {
+					return true
+				}
+			}
+		case map[string]any:
+			for key, child := range value {
+				switch strings.ToLower(strings.TrimSpace(key)) {
+				case "need_verify", "needverify", "captcha_required", "captcharequired", "challenge_required", "challengerequired":
+					if flagValueOn(child) {
+						return true
+					}
+				}
+				if inspect(child) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return inspect(payload)
+}
+
+func flagValueOn(value any) bool {
+	switch item := value.(type) {
+	case bool:
+		return item
+	case float64:
+		return item != 0
+	case string:
+		normalized := strings.ToLower(strings.TrimSpace(item))
+		return normalized != "" && normalized != "0" && normalized != "false" && normalized != "none" && normalized != "null"
+	default:
+		return false
+	}
 }
 
 func hasAnyKey(data map[string]any, keys ...string) bool {
