@@ -59,6 +59,8 @@ type ParticipationProfile struct {
 	GroupID                string   `json:"group_id,omitempty"`
 }
 
+const redPacketStatusChallengeBlocked = "challenge_blocked"
+
 type ParticipationGroup struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
@@ -465,6 +467,13 @@ func (s *Store) RedPacketParticipationCredentials(now time.Time) []RedPacketPart
 		if profile == nil || !profile.Enabled || !profile.RedPacketAPIEnabled || !hasRole(account, RoleParticipation) {
 			continue
 		}
+		// A captcha/security challenge is an account-level native page block,
+		// not a temporary request cooldown and not CK expiry. Keep the account
+		// out of the scheduler until the user explicitly restarts participation
+		// after handling the challenge in its isolated browser instance.
+		if profile.LastRedPacketStatus == redPacketStatusChallengeBlocked {
+			continue
+		}
 		if strings.TrimSpace(account.Cookie) == "" || account.CookieStatus != cookieStatusValid {
 			continue
 		}
@@ -494,6 +503,10 @@ func (s *Store) RecordRedPacketParticipation(accountID, status, message string, 
 	profile := account.Participation
 	profile.LastRedPacketStatus = strings.TrimSpace(status)
 	profile.LastRedPacketMessage = strings.TrimSpace(message)
+	if profile.LastRedPacketStatus == redPacketStatusChallengeBlocked {
+		profile.RedPacketAPIEnabled = false
+		profile.RedPacketCooldownUntil = ""
+	}
 	if joined {
 		profile.JoinCount++
 		profile.LastJoinAt = now.Format(time.RFC3339Nano)

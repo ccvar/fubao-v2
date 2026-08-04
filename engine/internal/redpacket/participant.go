@@ -95,13 +95,19 @@ type participationCancellationStore interface {
 // execute a luckybox action inside an account's live-room WebView. Cookies,
 // signed URLs and response bodies never cross the frontend JavaScript bridge.
 type PageParticipationTask struct {
-	Action           string
-	EventID          string
-	AccountID        string
-	AccountName      string
-	WebRID           string
-	ActualRoomID     string
-	BoxID            string
+	Action       string
+	EventID      string
+	AccountID    string
+	AccountName  string
+	WebRID       string
+	ActualRoomID string
+	BoxID        string
+	// PacketID is the event's stable packet identity. Douyin's receive
+	// response can identify the same packet with packet_id/activity_id while
+	// the request must use the numeric box_id from the original box row.
+	// Keeping both native-only aliases prevents a valid personal result from
+	// being discarded when those two server-side identifiers differ.
+	PacketID         string
 	AnchorID         string
 	BoxType          string
 	SendTime         string
@@ -115,13 +121,14 @@ type PageParticipationTask struct {
 // Rust-to-Go channel after the live page has issued the request. Body remains
 // native-only and is reduced to safe status metadata before persistence.
 type PageParticipationResponse struct {
-	Endpoint       string
-	HTTPStatus     int
-	Body           string
-	Error          string
-	Attempts       int
-	ContextMissing bool
-	LoginExpired   bool
+	Endpoint         string
+	HTTPStatus       int
+	Body             string
+	Error            string
+	Attempts         int
+	ContextMissing   bool
+	LoginExpired     bool
+	ChallengeBlocked bool
 }
 
 // PageParticipationExecutor keeps luckybox participation in the same browser
@@ -497,6 +504,18 @@ func (p *Participant) run(event Event, credential accounts.RedPacketParticipatio
 		result.cooldown,
 		result.cookieExpired,
 	)
+	if result.status == "challenge_blocked" {
+		// A challenge blocks the native account page indefinitely until the user
+		// handles it and explicitly starts a new task. It is not CK expiry and it
+		// must not become eligible again just because a timer elapsed.
+		if stopper, ok := p.pageExecutor.(participationAccountStopper); ok {
+			stopper.StopAccount(credential.AccountID)
+		}
+		if lifecycle, ok := p.recordStore.(participationTaskLifecycleStore); ok {
+			_ = lifecycle.FinishParticipationTask(credential.AccountID, "验证码/安全验证拦截")
+		}
+		return
+	}
 	if result.joined && !result.won && p.pageExecutor != nil {
 		p.scheduleDraw(event, credential.AccountID, credential.AccountName)
 	}
@@ -574,7 +593,7 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 		ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
 		task := PageParticipationTask{
 			Action: "receive", EventID: event.ID, AccountID: accountID, AccountName: accountName,
-			WebRID: event.WebRID, ActualRoomID: event.ActualRoomID, BoxID: event.JoinBoxID, AnchorID: event.AnchorID,
+			WebRID: event.WebRID, ActualRoomID: event.ActualRoomID, BoxID: event.JoinBoxID, PacketID: event.PacketID, AnchorID: event.AnchorID,
 		}
 		response := p.pageExecutor.Execute(ctx, task)
 		cancel()
@@ -590,7 +609,14 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 			break
 		}
 		bodyLower := strings.ToLower(response.Body)
-		if response.HTTPStatus == http.StatusTooManyRequests || response.HTTPStatus == 444 || containsAny(bodyLower, "风控", "操作频繁", "rush_spam", "rush_too_often", "验证码") {
+		if response.ChallengeBlocked || containsChallengeFailure(bodyLower) {
+			p.store.RecordRedPacketParticipation(accountID, "challenge_blocked", "验证码/安全验证拦截，已暂停接收新任务", false, false, 0, false)
+			if stopper, ok := p.pageExecutor.(participationAccountStopper); ok {
+				stopper.StopAccount(accountID)
+			}
+			return
+		}
+		if response.HTTPStatus == http.StatusTooManyRequests || response.HTTPStatus == 444 || containsAny(bodyLower, "风控", "操作频繁", "rush_spam", "rush_too_often") {
 			p.store.RecordRedPacketParticipation(accountID, "risk_control", "开奖结果查询触发风控，账号已进入冷却", false, false, defaultRiskCooldown, false)
 		}
 		if response.ContextMissing {
@@ -605,7 +631,11 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 			}
 			continue
 		}
-		outcome := classifyReceiveResponse(response.Body, event.JoinBoxID)
+		// One account is allowed only one unresolved accepted packet at a time.
+		// That makes a single definitive receive_info row safe to associate even
+		// when Douyin rotates the receive-side box_id; multiple rows still require
+		// an exact request/event alias match.
+		outcome := classifyReceiveResponseWithSingleFallback(response.Body, event.JoinBoxID, event.PacketID)
 		if outcome.status == "" {
 			if wait := minDuration(2*time.Second, time.Until(deadline)); wait > 0 {
 				time.Sleep(wait)
@@ -626,7 +656,7 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 	if traceStore, ok := p.recordStore.(participationTraceStore); ok {
 		_ = traceStore.RecordParticipationTrace(PageParticipationTask{
 			Action: "receive_timeout", EventID: event.ID, AccountID: accountID, AccountName: accountName,
-			WebRID: event.WebRID, ActualRoomID: event.ActualRoomID, BoxID: event.JoinBoxID, AnchorID: event.AnchorID,
+			WebRID: event.WebRID, ActualRoomID: event.ActualRoomID, BoxID: event.JoinBoxID, PacketID: event.PacketID, AnchorID: event.AnchorID,
 		}, PageParticipationResponse{Endpoint: "receive", Error: message, Attempts: attempts})
 	}
 	if _, err := drawStore.ResolveParticipationDraw(event.ID, accountID, "draw_error", message, "", attempts); err == nil {
@@ -730,9 +760,19 @@ type drawOutcome struct {
 	award   string
 }
 
-func classifyReceiveResponse(body, boxID string) drawOutcome {
+func classifyReceiveResponse(body string, boxIDs ...string) drawOutcome {
+	return classifyReceiveResponseMode(body, false, boxIDs...)
+}
+
+func classifyReceiveResponseWithSingleFallback(body string, boxIDs ...string) drawOutcome {
+	return classifyReceiveResponseMode(body, true, boxIDs...)
+}
+
+func classifyReceiveResponseMode(body string, allowSingleFallback bool, boxIDs ...string) drawOutcome {
 	var payload map[string]any
-	if json.Unmarshal([]byte(strings.TrimSpace(body)), &payload) != nil || statusCode(payload) != 0 {
+	decoder := json.NewDecoder(strings.NewReader(strings.TrimSpace(body)))
+	decoder.UseNumber()
+	if decoder.Decode(&payload) != nil || statusCode(payload) != 0 {
 		return drawOutcome{}
 	}
 	data, _ := payload["data"].(map[string]any)
@@ -740,15 +780,25 @@ func classifyReceiveResponse(body, boxID string) drawOutcome {
 	if !present {
 		return drawOutcome{}
 	}
+	// An empty/null receive_info is the normal intermediate response while
+	// Douyin has not published this account's personal draw result yet. It is
+	// deliberately not a loss; the caller keeps polling until the configured
+	// draw-result timeout and then records “开奖异常”.
 	if value == nil {
-		return drawOutcome{status: "not_won", message: "未中奖"}
+		return drawOutcome{}
 	}
 	infos, ok := value.([]any)
 	if !ok {
 		return drawOutcome{}
 	}
 	if len(infos) == 0 {
-		return drawOutcome{status: "not_won", message: "未中奖"}
+		return drawOutcome{}
+	}
+	wanted := make(map[string]struct{}, len(boxIDs))
+	for _, boxID := range boxIDs {
+		if normalized := strings.TrimSpace(boxID); normalized != "" {
+			wanted[normalized] = struct{}{}
+		}
 	}
 	var selected map[string]any
 	var idless map[string]any
@@ -757,8 +807,8 @@ func classifyReceiveResponse(body, boxID string) drawOutcome {
 		if info == nil {
 			continue
 		}
-		candidate := firstMapString(info, "box_id_str", "boxIdStr", "box_id", "boxId", "activity_id", "activityId")
-		if candidate == strings.TrimSpace(boxID) {
+		candidate := firstMapString(info, "box_id_str", "boxIdStr", "box_id", "boxId", "activity_id", "activityId", "red_packet_id", "redPacketId", "lottery_id", "lotteryId")
+		if _, matches := wanted[candidate]; matches {
 			selected = info
 			break
 		}
@@ -767,7 +817,9 @@ func classifyReceiveResponse(body, boxID string) drawOutcome {
 		}
 	}
 	if selected == nil && len(infos) == 1 {
-		selected = idless
+		if idless != nil || allowSingleFallback {
+			selected, _ = infos[0].(map[string]any)
+		}
 	}
 	if selected == nil || !hasAnyKey(selected, "succeed", "success") {
 		return drawOutcome{}
@@ -816,6 +868,9 @@ func positiveParticipantInt(value any) int {
 	switch item := value.(type) {
 	case float64:
 		return int(item)
+	case json.Number:
+		parsed, _ := strconv.Atoi(strings.TrimSpace(item.String()))
+		return parsed
 	case string:
 		parsed, _ := strconv.Atoi(strings.TrimSpace(item))
 		return parsed
@@ -870,6 +925,7 @@ func (p *Participant) attemptInPage(event Event, credential accounts.RedPacketPa
 		WebRID:           strings.TrimSpace(event.WebRID),
 		ActualRoomID:     strings.TrimSpace(event.ActualRoomID),
 		BoxID:            strings.TrimSpace(event.JoinBoxID),
+		PacketID:         strings.TrimSpace(event.PacketID),
 		AnchorID:         strings.TrimSpace(event.AnchorID),
 		BoxType:          strings.TrimSpace(event.BoxType),
 		SendTime:         strings.TrimSpace(event.SendTime),
@@ -892,6 +948,12 @@ func (p *Participant) attemptInPage(event Event, credential accounts.RedPacketPa
 		return participationResult{
 			status: "login_expired", message: firstNonEmpty(response.Error, "CK 已失效：直播页面未登录"),
 			cookieExpired: true, terminal: true, endpoint: "page", attempts: response.Attempts,
+		}
+	}
+	if response.ChallengeBlocked || containsChallengeFailure(response.Error) {
+		return participationResult{
+			status: "challenge_blocked", message: firstNonEmpty(response.Error, "验证码/安全验证拦截，已暂停接收新任务"),
+			terminal: true, endpoint: firstNonEmpty(response.Endpoint, "page"), attempts: response.Attempts,
 		}
 	}
 	if strings.TrimSpace(response.Error) != "" {
@@ -985,8 +1047,11 @@ func classifyParticipationResponse(response *http.Response, requestErr error, en
 	if containsLoginFailure(combined) {
 		return participationResult{status: "login_expired", message: "CK 已失效：红包接口返回未登录", cookieExpired: true, terminal: true}
 	}
-	if flagOn(data, "rush_spam", "rush_too_often", "need_verify", "needVerify", "captcha", "risk", "risky") ||
-		containsAny(combined, "风控", "访问过于频繁", "操作频繁", "验证码", "rush_spam", "rush_too_often") {
+	if flagOn(data, "need_verify", "needVerify", "captcha", "challenge", "blocked") || containsChallengeFailure(combined) {
+		return participationResult{status: "challenge_blocked", message: firstNonEmpty(message, "验证码/安全验证拦截，已暂停接收新任务"), terminal: true}
+	}
+	if flagOn(data, "rush_spam", "rush_too_often", "risk", "risky") ||
+		containsAny(combined, "风控", "访问过于频繁", "操作频繁", "rush_spam", "rush_too_often") {
 		return participationResult{status: "risk_control", message: firstNonEmpty(message, "红包接口触发风控，账号已进入冷却"), cooldown: defaultRiskCooldown, terminal: true}
 	}
 	if flagOn(data, "expired", "is_expired", "isExpired") || containsAny(combined, "已结束", "已过期", "来晚", "已错过") {
@@ -1014,6 +1079,12 @@ func classifyParticipationResponse(response *http.Response, requestErr error, en
 		return participationResult{status: "joined", message: firstNonEmpty(message, "红包参与请求已受理，等待开奖"), joined: true, won: won, terminal: true}
 	}
 	return participationResult{status: "failed", message: firstNonEmpty(message, "红包接口未确认参与结果")}
+}
+
+func containsChallengeFailure(value string) bool {
+	return containsAny(strings.ToLower(value),
+		"验证码", "安全验证", "拖动滑块", "滑块验证", "secsdk-captcha", "captcha",
+		"verify_check", "verifycenter", "verify_center", "challenge", "need_verify")
 }
 
 func hasAnyKey(data map[string]any, keys ...string) bool {
@@ -1074,6 +1145,10 @@ func flagOn(data map[string]any, keys ...string) bool {
 			}
 		case float64:
 			if item != 0 {
+				return true
+			}
+		case json.Number:
+			if parsed, err := strconv.ParseFloat(strings.TrimSpace(item.String()), 64); err == nil && parsed != 0 {
 				return true
 			}
 		case string:

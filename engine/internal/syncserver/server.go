@@ -52,7 +52,80 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/v1/devices/register-upload", s.registerUpload)
 	mux.HandleFunc("POST /api/v1/sync/batch", s.syncBatch)
 	mux.HandleFunc("GET /api/v1/sync/changes", s.syncChanges)
+	mux.HandleFunc("GET /api/v1/rooms/exclusions", s.listRoomExclusions)
+	mux.HandleFunc("POST /api/v1/rooms/exclusions", s.excludeRooms)
+	mux.HandleFunc("POST /api/v1/rooms/exclusions/restore", s.restoreRoomExclusion)
 	return securityHeaders(mux)
+}
+
+func (s *Server) authorizeFullDevice(writer http.ResponseWriter, request *http.Request) (DeviceAuthorization, bool) {
+	token := bearerToken(request)
+	if token == "" {
+		writeJSONError(writer, http.StatusUnauthorized, "missing_device_token", "缺少同步设备令牌")
+		return DeviceAuthorization{}, false
+	}
+	authorization, err := s.store.AuthorizeDevice(request.Context(), token)
+	if err != nil {
+		writeJSONError(writer, http.StatusUnauthorized, "invalid_device_token", "同步设备令牌无效")
+		return DeviceAuthorization{}, false
+	}
+	if authorization.AccessMode != syncprotocol.DeviceAccessFull {
+		writeJSONError(writer, http.StatusForbidden, "center_exclusion_not_allowed", "当前设备无权管理中心库排除记录")
+		return DeviceAuthorization{}, false
+	}
+	return authorization, true
+}
+
+func (s *Server) listRoomExclusions(writer http.ResponseWriter, request *http.Request) {
+	authorization, ok := s.authorizeFullDevice(writer, request)
+	if !ok {
+		return
+	}
+	items, err := s.store.CenterRoomExclusions(request.Context())
+	if err != nil {
+		writeJSONError(writer, http.StatusServiceUnavailable, "center_exclusions_unavailable", "中心库排除记录暂不可用")
+		return
+	}
+	_ = s.store.TouchDevice(request.Context(), authorization.ClientID)
+	writeJSON(writer, http.StatusOK, syncprotocol.CenterRoomExclusionsResponse{Items: items})
+}
+
+func (s *Server) excludeRooms(writer http.ResponseWriter, request *http.Request) {
+	authorization, ok := s.authorizeFullDevice(writer, request)
+	if !ok {
+		return
+	}
+	var input syncprotocol.CenterRoomExclusionsRequest
+	if err := decodeJSON(writer, request, &input); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if len(input.Items) == 0 || len(input.Items) > syncprotocol.MaxBatchItems {
+		writeJSONError(writer, http.StatusBadRequest, "invalid_exclusion_count", "中心库排除记录数量无效")
+		return
+	}
+	if err := s.store.ExcludeCenterRooms(request.Context(), authorization.ClientID, input.Items); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "center_exclusion_failed", err.Error())
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"excluded": len(input.Items)})
+}
+
+func (s *Server) restoreRoomExclusion(writer http.ResponseWriter, request *http.Request) {
+	authorization, ok := s.authorizeFullDevice(writer, request)
+	if !ok {
+		return
+	}
+	var input syncprotocol.CenterRoomExclusionRestoreRequest
+	if err := decodeJSON(writer, request, &input); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "invalid_json", err.Error())
+		return
+	}
+	if err := s.store.RestoreCenterRoomExclusion(request.Context(), authorization.ClientID, input.WebRID); err != nil {
+		writeJSONError(writer, http.StatusBadRequest, "center_exclusion_restore_failed", err.Error())
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]bool{"restored": true})
 }
 
 func (s *Server) syncChanges(writer http.ResponseWriter, request *http.Request) {

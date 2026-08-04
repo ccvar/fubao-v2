@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const storeVersion = 5
+const storeVersion = 7
 
 const (
 	defaultAutoRecycleOfflineDays      = 7
@@ -21,8 +21,12 @@ const (
 )
 
 type Settings struct {
-	AutoRecycleOfflineDays      int `json:"auto_recycle_offline_days"`
-	ParticipationPrewarmMinutes int `json:"participation_prewarm_minutes"`
+	AutoRecycleOfflineDays      int  `json:"auto_recycle_offline_days"`
+	ParticipationPrewarmMinutes int  `json:"participation_prewarm_minutes"`
+	AutoRecycleLowLiveEnabled   bool `json:"auto_recycle_low_live_enabled"`
+	AutoRecycleMaxLiveSessions  int  `json:"auto_recycle_max_live_sessions"`
+	AutoRecycleNoPacketEnabled  bool `json:"auto_recycle_no_packet_enabled"`
+	AutoRecycleNoPacketDays     int  `json:"auto_recycle_no_packet_days"`
 }
 
 type ListPage struct {
@@ -62,29 +66,50 @@ type CenterRoom struct {
 	CenterUpdatedAt string
 }
 
+// CenterExclusion is a safe persistent tombstone for a room removed from the
+// shared center library. It prevents a later center snapshot from silently
+// recreating known junk while keeping an explicit recovery path for mistakes.
+type CenterExclusion struct {
+	ID           string `json:"id"`
+	WebRID       string `json:"web_rid"`
+	ActualRoomID string `json:"actual_room_id,omitempty"`
+	Name         string `json:"name,omitempty"`
+	StreamerName string `json:"streamer_name,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	ExcludedAt   string `json:"excluded_at"`
+	SyncPending  bool   `json:"sync_pending,omitempty"`
+}
+
 type Room struct {
-	ID                string         `json:"id"`
-	WebRID            string         `json:"web_rid,omitempty"`
-	ActualRoomID      string         `json:"actual_room_id,omitempty"`
-	Name              string         `json:"name,omitempty"`
-	StreamerName      string         `json:"streamer_name,omitempty"`
-	MonitorStatus     string         `json:"monitor_status"`
-	ConnectionStatus  string         `json:"connection_status"`
-	Enabled           bool           `json:"enabled"`
-	Source            string         `json:"source,omitempty"`
-	FollowSources     []FollowSource `json:"follow_sources,omitempty"`
-	FollowingLive     bool           `json:"following_live,omitempty"`
-	LastSeenLiveAt    string         `json:"last_seen_live_at,omitempty"`
-	CenterLiveStatus  string         `json:"center_live_status,omitempty"`
-	CenterLiveAt      string         `json:"center_live_at,omitempty"`
-	CenterLastEventAt string         `json:"center_last_event_at,omitempty"`
-	Recycled          bool           `json:"recycled,omitempty"`
-	RecycledAt        string         `json:"recycled_at,omitempty"`
-	RecycleReason     string         `json:"recycle_reason,omitempty"`
-	OfflineDays       int            `json:"offline_days,omitempty"`
-	LastOfflineDay    string         `json:"last_offline_day,omitempty"`
-	CreatedAt         string         `json:"created_at"`
-	UpdatedAt         string         `json:"updated_at"`
+	ID                      string         `json:"id"`
+	WebRID                  string         `json:"web_rid,omitempty"`
+	ActualRoomID            string         `json:"actual_room_id,omitempty"`
+	Name                    string         `json:"name,omitempty"`
+	StreamerName            string         `json:"streamer_name,omitempty"`
+	MonitorStatus           string         `json:"monitor_status"`
+	ConnectionStatus        string         `json:"connection_status"`
+	Enabled                 bool           `json:"enabled"`
+	Source                  string         `json:"source,omitempty"`
+	FollowSources           []FollowSource `json:"follow_sources,omitempty"`
+	FollowingLive           bool           `json:"following_live,omitempty"`
+	LastSeenLiveAt          string         `json:"last_seen_live_at,omitempty"`
+	CenterLiveStatus        string         `json:"center_live_status,omitempty"`
+	CenterLiveAt            string         `json:"center_live_at,omitempty"`
+	CenterLastEventAt       string         `json:"center_last_event_at,omitempty"`
+	CenterLinked            bool           `json:"center_linked,omitempty"`
+	Recycled                bool           `json:"recycled,omitempty"`
+	RecycledAt              string         `json:"recycled_at,omitempty"`
+	RecycleReason           string         `json:"recycle_reason,omitempty"`
+	OfflineDays             int            `json:"offline_days,omitempty"`
+	LastOfflineDay          string         `json:"last_offline_day,omitempty"`
+	HasDefinitiveProbe      bool           `json:"has_definitive_probe,omitempty"`
+	FirstDefinitiveProbeAt  string         `json:"first_definitive_probe_at,omitempty"`
+	LastDefinitiveProbeAt   string         `json:"last_definitive_probe_at,omitempty"`
+	LastDefinitiveLiveState string         `json:"last_definitive_live_state,omitempty"`
+	LiveSessionCount        int            `json:"live_session_count,omitempty"`
+	LastRedPacketAt         string         `json:"last_red_packet_at,omitempty"`
+	CreatedAt               string         `json:"created_at"`
+	UpdatedAt               string         `json:"updated_at"`
 }
 
 // MergeCenter adds safe room metadata learned from the shared center. A room
@@ -101,6 +126,10 @@ func (s *Store) MergeCenter(items []CenterRoom) (MigrationResult, error) {
 			result.Invalid++
 			continue
 		}
+		if s.centerRoomExcludedLocked(webRID, strings.TrimSpace(item.ActualRoomID)) {
+			result.Excluded++
+			continue
+		}
 		var room *Room
 		for _, candidate := range s.rooms {
 			if candidate.ID == webRID || candidate.WebRID == webRID || (item.ActualRoomID != "" && candidate.ActualRoomID == item.ActualRoomID) {
@@ -115,12 +144,17 @@ func (s *Store) MergeCenter(items []CenterRoom) (MigrationResult, error) {
 				Name: strings.TrimSpace(item.Title), StreamerName: strings.TrimSpace(item.StreamerName),
 				MonitorStatus: "stopped", ConnectionStatus: "disconnected", Enabled: true,
 				Source: "center", CreatedAt: createdAt, UpdatedAt: createdAt,
+				CenterLinked: true,
 			}
 			s.rooms[room.ID] = room
 			result.Imported++
 			changed = true
 		} else {
 			result.Merged++
+			if !room.CenterLinked {
+				room.CenterLinked = true
+				changed = true
+			}
 		}
 		if value := strings.TrimSpace(item.ActualRoomID); value != "" && room.ActualRoomID == "" {
 			room.ActualRoomID = value
@@ -132,6 +166,10 @@ func (s *Store) MergeCenter(items []CenterRoom) (MigrationResult, error) {
 		}
 		if value := strings.TrimSpace(item.StreamerName); value != "" && (room.StreamerName == "" || room.Source == "center") && room.StreamerName != value {
 			room.StreamerName = value
+			changed = true
+		}
+		if value := strings.TrimSpace(item.LastEventAt); value != "" && value > room.LastRedPacketAt {
+			room.LastRedPacketAt = value
 			changed = true
 		}
 		centerLiveAt := firstNonEmpty(item.LastSeenLiveAt, item.LiveStartedAt, item.CenterUpdatedAt)
@@ -161,12 +199,14 @@ type MigrationResult struct {
 	Merged   int `json:"merged"`
 	Total    int `json:"total"`
 	Invalid  int `json:"invalid,omitempty"`
+	Excluded int `json:"excluded,omitempty"`
 }
 
 type roomFile struct {
-	Version  int      `json:"version"`
-	Settings Settings `json:"settings"`
-	Rooms    []*Room  `json:"rooms"`
+	Version          int                `json:"version"`
+	Settings         Settings           `json:"settings"`
+	Rooms            []*Room            `json:"rooms"`
+	CenterExclusions []*CenterExclusion `json:"center_exclusions,omitempty"`
 }
 
 type legacyRoom struct {
@@ -184,6 +224,7 @@ type Store struct {
 	mu               sync.Mutex
 	path             string
 	rooms            map[string]*Room
+	centerExclusions map[string]*CenterExclusion
 	settings         Settings
 	persistDirty     bool
 	persistScheduled bool
@@ -197,9 +238,10 @@ func NewStore(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("创建直播间数据目录失败: %w", err)
 	}
 	store := &Store{
-		path:     filepath.Join(dataDir, "rooms.json"),
-		rooms:    map[string]*Room{},
-		settings: defaultSettings(),
+		path:             filepath.Join(dataDir, "rooms.json"),
+		rooms:            map[string]*Room{},
+		centerExclusions: map[string]*CenterExclusion{},
+		settings:         defaultSettings(),
 	}
 	if err := store.load(); err != nil {
 		return nil, err
@@ -219,8 +261,18 @@ func (s *Store) load() error {
 	if err := json.Unmarshal(data, &file); err != nil {
 		return fmt.Errorf("解析直播间数据失败: %w", err)
 	}
-	if file.Version >= 5 {
+	if file.Version >= 6 {
 		s.settings = normalizeSettings(file.Settings)
+	} else if file.Version >= 5 {
+		// Existing installations opt in to the new cleanup rules explicitly;
+		// retaining the values without enabling them avoids a surprise bulk
+		// cleanup immediately after upgrading.
+		s.settings = normalizeSettings(Settings{
+			AutoRecycleOfflineDays:      file.Settings.AutoRecycleOfflineDays,
+			ParticipationPrewarmMinutes: file.Settings.ParticipationPrewarmMinutes,
+			AutoRecycleMaxLiveSessions:  0,
+			AutoRecycleNoPacketDays:     3,
+		})
 	} else if file.Version >= 4 {
 		// Version 4 already persisted the automatic-recycle value. Preserve it
 		// while introducing the participation-monitor prewarm default.
@@ -243,7 +295,20 @@ func (s *Store) load() error {
 			removedInvalid = true
 			continue
 		}
+		if strings.EqualFold(strings.TrimSpace(room.Source), "center") {
+			room.CenterLinked = true
+		}
 		s.rooms[room.ID] = room
+	}
+	for _, exclusion := range file.CenterExclusions {
+		if exclusion == nil || !validRoomID(strings.TrimSpace(exclusion.WebRID)) {
+			removedInvalid = true
+			continue
+		}
+		copy := *exclusion
+		copy.ID = strings.TrimSpace(firstNonEmpty(copy.ID, copy.WebRID))
+		copy.WebRID = strings.TrimSpace(copy.WebRID)
+		s.centerExclusions[copy.ID] = &copy
 	}
 	if removedInvalid {
 		return s.saveLocked()
@@ -257,7 +322,17 @@ func (s *Store) saveLocked() error {
 		items = append(items, room)
 	}
 	sortRooms(items)
-	payload, err := json.Marshal(roomFile{Version: storeVersion, Settings: s.settings, Rooms: items})
+	exclusions := make([]*CenterExclusion, 0, len(s.centerExclusions))
+	for _, exclusion := range s.centerExclusions {
+		exclusions = append(exclusions, exclusion)
+	}
+	sort.Slice(exclusions, func(i, j int) bool {
+		if exclusions[i].ExcludedAt != exclusions[j].ExcludedAt {
+			return exclusions[i].ExcludedAt > exclusions[j].ExcludedAt
+		}
+		return exclusions[i].ID < exclusions[j].ID
+	})
+	payload, err := json.Marshal(roomFile{Version: storeVersion, Settings: s.settings, Rooms: items, CenterExclusions: exclusions})
 	if err != nil {
 		return fmt.Errorf("序列化直播间数据失败: %w", err)
 	}
@@ -308,6 +383,13 @@ func (s *Store) CountAll() int {
 }
 
 func (s *Store) Page(offset, limit int, query string) ListPage {
+	return s.PageBySource(offset, limit, query, "")
+}
+
+// PageBySource returns a bounded page of active rooms filtered by their
+// canonical acquisition source. The filtering happens before pagination so
+// high-volume room lists never produce partial frontend-only results.
+func (s *Store) PageBySource(offset, limit int, query, source string) ListPage {
 	if offset < 0 {
 		offset = 0
 	}
@@ -318,11 +400,15 @@ func (s *Store) Page(offset, limit int, query string) ListPage {
 		limit = 3000
 	}
 	query = strings.ToLower(strings.TrimSpace(query))
+	source = normalizePageSource(source)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	items := make([]Room, 0, minInt(len(s.rooms), limit*2))
 	for _, room := range s.rooms {
 		if room.Recycled {
+			continue
+		}
+		if source != "" && roomPageSource(room) != source {
 			continue
 		}
 		if query != "" {
@@ -345,6 +431,28 @@ func (s *Store) Page(offset, limit int, query string) ListPage {
 		end = total
 	}
 	return ListPage{Items: items[offset:end], Total: total}
+}
+
+func normalizePageSource(source string) string {
+	switch strings.ToLower(strings.TrimSpace(source)) {
+	case "following", "imported", "center":
+		return strings.ToLower(strings.TrimSpace(source))
+	default:
+		return ""
+	}
+}
+
+func roomPageSource(room *Room) string {
+	if room == nil {
+		return "imported"
+	}
+	if len(room.FollowSources) > 0 || strings.EqualFold(strings.TrimSpace(room.Source), "following-live") {
+		return "following"
+	}
+	if strings.EqualFold(strings.TrimSpace(room.Source), "center") {
+		return "center"
+	}
+	return "imported"
 }
 
 // All returns active and recycled rooms for internal monitor synchronization.
@@ -393,6 +501,177 @@ func (s *Store) RecycleBin() []Room {
 	return items
 }
 
+// CenterExclusions returns safe center-library tombstones for management UI.
+func (s *Store) CenterExclusions() []CenterExclusion {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := make([]CenterExclusion, 0, len(s.centerExclusions))
+	for _, exclusion := range s.centerExclusions {
+		items = append(items, *exclusion)
+	}
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].ExcludedAt != items[j].ExcludedAt {
+			return items[i].ExcludedAt > items[j].ExcludedAt
+		}
+		return items[i].ID < items[j].ID
+	})
+	return items
+}
+
+func (s *Store) CenterExclusion(roomID string) (CenterExclusion, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	roomID = strings.TrimSpace(roomID)
+	for _, exclusion := range s.centerExclusions {
+		if exclusion.ID == roomID || exclusion.WebRID == roomID || exclusion.ActualRoomID == roomID {
+			return *exclusion, true
+		}
+	}
+	return CenterExclusion{}, false
+}
+
+func (s *Store) centerRoomExcludedLocked(webRID, actualRoomID string) bool {
+	webRID = strings.TrimSpace(webRID)
+	actualRoomID = strings.TrimSpace(actualRoomID)
+	for _, exclusion := range s.centerExclusions {
+		if exclusion.WebRID == webRID || (actualRoomID != "" && exclusion.ActualRoomID == actualRoomID) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Store) excludeCenterRoomLocked(room *Room, reason string, excludedAt time.Time) {
+	if room == nil || !room.CenterLinked || !validRoomID(strings.TrimSpace(room.WebRID)) {
+		return
+	}
+	if excludedAt.IsZero() {
+		excludedAt = time.Now()
+	}
+	id := strings.TrimSpace(room.WebRID)
+	s.centerExclusions[id] = &CenterExclusion{
+		ID: id, WebRID: id, ActualRoomID: strings.TrimSpace(room.ActualRoomID),
+		Name: strings.TrimSpace(room.Name), StreamerName: strings.TrimSpace(room.StreamerName),
+		Reason: strings.TrimSpace(reason), ExcludedAt: excludedAt.Format(time.RFC3339Nano), SyncPending: true,
+	}
+}
+
+// PendingCenterExclusions returns only locally-created exclusions that have
+// not yet been acknowledged by the center server. Server-originated rows are
+// never re-uploaded, which prevents a stale client from resurrecting an
+// exclusion that another authorized client has restored globally.
+func (s *Store) PendingCenterExclusions() []CenterExclusion {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	items := make([]CenterExclusion, 0)
+	for _, exclusion := range s.centerExclusions {
+		if exclusion.SyncPending {
+			items = append(items, *exclusion)
+		}
+	}
+	return items
+}
+
+func (s *Store) MarkCenterExclusionsSynced(webRIDs []string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	changed := false
+	for _, webRID := range webRIDs {
+		if exclusion := s.centerExclusions[strings.TrimSpace(webRID)]; exclusion != nil && exclusion.SyncPending {
+			exclusion.SyncPending = false
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return s.saveLocked()
+}
+
+// MergeGlobalCenterExclusions reconciles the local cache with the
+// server-authoritative exclusion library. Locally pending rows survive until
+// acknowledged; center-only room rows are removed immediately.
+func (s *Store) MergeGlobalCenterExclusions(items []CenterExclusion) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	global := make(map[string]CenterExclusion, len(items))
+	for _, item := range items {
+		item.WebRID = strings.TrimSpace(item.WebRID)
+		if !validRoomID(item.WebRID) {
+			continue
+		}
+		item.ID = item.WebRID
+		item.SyncPending = false
+		global[item.WebRID] = item
+	}
+	changed := false
+	for key, current := range s.centerExclusions {
+		if current.SyncPending {
+			continue
+		}
+		if _, exists := global[key]; !exists {
+			delete(s.centerExclusions, key)
+			changed = true
+		}
+	}
+	for key, item := range global {
+		current := s.centerExclusions[key]
+		if current == nil || *current != item {
+			copy := item
+			s.centerExclusions[key] = &copy
+			changed = true
+		}
+	}
+	for id, room := range s.rooms {
+		if room.Source == "center" && s.centerRoomExcludedLocked(room.WebRID, room.ActualRoomID) {
+			delete(s.rooms, id)
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return s.saveLocked()
+}
+
+// RestoreCenterExclusion removes a center-library tombstone and restores the
+// room locally in a stopped state. Future center snapshots may enrich it again.
+func (s *Store) RestoreCenterExclusion(roomID string) (Room, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	roomID = strings.TrimSpace(roomID)
+	var key string
+	var exclusion *CenterExclusion
+	for candidateKey, candidate := range s.centerExclusions {
+		if candidate.ID == roomID || candidate.WebRID == roomID || candidate.ActualRoomID == roomID {
+			key, exclusion = candidateKey, candidate
+			break
+		}
+	}
+	if exclusion == nil {
+		return Room{}, errors.New("中心库排除记录不存在")
+	}
+	delete(s.centerExclusions, key)
+	now := time.Now().Format(time.RFC3339Nano)
+	room := s.rooms[exclusion.WebRID]
+	if room == nil {
+		room = &Room{
+			ID: exclusion.WebRID, WebRID: exclusion.WebRID, ActualRoomID: exclusion.ActualRoomID,
+			Name: exclusion.Name, StreamerName: exclusion.StreamerName,
+			MonitorStatus: "stopped", ConnectionStatus: "disconnected", Enabled: true,
+			Source: "center", CenterLinked: true, CreatedAt: now, UpdatedAt: now,
+		}
+		s.rooms[room.ID] = room
+	}
+	if err := s.saveLocked(); err != nil {
+		s.centerExclusions[key] = exclusion
+		return Room{}, err
+	}
+	copy := *room
+	copy.FollowSources = append([]FollowSource(nil), room.FollowSources...)
+	return copy, nil
+}
+
 func normalizeSettings(settings Settings) Settings {
 	if settings.AutoRecycleOfflineDays < 0 {
 		settings.AutoRecycleOfflineDays = 0
@@ -406,6 +685,18 @@ func normalizeSettings(settings Settings) Settings {
 	if settings.ParticipationPrewarmMinutes > maximumParticipationPrewarmMinutes {
 		settings.ParticipationPrewarmMinutes = maximumParticipationPrewarmMinutes
 	}
+	if settings.AutoRecycleMaxLiveSessions < 0 {
+		settings.AutoRecycleMaxLiveSessions = 0
+	}
+	if settings.AutoRecycleMaxLiveSessions > 100000 {
+		settings.AutoRecycleMaxLiveSessions = 100000
+	}
+	if settings.AutoRecycleNoPacketDays < 0 {
+		settings.AutoRecycleNoPacketDays = 0
+	}
+	if settings.AutoRecycleNoPacketDays > 3650 {
+		settings.AutoRecycleNoPacketDays = 3650
+	}
 	return settings
 }
 
@@ -413,6 +704,8 @@ func defaultSettings() Settings {
 	return Settings{
 		AutoRecycleOfflineDays:      defaultAutoRecycleOfflineDays,
 		ParticipationPrewarmMinutes: defaultParticipationPrewarmMinutes,
+		AutoRecycleMaxLiveSessions:  0,
+		AutoRecycleNoPacketDays:     3,
 	}
 }
 
@@ -437,7 +730,9 @@ func (s *Store) SetSettings(settings Settings) (Settings, error) {
 
 // RecordLiveResult applies only a definitive successful live probe. Unknown,
 // error, and network outcomes are ignored by design. An offline calendar day
-// is counted at most once; a confirmed live result resets the streak.
+// is counted at most once; a transition into live counts one independent live
+// session. Cleanup is evaluated only while definitively offline, so a room can
+// never be removed while a successful probe says it is live.
 func (s *Store) RecordLiveResult(roomID, status string, checkedAt time.Time) (bool, error) {
 	roomID = strings.TrimSpace(roomID)
 	status = strings.ToLower(strings.TrimSpace(status))
@@ -462,24 +757,70 @@ func (s *Store) RecordLiveResult(roomID, status string, checkedAt time.Time) (bo
 		return false, nil
 	}
 	changed := false
+	checkedAtText := checkedAt.Format(time.RFC3339Nano)
+	if !room.HasDefinitiveProbe {
+		room.HasDefinitiveProbe = true
+		room.FirstDefinitiveProbeAt = checkedAtText
+		changed = true
+	}
+	if room.LastDefinitiveProbeAt != checkedAtText {
+		room.LastDefinitiveProbeAt = checkedAtText
+		changed = true
+	}
 	if status == "live" {
+		if room.LastDefinitiveLiveState != "live" {
+			room.LiveSessionCount++
+			changed = true
+		}
+		if room.LastDefinitiveLiveState != "live" {
+			room.LastDefinitiveLiveState = "live"
+			changed = true
+		}
 		if room.OfflineDays != 0 || room.LastOfflineDay != "" {
 			room.OfflineDays = 0
 			room.LastOfflineDay = ""
 			changed = true
 		}
 	} else {
+		if room.LastDefinitiveLiveState != "offline" {
+			room.LastDefinitiveLiveState = "offline"
+			changed = true
+		}
 		day := checkedAt.In(time.Local).Format("2006-01-02")
 		if room.LastOfflineDay != day {
 			room.LastOfflineDay = day
 			room.OfflineDays++
 			changed = true
 		}
+		reason := ""
+		if s.settings.AutoRecycleLowLiveEnabled && room.LiveSessionCount <= s.settings.AutoRecycleMaxLiveSessions {
+			reason = fmt.Sprintf("累计确认开播 %d 次，不超过设置的 %d 次，系统自动清理", room.LiveSessionCount, s.settings.AutoRecycleMaxLiveSessions)
+		}
+		if reason == "" && s.settings.AutoRecycleNoPacketEnabled && s.settings.AutoRecycleNoPacketDays > 0 {
+			baseline := firstNonEmpty(room.LastRedPacketAt, room.FirstDefinitiveProbeAt)
+			if since, ok := parseStoredTime(baseline); ok && checkedAt.Sub(since) >= time.Duration(s.settings.AutoRecycleNoPacketDays)*24*time.Hour {
+				reason = fmt.Sprintf("近 %d 天未发现红包，系统自动清理", s.settings.AutoRecycleNoPacketDays)
+			}
+		}
 		limit := s.settings.AutoRecycleOfflineDays
-		if limit > 0 && room.OfflineDays >= limit {
+		if reason == "" && limit > 0 && room.OfflineDays >= limit {
+			reason = fmt.Sprintf("连续 %d 天监测未发现直播，系统自动回收", room.OfflineDays)
+		}
+		if reason != "" {
+			centerOnly := strings.EqualFold(strings.TrimSpace(room.Source), "center") && len(room.FollowSources) == 0
+			if centerOnly {
+				s.excludeCenterRoomLocked(room, reason, checkedAt)
+				delete(s.rooms, room.ID)
+				if err := s.saveLocked(); err != nil {
+					delete(s.centerExclusions, room.WebRID)
+					s.rooms[room.ID] = room
+					return false, err
+				}
+				return true, nil
+			}
 			room.Recycled = true
-			room.RecycledAt = checkedAt.Format(time.RFC3339Nano)
-			room.RecycleReason = fmt.Sprintf("连续 %d 天监测未发现直播，系统自动回收", room.OfflineDays)
+			room.RecycledAt = checkedAtText
+			room.RecycleReason = reason
 			room.Enabled = false
 			room.MonitorStatus = "stopped"
 			room.ConnectionStatus = "disconnected"
@@ -492,6 +833,52 @@ func (s *Store) RecordLiveResult(roomID, status string, checkedAt time.Time) (bo
 	room.UpdatedAt = checkedAt.Format(time.RFC3339Nano)
 	s.scheduleSaveLocked()
 	return room.Recycled, nil
+}
+
+// RecordRedPacketEvent records only safe discovery evidence. It is called by
+// the native red-packet store and never exposes packet data to the frontend.
+func (s *Store) RecordRedPacketEvent(roomID string, detectedAt time.Time) error {
+	roomID = strings.TrimSpace(roomID)
+	if roomID == "" {
+		return nil
+	}
+	if detectedAt.IsZero() {
+		detectedAt = time.Now()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	room := s.rooms[roomID]
+	if room == nil {
+		for _, candidate := range s.rooms {
+			if candidate.WebRID == roomID || candidate.ActualRoomID == roomID {
+				room = candidate
+				break
+			}
+		}
+	}
+	if room == nil || room.Recycled {
+		return nil
+	}
+	value := detectedAt.Format(time.RFC3339Nano)
+	if value <= room.LastRedPacketAt {
+		return nil
+	}
+	room.LastRedPacketAt = value
+	room.UpdatedAt = value
+	s.scheduleSaveLocked()
+	return nil
+}
+
+func parseStoredTime(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		parsed, err = time.Parse(time.RFC3339, value)
+	}
+	return parsed, err == nil
 }
 
 func (s *Store) Restore(roomID string) (Room, error) {
@@ -507,6 +894,12 @@ func (s *Store) Restore(roomID string) (Room, error) {
 	room.RecycleReason = ""
 	room.OfflineDays = 0
 	room.LastOfflineDay = ""
+	room.HasDefinitiveProbe = false
+	room.FirstDefinitiveProbeAt = ""
+	room.LastDefinitiveProbeAt = ""
+	room.LastDefinitiveLiveState = ""
+	room.LiveSessionCount = 0
+	room.LastRedPacketAt = ""
 	room.Enabled = true
 	room.MonitorStatus = "stopped"
 	room.ConnectionStatus = "disconnected"
@@ -527,6 +920,7 @@ func (s *Store) DeleteRecycled(roomID string) error {
 	if room == nil || !room.Recycled {
 		return errors.New("回收站中的直播间不存在")
 	}
+	s.excludeCenterRoomLocked(room, firstNonEmpty(room.RecycleReason, "从回收站永久删除"), time.Now())
 	delete(s.rooms, roomID)
 	return s.saveLocked()
 }

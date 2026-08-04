@@ -243,7 +243,7 @@ func (s *Store) RecordParticipationBatchResult(scheduleID, mode string, started,
 		if task == nil || strings.TrimSpace(task.ID) == "" {
 			continue
 		}
-		if activity := s.activities[task.ID]; activity != nil && activity.Kind == "participation_started" {
+		if activity := s.activities[task.ID]; activity != nil && (activity.Kind == "participation_started" || activity.Kind == "participation_task_completed") {
 			delete(s.activities, task.ID)
 		}
 	}
@@ -255,6 +255,8 @@ func (s *Store) RecordParticipationBatchResult(scheduleID, mode string, started,
 		}
 	}
 	activity := s.addActivityLocked("participation_batch_executed", "", message, time.Now())
+	activity.Title = label
+	activity.TaskIDs = map[string]string{}
 	seen := make(map[string]struct{}, len(accountIDs))
 	for _, accountID := range accountIDs {
 		accountID = strings.TrimSpace(accountID)
@@ -266,8 +268,17 @@ func (s *Store) RecordParticipationBatchResult(scheduleID, mode string, started,
 		}
 		seen[accountID] = struct{}{}
 		activity.AccountIDs = append(activity.AccountIDs, accountID)
+		if task := s.participationTasks[accountID]; task != nil && task.ID != "" {
+			activity.TaskIDs[accountID] = task.ID
+			task.BatchActivityID = activity.ID
+			if task.Active {
+				activity.Active = true
+			}
+		}
 	}
-	activity.Active = len(activity.AccountIDs) > 0
+	if len(activity.AccountIDs) > 0 && !activity.Active {
+		s.finalizeParticipationBatchActivityLocked(activity.ID, false, time.Now())
+	}
 	return s.saveLocked()
 }
 
@@ -280,16 +291,17 @@ func (s *Store) StopParticipationBatch(activityID string) ([]string, error) {
 	if activity == nil || activity.Kind != "participation_batch_executed" {
 		return nil, errors.New("红包参与批次不存在")
 	}
-	now := time.Now().Format(time.RFC3339Nano)
+	stoppedAt := time.Now()
+	now := stoppedAt.Format(time.RFC3339Nano)
 	for _, accountID := range activity.AccountIDs {
-		if task := s.participationTasks[accountID]; task != nil && task.Active {
+		taskID := activity.TaskIDs[accountID]
+		if task := s.participationTasks[accountID]; task != nil && task.Active && (taskID == "" || task.ID == taskID) {
 			task.Active = false
 			task.EndedAt = now
 			task.EndReason = "批次手动停止"
 		}
 	}
-	activity.Active = false
-	activity.StoppedAt = now
+	s.finalizeParticipationBatchActivityLocked(activity.ID, true, stoppedAt)
 	if err := s.saveLocked(); err != nil {
 		return nil, err
 	}
@@ -302,35 +314,55 @@ func (s *Store) StopParticipationBatch(activityID string) ([]string, error) {
 func (s *Store) migrateLegacyBatchActivitiesLocked() bool {
 	migrated := false
 	for _, batch := range s.activities {
-		if batch.Kind != "participation_batch_executed" || len(batch.AccountIDs) > 0 {
+		if batch.Kind != "participation_batch_executed" {
 			continue
 		}
 		batchAt, err := time.Parse(time.RFC3339Nano, batch.CreatedAt)
 		if err != nil {
 			continue
 		}
-		for accountID, task := range s.participationTasks {
-			if task == nil || !task.Active {
-				continue
+		if len(batch.AccountIDs) == 0 {
+			for accountID, task := range s.participationTasks {
+				if task == nil || !task.Active {
+					continue
+				}
+				started := s.activities[task.ID]
+				if started == nil || started.Kind != "participation_started" {
+					continue
+				}
+				startedAt, parseErr := time.Parse(time.RFC3339Nano, started.CreatedAt)
+				if parseErr != nil || startedAt.After(batchAt) || batchAt.Sub(startedAt) > 5*time.Minute {
+					continue
+				}
+				batch.AccountIDs = append(batch.AccountIDs, accountID)
+				delete(s.activities, task.ID)
+				batch.Active = true
+				migrated = true
 			}
-			started := s.activities[task.ID]
-			if started == nil || started.Kind != "participation_started" {
-				continue
-			}
-			startedAt, parseErr := time.Parse(time.RFC3339Nano, started.CreatedAt)
-			if parseErr != nil || startedAt.After(batchAt) || batchAt.Sub(startedAt) > 5*time.Minute {
-				continue
-			}
-			batch.AccountIDs = append(batch.AccountIDs, accountID)
-			delete(s.activities, task.ID)
-			migrated = true
 		}
-		if len(batch.AccountIDs) > 0 {
+		if len(batch.AccountIDs) > 0 && len(batch.TaskIDs) == 0 && batch.Active {
 			sort.Strings(batch.AccountIDs)
-			batch.Active = true
+			batch.TaskIDs = map[string]string{}
+			for _, accountID := range batch.AccountIDs {
+				if task := s.participationTasks[accountID]; task != nil && task.Active {
+					batch.TaskIDs[accountID] = task.ID
+					task.BatchActivityID = batch.ID
+				}
+			}
+			batch.Title = participationBatchTitleFromLabel(batch.Label)
+			migrated = true
 		}
 	}
 	return migrated
+}
+
+func participationBatchTitleFromLabel(label string) string {
+	for _, title := range []string{"立即执行", "指定日期", "每天固定时间", "间隔执行"} {
+		if strings.Contains(label, title) {
+			return title
+		}
+	}
+	return "红包参与任务"
 }
 
 func (s *Store) addActivityLocked(kind, accountID, label string, now time.Time) *Activity {

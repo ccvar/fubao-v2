@@ -137,6 +137,48 @@ func TestRedPacketParticipationEligibility(t *testing.T) {
 	}
 }
 
+func TestRedPacketChallengeBlocksWithoutExpiringCookieAndPersists(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, _, err := store.UpsertAuthenticatedCookie("sessionid_ss=challenge", "验证账号", "30005", "sec-30005", RoleParticipation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetRedPacketAPIEnabled(view.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	store.RecordRedPacketParticipation(view.ID, "challenge_blocked", "验证码/安全验证拦截", false, false, 0, false)
+
+	blocked := store.List(RoleParticipation)[0]
+	if blocked.CookieStatus != cookieStatusValid {
+		t.Fatalf("captcha interception must not expire CK: %+v", blocked)
+	}
+	if blocked.Participation == nil || blocked.Participation.RedPacketAPIEnabled || blocked.Participation.LastRedPacketStatus != "challenge_blocked" {
+		t.Fatalf("challenge must stop future allocation and remain visible: %+v", blocked.Participation)
+	}
+	if credentials := store.RedPacketParticipationCredentials(time.Now()); len(credentials) != 0 {
+		t.Fatalf("challenge-blocked account must be excluded: %+v", credentials)
+	}
+
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := reloaded.List(RoleParticipation)[0]
+	if persisted.Participation == nil || persisted.Participation.LastRedPacketStatus != "challenge_blocked" {
+		t.Fatalf("challenge state did not persist: %+v", persisted.Participation)
+	}
+	if _, err := reloaded.SetRedPacketAPIEnabled(view.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if credentials := reloaded.RedPacketParticipationCredentials(time.Now()); len(credentials) != 1 {
+		t.Fatalf("explicit restart after handling challenge should restore eligibility: %+v", credentials)
+	}
+}
+
 func TestRecordMonitoringRequestTracksLocalCounters(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {
@@ -228,10 +270,24 @@ func TestAddRoleKeepsExistingRole(t *testing.T) {
 	if len(items) != 1 || !hasRoleInView(items[0], RoleMonitoring) || !hasRoleInView(items[0], RoleParticipation) {
 		t.Fatalf("adding a role removed the original role: %+v", items)
 	}
-	if _, err := store.RemoveRole("account-1", RoleMonitoring); err != nil {
+	view, err := store.RemoveRole("account-1", RoleMonitoring)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.RemoveRole("account-1", RoleParticipation); err == nil {
+	if hasRoleInView(view, RoleMonitoring) || !hasRoleInView(view, RoleParticipation) || view.Monitoring != nil || view.Participation == nil {
+		t.Fatalf("removing monitoring role changed the wrong assignment: %+v", view)
+	}
+	if _, err := store.AddRole("account-1", RoleMonitoring); err != nil {
+		t.Fatal(err)
+	}
+	view, err = store.RemoveRole("account-1", RoleParticipation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasRoleInView(view, RoleParticipation) || !hasRoleInView(view, RoleMonitoring) || view.Participation != nil || view.Monitoring == nil {
+		t.Fatalf("removing participation role changed the wrong assignment: %+v", view)
+	}
+	if _, err := store.RemoveRole("account-1", RoleMonitoring); err == nil {
 		t.Fatal("expected the final role removal to be rejected")
 	}
 }

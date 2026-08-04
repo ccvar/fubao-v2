@@ -1,5 +1,7 @@
 # Prototype Instructions
 
+参与记录中，“未中奖”只作为结果徽标；其下方流程状态显示“已开奖”，避免重复显示“未中奖”。
+
 Run the local server yourself and open the preview in the browser available to this environment. Do not give the user server-start instructions when you can run it.
 
 Before making substantial visual changes, use the Product Design plugin's `get-context` skill when the visual source is unclear or no longer matches the current goal. When the user gives durable prototype-specific design feedback, preferences, or decisions, record them in `AGENTS.md`.
@@ -22,6 +24,8 @@ Account sorting lives beside the “状态与数据” table heading and follows
 
 All hover help in the desktop UI uses the shared dark in-app Tooltip (`data-tooltip` plus an edge-safe placement), never the browser-native `title` tooltip. Keep `aria-label` on icon-only controls.
 
+The desktop application chrome suppresses the WebView's browser-native context menu, so Reload, Inspect Element, and AutoFill are never exposed by right-clicking blank space or ordinary controls. Do not stop context-menu event propagation: product-owned interactions such as the primary-sidebar detached-window menu must continue to receive right clicks and render only the app's own menu.
+
 Top-bar dropdowns and other floating menus must always render above the scrollbars of the business tables beneath them. Native table scrollbar thumbs must never bleed through or visually cover an open menu; hiding only the underlying thumb while a menu is open is acceptable and must not change table scroll position or behavior.
 
 When implementing from a selected generated mock, treat that image as the source of truth for layout, component anatomy, density, spacing, color, typography, visible content, and hierarchy.
@@ -37,6 +41,8 @@ Closing the main window hides it to the native system tray instead of terminatin
 Keep the desktop development URL pinned to this project's dedicated port and use Vite `strictPort` so Tauri cannot silently attach to another local project's dev server.
 
 On the 账号与直播间 page, keep the 直播间/参与账号/监测账号 tab strip outside the table card so the table is the only framed surface. The account status filter belongs in that external tab strip; do not repeat the old explanatory account-copy in the content area.
+
+On the 账号与直播间 page, treat room monitoring as an advanced workflow: collapse “直播间” and “监测账号” behind one compact inline “监测管理” icon by default, and expand those two tabs in the existing tab strip only after the icon is clicked. Keep the group expanded while either monitoring tab is active, then collapse it again after switching to a common tab. The sidebar data overview omits the “直播间正在监测” row entirely when its real running count is zero and reveals it only while monitoring is actually running.
 
 Keep the external account tab strip vertically balanced around the table, use the same responsive inline inset for tabs and table rows, and keep the selected tab/count surfaces light and quiet rather than using a heavy fill.
 
@@ -62,9 +68,15 @@ The recent-activity section must never render demo or sample events. A fresh loc
 
 The sidebar names its live counters section “数据概览”. Its four counter rows are text-only: do not render leading status icons, and place each count directly before the status label without the Chinese classifier “个”, while preserving the existing semantic colors and click targets. A separate “最近活动” section sits below it, reuses the same compact icon-and-copy row language, and owns the remaining scrollable space above the fixed footer.
 
-In the sidebar “数据概览”, render each leading count in a compact, prominent condensed numeric face with tabular figures. Keep the counts visibly larger than the deliberately smaller supporting copy, while preserving warning colors.
+In the sidebar “数据概览”, keep every status label left-aligned and every count right-aligned on a shared edge. Render counts in a compact, prominent condensed numeric face with tabular figures, visibly larger than the deliberately smaller supporting copy, while preserving warning colors.
+
+In the sidebar data overview, omit each CK-expiry row entirely when its corresponding expired-account count is zero; render it with the warning treatment only when the count is positive.
+
+In the sidebar data overview, combine the all-time participation and win counts into one compact `参与数/中奖数 参与/中奖总次数` row. Keep confirmed diamond winnings as its own row.
 
 The sidebar recent-activity list displays the complete persisted history returned by the Go store (currently up to 100 newest entries) in its own scrollable region; never impose a smaller frontend-only item cap such as four rows.
+
+Every explicit browser-account participation task updates its existing recent-activity row when the task ends, using exact per-task records to report joined count, confirmed-win count, and confirmed diamond winnings. A top-bar immediate or scheduled batch remains one consolidated activity: only after all linked account task IDs are terminal does it become a single completion summary, while manual batch stop produces the corresponding stopped summary. Completion is idempotent and later tasks for the same account must never change earlier activity totals. The sidebar data overview reads Go-derived, persisted all-time participation count, win count, and confirmed diamond total; non-diamond awards count as wins but add zero diamonds.
 
 The recent-activity region uses a permanently reserved, thin Pilot-style internal scrollbar with no visible track background and only a rounded gray thumb. Keep the visible thumb close to the sidebar divider with only a minimal inset while retaining a wider invisible hit area for dragging. Scrolling remains contained within recent activity so the data overview and fixed workspace footer do not move.
 
@@ -85,6 +97,8 @@ At narrow widths (760px and below), the sidebar becomes a true icon rail. Never 
 Use `/Users/apple/work/DY-KIRO/assets/icon.png` as the source artwork for the desktop application icon. Place it at about 83% scale (850px artwork on a 1024px transparent canvas) before regenerating the Tauri icon set; direct Dock comparison showed both 720px and 770px variants were visibly smaller than neighboring macOS icons.
 
 Account migration uses one canonical local account entity with independent `monitoring` and `participation` role assignments. The same login may belong to both roles simultaneously. “添加到另一分类” must preserve the current role; removing a role must never silently delete the canonical account or its other role. Monitoring counters/status stay in the monitoring profile, while participation statistics, proxy binding, fingerprint binding, and tags stay in the participation profile. DY-KIRO migration is copy-only and must never modify the legacy `douyin_accounts.json` or `lottery_accounts.json` files. Cookie data stays inside the Go engine’s permission-restricted local store and must never be returned by list APIs or rendered in the frontend.
+
+When an account has both roles, each role-removal cross belongs inside its own role badge and its hit target must never overlap the neighboring badge. Hidden role-removal controls must not accept pointer input. After removal, reconcile against the Go-returned account and report success only when the clicked role is actually absent while the other role remains assigned.
 
 Commands that dynamically create Tauri child WebViews must be asynchronous so Windows WebView2 environment creation never blocks the main-thread IPC/message pump. On Windows, every account-keyed WebView2 profile lives under the application LocalAppData directory rather than roaming AppData; macOS continues to use account-keyed WKWebView data-store identifiers. Raw login data remains native-only on every platform.
 
@@ -114,7 +128,11 @@ The shared settings dialog uses top-level tabs for “红包参与” and “直
 
 Participation task schedules prewarm room monitoring through the Go engine before every “指定日期 / 每天固定时间 / 间隔执行” occurrence. The lead time is persisted in the shared “直播间” settings, defaults to 10 minutes, and zero means check only when the participation batch actually starts. When the prewarm window opens, check all eligible non-recycled rooms and invoke the same native “全部启动” path only as needed; invalid monitoring CKs are skipped by the Go account store. Immediate execution always performs the execution-time check. This behavior must remain independent of the current page, browser-card rendering, and window visibility, and deleting or stopping a participation schedule must not automatically stop room monitoring.
 
-Room red-packet monitoring is explicitly two-stage. First probe Douyin's room-entry endpoint to determine whether the room is live; only a room positively confirmed live may query red-packet endpoints. Unknown rooms use a short initial probe cadence, offline rooms use a slower live-status cadence, live rooms use a faster red-packet cadence, and an active red packet uses the fastest cadence. Monitor-task state, live/offline state, and red-packet state are separate UI concepts. In the room table, combine the streamer and room identifier into one column with the identifier and source shown below the streamer, and show the current live/offline result in the status area.
+Room red-packet monitoring is explicitly two-stage. First probe Douyin's room-entry endpoint to determine whether the room is live; only a room positively confirmed live may query red-packet endpoints. Unknown rooms use a short initial probe cadence, offline rooms use a slower live-status cadence, live rooms use a faster red-packet cadence, and an active red packet uses the fastest cadence. Monitor-task state, live/offline state, and red-packet state are separate UI concepts. In the room table, combine the streamer and room identifier into one column with the identifier and source shown below the streamer, and show the current live/offline result in the status area. Place an icon-only funnel control beside the “主播 / 房间标识” heading and reuse the compact room-sort menu for the Go-backed source filter “全部来源 / 关注列表 / 导入 / 中心库”; only a permanent professional license may see the “中心库” option.
+
+Place a compact automatic-cleanup settings icon immediately before the room recycle-bin action. The Go-persisted rules support a configurable maximum confirmed live-session count and a configurable number of days without a detected red packet. A room without any definitive live/offline probe is never eligible; unknown, network, and CK failures are not evidence. Evaluate cleanup only while definitively offline. Locally owned rooms enter the recoverable recycle bin. Removing a center-only room, or permanently deleting any center-linked room from the recycle bin, writes a server-authoritative center-library exclusion. The center server immediately deletes that room and its related red packets and rejects later uploads with the same WebRID or actual room ID, so known junk cannot be recreated by another client. The local exclusion cache exists only for offline fallback and retry, periodically reconciles with the server, and “解除排除并恢复” must remove the server exclusion before restoring locally. If a center room has also become a manual or following-list room, preserve the local room and recycle it normally until the user permanently deletes it.
+
+When “全部启动” includes followed rooms, imported/legacy rooms, and rows learned only from the center library, the native monitor scheduler queues due probes by the strict source order “关注列表 > 导入 > 中心库”. A bounded worker pool and native request gates limit concurrency; a small priority burst lets a ready lower tier receive a slot so center-library rooms cannot starve behind a continuously busy following feed. Following/imported/center rows remain enabled and native-backed; this priority changes queue order only and never removes or makes center rows frontend-only.
 
 The shared settings dialog includes a third top-level “监测设置” tab. Its Go-persisted, hot-applied controls are the global request interval, per-account request interval, global slow-request concurrency, per-account slow-request concurrency, and native probe concurrency. Saving affects subsequent requests in an already-running monitor pool without cancelling in-flight requests; unsafe values are clamped in Go. Keep the internal bulk-worker sharding fixed and unavailable as a user-facing tuning control. Cookies, signatures, endpoints, and raw request data remain native-only.
 
@@ -153,6 +171,8 @@ Browser instance records are not a fixed concurrency allowance. The Go engine co
 Native browser WebView teardown is idempotent and must never inspect the page URL, Cookie, or other WKWebView state after destruction begins. Persist the last safe Douyin location only from navigation/page-load callbacks, ignore overlapping close requests, and throttle large batch-created instance mounts through a small rolling native-mount window so creating many records cannot flood the macOS main thread.
 
 An active red-packet participation task retains its real native live-room WebView and Go runtime lease even when the instance card is outside the viewport or another app page is selected; hide the surface without destroying the page context. Release both only after the participation context ends. The browser screen shows a compact live task summary from safe Go context state—active accounts, prepared/accepting contexts, task-local joined count, pending draws, and wins—and never invents frontend counters.
+
+When at least one browser account has a genuinely prepared native red-packet participation context, show a small green pulsing dot immediately after the primary sidebar label “浏览器实例”; persisted task flags, enabled switches, pending-result recovery and frontend-local optimistic state alone must never light it. Captcha or security-verification interception is a persistent participation-page block distinct from CK expiry and timed risk cooldown: label it “拦截” in the browser-instance card and participation-account row, keep CK valid, stop that account's native context and future assignments, and clear it only when the user explicitly restarts participation after handling the challenge. Frequency/rush-spam remains cooling, login failure remains CK expiry, and temporary network or context failures remain unknown/retryable rather than being mislabeled.
 
 On the browser-instance screen, place the compact live participation-task summary immediately after the top-bar “抢包” trigger rather than in a separate content row. Hide that summary while the “抢包” action menu is expanded, restore it after the menu collapses, and keep its height aligned with the compact trigger so active-task status does not increase the page header or content height.
 
@@ -271,5 +291,7 @@ On Windows, retain the native caption and system window controls. Keep the sideb
 所有绑定中心服务的客户端共享直播间与红包业务数据。任一客户端的本地发现按稳定直播间/红包标识上传中心库，其他客户端使用持久化增量游标自动拉取并合并；本机产生的记录保留本地来源，仅从远端取得的记录在直播间和红包列表明确标记“来源于中心库”。客户端必须忽略自身中心变更并禁止把纯中心来源数据回传，避免循环同步；Cookie、账号、签名、请求上下文和参与数据仍不得同步。
 
 中心库上传不以同步 KEY 或授权状态为前提：未绑定同步 KEY 的客户端自动注册仅上传设备身份，持续上传安全白名单内的直播间与红包数据，但服务端必须拒绝该身份读取中心增量。绑定同步 KEY 后才取得完整设备身份；无有效授权仍只上传，有限期且当前有效的授权只拉取红包，永久有效授权才拉取直播间与红包。直播间和红包使用独立持久化游标，保证有限期授权升级为永久授权后仍能补拉直播间；已落地的中心数据不因授权变化主动删除。
+
+中心库排除记录保存在中心库服务端并作为全局权威数据。永久删除中心库来源直播间时，服务端同时清除该直播间及其红包事件，并按 WebRID 和真实房间 ID 拦截所有客户端后续重复上传；客户端本地排除仅用于离线重试和缓存。解除排除必须先成功更新服务端，再恢复本地直播间。
 
 免费版或无有效授权的客户端最多只能创建一个浏览器实例；有效专业版不受该授权数量限制，仍服从机器资源建议上限。实例数量限制必须由 Go 引擎在复用判断与持久化新实例的同一临界区内强制执行，前端只负责同步提示与免费版单选；授权失效不得自动删除或关闭既有实例，只阻止继续新增。

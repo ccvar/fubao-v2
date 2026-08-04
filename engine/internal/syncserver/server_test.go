@@ -121,12 +121,89 @@ func TestUploadOnlyRegistrationCanWriteButCannotReadChanges(t *testing.T) {
 	requestJSON(t, httpServer.Client(), http.MethodPost, httpServer.URL+"/api/v1/sync/batch", registration.DeviceToken, batch, http.StatusOK, &batchResponse)
 	var denied map[string]any
 	requestJSON(t, httpServer.Client(), http.MethodGet, httpServer.URL+"/api/v1/sync/changes?cursor=0&limit=200", registration.DeviceToken, nil, http.StatusForbidden, &denied)
+	requestJSON(t, httpServer.Client(), http.MethodPost, httpServer.URL+"/api/v1/rooms/exclusions", registration.DeviceToken,
+		syncprotocol.CenterRoomExclusionsRequest{Items: []syncprotocol.CenterRoomExclusion{{WebRID: "654321", ExcludedAt: now}}},
+		http.StatusForbidden, &denied)
 	stats, err := store.Stats(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if stats.Devices != 1 || stats.RedPacket != 1 {
 		t.Fatalf("upload-only batch was not persisted: %+v", stats)
+	}
+}
+
+func TestCenterExclusionDeletesDataAndRejectsLaterUploads(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	enrollmentToken := "0123456789abcdef0123456789abcdef"
+	service, err := New(store, enrollmentToken, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(service.Handler())
+	defer httpServer.Close()
+
+	register := syncprotocol.RegisterRequest{Version: syncprotocol.Version, ClientID: "desktop-exclusion-test"}
+	var registration syncprotocol.RegisterResponse
+	requestJSON(t, httpServer.Client(), http.MethodPost, httpServer.URL+"/api/v1/devices/register", enrollmentToken, register, http.StatusCreated, &registration)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	roomPayload, _ := json.Marshal(syncprotocol.RoomState{WebRID: "123456", ActualRoomID: "7000000000000000001", Title: "垃圾直播间", UpdatedAt: now})
+	packetPayload, _ := json.Marshal(syncprotocol.RedPacket{WebRID: "123456", ActualRoomID: "7000000000000000001", PacketID: "packet-junk", DetectedAt: now})
+	batch := syncprotocol.BatchRequest{
+		Version: syncprotocol.Version, RequestID: "before-exclusion", ClientID: registration.ClientID, SentAt: now,
+		Items: []syncprotocol.BatchItem{
+			{Type: syncprotocol.ItemRoomState, IdempotencyKey: "room:123456", OccurredAt: now, Payload: roomPayload},
+			{Type: syncprotocol.ItemRedPacket, IdempotencyKey: "packet:123456", OccurredAt: now, Payload: packetPayload},
+		},
+	}
+	var batchResponse syncprotocol.BatchResponse
+	requestJSON(t, httpServer.Client(), http.MethodPost, httpServer.URL+"/api/v1/sync/batch", registration.DeviceToken, batch, http.StatusOK, &batchResponse)
+
+	exclusions := syncprotocol.CenterRoomExclusionsRequest{Items: []syncprotocol.CenterRoomExclusion{{
+		WebRID: "123456", ActualRoomID: "7000000000000000001", Name: "垃圾直播间", Reason: "自动清理", ExcludedAt: now,
+	}}}
+	var excluded map[string]any
+	requestJSON(t, httpServer.Client(), http.MethodPost, httpServer.URL+"/api/v1/rooms/exclusions", registration.DeviceToken, exclusions, http.StatusOK, &excluded)
+	stats, err := store.Stats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Rooms != 0 || stats.RedPacket != 0 || stats.RoomExclusions != 1 {
+		t.Fatalf("center data was not removed: %+v", stats)
+	}
+	var changes syncprotocol.ChangesResponse
+	requestJSON(t, httpServer.Client(), http.MethodGet, httpServer.URL+"/api/v1/sync/changes?cursor=0&limit=200", registration.DeviceToken, nil, http.StatusOK, &changes)
+	if len(changes.Changes) != 0 {
+		t.Fatalf("removed center data remained in changes: %+v", changes.Changes)
+	}
+
+	// A different client/key combination using the same actual room ID must not
+	// reintroduce the excluded center room or its packets.
+	aliasRoom, _ := json.Marshal(syncprotocol.RoomState{WebRID: "999999", ActualRoomID: "7000000000000000001", UpdatedAt: now})
+	aliasPacket, _ := json.Marshal(syncprotocol.RedPacket{WebRID: "999999", ActualRoomID: "7000000000000000001", PacketID: "packet-alias", DetectedAt: now})
+	batch.RequestID = "after-exclusion"
+	batch.Items[0].Payload = aliasRoom
+	batch.Items[1].Payload = aliasPacket
+	requestJSON(t, httpServer.Client(), http.MethodPost, httpServer.URL+"/api/v1/sync/batch", registration.DeviceToken, batch, http.StatusOK, &batchResponse)
+	stats, _ = store.Stats(context.Background())
+	if stats.Rooms != 0 || stats.RedPacket != 0 {
+		t.Fatalf("excluded room was reintroduced: %+v", stats)
+	}
+
+	var listed syncprotocol.CenterRoomExclusionsResponse
+	requestJSON(t, httpServer.Client(), http.MethodGet, httpServer.URL+"/api/v1/rooms/exclusions", registration.DeviceToken, nil, http.StatusOK, &listed)
+	if len(listed.Items) != 1 || listed.Items[0].WebRID != "123456" {
+		t.Fatalf("unexpected exclusion list: %+v", listed.Items)
+	}
+	var restored map[string]bool
+	requestJSON(t, httpServer.Client(), http.MethodPost, httpServer.URL+"/api/v1/rooms/exclusions/restore", registration.DeviceToken,
+		syncprotocol.CenterRoomExclusionRestoreRequest{WebRID: "123456"}, http.StatusOK, &restored)
+	if !restored["restored"] {
+		t.Fatal("center exclusion was not restored")
 	}
 }
 

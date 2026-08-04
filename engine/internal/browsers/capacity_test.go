@@ -18,3 +18,16 @@ func TestParseDarwinCPUUsageRejectsUnknownOutput(t *testing.T) {
 		t.Fatalf("CPU usage = %.2f, want 0", usage)
 	}
 }
+
+func TestCPUUsageFromSamples(t *testing.T) {
+	usage := cpuUsageFromSamples(1_000, 600, 1_400, 760)
+	if math.Abs(usage-60) > 0.001 {
+		t.Fatalf("CPU usage = %.2f, want 60", usage)
+	}
+}
+
+func TestCPUUsageFromSamplesRejectsInvalidRange(t *testing.T) {
+	if usage := cpuUsageFromSamples(1_000, 600, 900, 500); usage != 0 {
+		t.Fatalf("CPU usage = %.2f, want 0", usage)
+	}
+}

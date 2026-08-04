@@ -394,6 +394,7 @@ struct NativePageParticipationTask {
     web_rid: String,
     actual_room_id: String,
     box_id: String,
+    packet_id: Option<String>,
     anchor_id: Option<String>,
     box_type: Option<String>,
     send_time: Option<String>,
@@ -408,6 +409,7 @@ struct NativePageParticipationResult {
     attempts: i64,
     context_missing: bool,
     login_expired: bool,
+    challenge_blocked: bool,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -439,6 +441,7 @@ impl NativePageParticipationResult {
             attempts: 0,
             context_missing: true,
             login_expired: false,
+            challenge_blocked: false,
         }
     }
 
@@ -451,6 +454,7 @@ impl NativePageParticipationResult {
             attempts: 0,
             context_missing: false,
             login_expired: true,
+            challenge_blocked: false,
         }
     }
 }
@@ -1152,6 +1156,7 @@ async fn execute_page_participation(
         "web_rid": task.web_rid,
         "actual_room_id": task.actual_room_id,
         "box_id": task.box_id,
+        "packet_id": task.packet_id.as_deref().unwrap_or_default(),
         "anchor_id": task.anchor_id.as_deref().unwrap_or_default(),
         "box_type": task.box_type.as_deref().unwrap_or_default(),
         "send_time": task.send_time.as_deref().unwrap_or_default(),
@@ -1173,6 +1178,14 @@ async fn execute_page_participation(
             for (const key of ['msToken', 'a_bogus', 'X-Bogus', '__ac_signature', '__ac_nonce']) {{
               url.searchParams.delete(key);
             }}
+          }};
+          const detectsChallenge = (value) => {{
+            const source = String(value || '').slice(0, 120000);
+            const lowered = source.toLowerCase();
+            return /验证码|安全验证|拖动滑块|滑块验证|验证中/.test(source) ||
+              lowered.includes('secsdk-captcha') || lowered.includes('captcha') ||
+              lowered.includes('verify_check') || lowered.includes('verifycenter') ||
+              lowered.includes('verify_center') || lowered.includes('need_verify');
           }};
           const commonRequestURL = () => {{
             try {{
@@ -1197,14 +1210,15 @@ async fn execute_page_participation(
             }}
             const values = {{
               aid: '6383', app_name: 'douyin_web', live_id: '1', device_platform: 'web',
-              room_id: task.actual_room_id, box_id: task.box_id, anchor_id: task.anchor_id
+              room_id: task.actual_room_id, web_rid: task.web_rid, box_id: task.box_id, anchor_id: task.anchor_id
             }};
             for (const [key, value] of Object.entries(values)) {{
               if (String(value || '').trim()) url.searchParams.set(key, String(value));
             }}
             if (!url.searchParams.has('browser_language')) url.searchParams.set('browser_language', navigator.language || 'zh-CN');
             if (!url.searchParams.has('browser_platform')) url.searchParams.set('browser_platform', navigator.platform || 'MacIntel');
-            if (!url.searchParams.has('browser_name')) url.searchParams.set('browser_name', 'Mozilla');
+            if (!url.searchParams.has('browser_name')) url.searchParams.set('browser_name', 'Chrome');
+            if (!url.searchParams.has('browser_version')) url.searchParams.set('browser_version', '124.0.0.0');
             if (!url.searchParams.has('browser_online')) url.searchParams.set('browser_online', String(navigator.onLine));
             if (!url.searchParams.has('cookie_enabled')) url.searchParams.set('cookie_enabled', String(navigator.cookieEnabled));
             return url;
@@ -1223,13 +1237,19 @@ async fn execute_page_participation(
                 const infos = parsed && parsed.data && parsed.data.receive_info;
                 let reduced = infos;
                 if (Array.isArray(infos)) {{
-                  const target = String(task.box_id || '');
+                  const targets = new Set([String(task.box_id || ''), String(task.packet_id || '')].filter(Boolean));
                   const matched = infos.find((item) => {{
-                    const id = String(item && (item.box_id_str || item.boxIdStr || item.box_id || item.boxId || item.activity_id || item.activityId) || '');
-                    return id === target;
+                    const id = String(item && (item.box_id_str || item.boxIdStr || item.box_id || item.boxId || item.activity_id || item.activityId || item.red_packet_id || item.redPacketId || item.lottery_id || item.lotteryId) || '');
+                    return targets.has(id);
                   }});
-                  const onlyIdless = infos.length === 1 && !String(infos[0] && (infos[0].box_id_str || infos[0].boxIdStr || infos[0].box_id || infos[0].boxId || infos[0].activity_id || infos[0].activityId) || '');
-                  reduced = matched ? [matched] : onlyIdless ? [infos[0]] : infos.length === 0 ? [] : undefined;
+                  const onlyDefinitive = infos.length === 1 && infos[0] &&
+                    (Object.prototype.hasOwnProperty.call(infos[0], 'succeed') || Object.prototype.hasOwnProperty.call(infos[0], 'success'));
+                  const onlyIdless = infos.length === 1 && !String(infos[0] && (infos[0].box_id_str || infos[0].boxIdStr || infos[0].box_id || infos[0].boxId || infos[0].activity_id || infos[0].activityId || infos[0].red_packet_id || infos[0].redPacketId || infos[0].lottery_id || infos[0].lotteryId) || '');
+                  // receive-side box_id can legitimately drift from the
+                  // request-side box row. Preserve one explicit personal
+                  // result for Go's account/event-scoped fallback; never
+                  // relax matching when multiple accounts/results are present.
+                  reduced = matched ? [matched] : onlyIdless || onlyDefinitive ? [infos[0]] : infos.length === 0 ? [] : undefined;
                 }}
                 text = JSON.stringify({{status_code: parsed.status_code, status_msg: parsed.status_msg, data: {{receive_info: reduced}}}});
               }} catch (error) {{}}
@@ -1242,6 +1262,11 @@ async fn execute_page_participation(
                 finish({{endpoint: 'page', http_status: 0, body: '', error: '浏览器实例未进入目标直播间', attempts: 0, context_missing: true}});
                 return;
               }}
+              const pageChallengeSource = `${{document.body && document.body.innerText || ''}}\n${{document.documentElement && document.documentElement.innerHTML || ''}}`;
+              if (detectsChallenge(pageChallengeSource)) {{
+                finish({{endpoint: 'page', http_status: 0, body: '', error: '验证码/安全验证拦截，已暂停接收新任务', attempts: 0, context_missing: false, login_expired: false, challenge_blocked: true}});
+                return;
+              }}
               // A synthetic join -> rush fallback doubles account traffic and
               // Douyin reports the second request as rush_spam. One detected
               // packet therefore issues exactly one page-context join. A rush
@@ -1249,17 +1274,21 @@ async fn execute_page_participation(
               // whose complete request template was captured by the page.
               const action = task.action === 'receive' ? 'receive' : 'join';
               const response = await send(action);
+              const challengeBlocked = detectsChallenge(response.text);
               finish({{
                 endpoint: response.endpoint,
                 http_status: response.status,
                 body: String(response.text || '').slice(0, 1200),
-                error: '',
+                error: challengeBlocked ? '验证码/安全验证拦截，已暂停接收新任务' : '',
                 attempts: 1,
                 context_missing: false,
-                login_expired: false
+                login_expired: false,
+                challenge_blocked: challengeBlocked
               }});
             }} catch (error) {{
-              finish({{endpoint: 'page', http_status: 0, body: '', error: String(error && (error.message || error) || '直播页面红包请求失败'), attempts: 1, context_missing: false, login_expired: false}});
+              const message = String(error && (error.message || error) || '直播页面红包请求失败');
+              const challengeBlocked = detectsChallenge(message);
+              finish({{endpoint: 'page', http_status: 0, body: '', error: challengeBlocked ? '验证码/安全验证拦截，已暂停接收新任务' : message, attempts: 1, context_missing: false, login_expired: false, challenge_blocked: challengeBlocked}});
             }}
           }})();
         }})();"#,
@@ -1276,6 +1305,7 @@ async fn execute_page_participation(
             attempts: 0,
             context_missing: false,
             login_expired: false,
+            challenge_blocked: false,
         };
     }
     for _ in 0..100 {
@@ -1339,6 +1369,10 @@ async fn execute_page_participation(
                 .get("login_expired")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            challenge_blocked: value
+                .get("challenge_blocked")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
         };
     }
     NativePageParticipationResult {
@@ -1349,6 +1383,7 @@ async fn execute_page_participation(
         attempts: 1,
         context_missing: false,
         login_expired: false,
+        challenge_blocked: false,
     }
 }
 
@@ -1404,6 +1439,8 @@ async fn handle_page_participation_task(
             if result.error.is_empty() { "none" } else { "present" },
         );
     }
+    let challenge_blocked = result.challenge_blocked;
+    let challenge_instance_id = task.instance_id.clone();
     let _ = native_engine_request(
         runtime.clone(),
         "red_packet_participation.native_complete",
@@ -1416,10 +1453,19 @@ async fn handle_page_participation_task(
             "attempts": result.attempts,
             "context_missing": result.context_missing,
             "login_expired": result.login_expired,
+            "challenge_blocked": result.challenge_blocked,
             "secret": runtime.native_secret,
         }),
     )
     .await;
+    if challenge_blocked {
+        // Go persists the safe account block and releases its participation
+        // lease. Mirror that terminal state in Rust immediately so the native
+        // WebView is no longer treated as an active participation context.
+        if let Ok(mut contexts) = runtime.browser_red_packet_contexts.lock() {
+            contexts.remove(&challenge_instance_id);
+        }
+    }
 }
 
 async fn poll_page_participation_tasks(app: tauri::AppHandle, runtime: Arc<EngineRuntime>) {

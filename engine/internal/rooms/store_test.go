@@ -149,6 +149,172 @@ func TestAutoRecycleDisabledNeverArchives(t *testing.T) {
 	}
 }
 
+func TestLowLiveCleanupSkipsUnknownAndRecyclesLocalRoom(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ImportIDs("777777777777"); err != nil {
+		t.Fatal(err)
+	}
+	settings := store.Settings()
+	settings.AutoRecycleOfflineDays = 0
+	settings.AutoRecycleLowLiveEnabled = true
+	settings.AutoRecycleMaxLiveSessions = 0
+	if _, err := store.SetSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	when := time.Date(2026, 8, 4, 10, 0, 0, 0, time.Local)
+	if cleaned, err := store.RecordLiveResult("777777777777", "unknown", when); err != nil || cleaned {
+		t.Fatalf("unknown room must be skipped, cleaned=%v err=%v", cleaned, err)
+	}
+	if len(store.List()) != 1 {
+		t.Fatal("a room without a definitive probe was removed")
+	}
+	if cleaned, err := store.RecordLiveResult("777777777777", "offline", when); err != nil || !cleaned {
+		t.Fatalf("definitively offline room with zero live sessions must recycle, cleaned=%v err=%v", cleaned, err)
+	}
+	if len(store.List()) != 0 || len(store.RecycleBin()) != 1 {
+		t.Fatal("local room must enter the recoverable recycle bin")
+	}
+}
+
+func TestCenterOnlyCleanupPersistsExclusionUntilRestored(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := CenterRoom{WebRID: "888888888888", Title: "中心库直播间", CenterUpdatedAt: "2026-08-04T09:00:00+08:00"}
+	if _, err := store.MergeCenter([]CenterRoom{item}); err != nil {
+		t.Fatal(err)
+	}
+	settings := store.Settings()
+	settings.AutoRecycleOfflineDays = 0
+	settings.AutoRecycleLowLiveEnabled = true
+	settings.AutoRecycleMaxLiveSessions = 0
+	if _, err := store.SetSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	if cleaned, err := store.RecordLiveResult(item.WebRID, "offline", time.Now()); err != nil || !cleaned {
+		t.Fatalf("center-only room was not cleaned, cleaned=%v err=%v", cleaned, err)
+	}
+	if len(store.All()) != 0 || len(store.RecycleBin()) != 0 {
+		t.Fatal("center-only room must be deleted locally instead of archived")
+	}
+	if exclusions := store.CenterExclusions(); len(exclusions) != 1 || exclusions[0].WebRID != item.WebRID {
+		t.Fatalf("center cleanup must create one exclusion: %+v", exclusions)
+	}
+	if pending := store.PendingCenterExclusions(); len(pending) != 1 || !pending[0].SyncPending {
+		t.Fatalf("new local exclusion must wait for center acknowledgement: %+v", pending)
+	}
+	if result, err := store.MergeCenter([]CenterRoom{item}); err != nil || result.Excluded != 1 || result.Imported != 0 {
+		t.Fatalf("excluded room must be skipped by later center sync: %+v err=%v", result, err)
+	}
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reloaded.CenterExclusions()) != 1 {
+		t.Fatal("center exclusion must persist across restarts")
+	}
+	restored, err := reloaded.RestoreCenterExclusion(item.WebRID)
+	if err != nil || restored.WebRID != item.WebRID {
+		t.Fatalf("center exclusion was not restored: %+v err=%v", restored, err)
+	}
+	if len(reloaded.CenterExclusions()) != 0 || len(reloaded.List()) != 1 {
+		t.Fatal("restoring exclusion must recreate the stopped local room")
+	}
+}
+
+func TestGlobalCenterExclusionsRemoveCenterRoomsWithoutResurrection(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := CenterRoom{WebRID: "887777777777", ActualRoomID: "7000000000000000007", Title: "全局垃圾直播间"}
+	if _, err := store.MergeCenter([]CenterRoom{item}); err != nil {
+		t.Fatal(err)
+	}
+	exclusion := CenterExclusion{ID: item.WebRID, WebRID: item.WebRID, ActualRoomID: item.ActualRoomID, Reason: "中心全局排除", ExcludedAt: time.Now().Format(time.RFC3339Nano)}
+	if err := store.MergeGlobalCenterExclusions([]CenterExclusion{exclusion}); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.All()) != 0 || len(store.CenterExclusions()) != 1 || len(store.PendingCenterExclusions()) != 0 {
+		t.Fatalf("global exclusion was not applied: rooms=%+v exclusions=%+v", store.All(), store.CenterExclusions())
+	}
+	if result, err := store.MergeCenter([]CenterRoom{item}); err != nil || result.Excluded != 1 {
+		t.Fatalf("global exclusion allowed center resurrection: result=%+v err=%v", result, err)
+	}
+	if err := store.MergeGlobalCenterExclusions(nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.CenterExclusions()) != 0 {
+		t.Fatalf("server-authoritative restore was not reconciled: %+v", store.CenterExclusions())
+	}
+}
+
+func TestPermanentDeleteCenterLinkedRoomCreatesExclusion(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := CenterRoom{WebRID: "889999999999", ActualRoomID: "778888888888", Title: "待删除中心房间"}
+	if _, err := store.MergeCenter([]CenterRoom{item}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ImportIDs(item.WebRID); err != nil {
+		t.Fatal(err)
+	}
+	settings := store.Settings()
+	settings.AutoRecycleOfflineDays = 0
+	settings.AutoRecycleLowLiveEnabled = true
+	settings.AutoRecycleMaxLiveSessions = 0
+	if _, err := store.SetSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	if cleaned, err := store.RecordLiveResult(item.WebRID, "offline", time.Now()); err != nil || !cleaned {
+		t.Fatalf("center-linked local room must enter recycle bin: cleaned=%v err=%v", cleaned, err)
+	}
+	if err := store.DeleteRecycled(item.WebRID); err != nil {
+		t.Fatal(err)
+	}
+	if exclusions := store.CenterExclusions(); len(exclusions) != 1 || exclusions[0].ActualRoomID != item.ActualRoomID {
+		t.Fatalf("permanent delete must retain center exclusion metadata: %+v", exclusions)
+	}
+}
+
+func TestNoPacketCleanupUsesFirstProbeAndLatestPacket(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ImportIDs("999999999999"); err != nil {
+		t.Fatal(err)
+	}
+	settings := store.Settings()
+	settings.AutoRecycleOfflineDays = 0
+	settings.AutoRecycleNoPacketEnabled = true
+	settings.AutoRecycleNoPacketDays = 3
+	if _, err := store.SetSettings(settings); err != nil {
+		t.Fatal(err)
+	}
+	first := time.Date(2026, 8, 1, 10, 0, 0, 0, time.Local)
+	if cleaned, err := store.RecordLiveResult("999999999999", "offline", first); err != nil || cleaned {
+		t.Fatalf("first definitive probe starts the observation window: cleaned=%v err=%v", cleaned, err)
+	}
+	packetAt := first.Add(48 * time.Hour)
+	if err := store.RecordRedPacketEvent("999999999999", packetAt); err != nil {
+		t.Fatal(err)
+	}
+	if cleaned, err := store.RecordLiveResult("999999999999", "offline", first.Add(96*time.Hour)); err != nil || cleaned {
+		t.Fatalf("recent packet must reset the no-packet window: cleaned=%v err=%v", cleaned, err)
+	}
+	if cleaned, err := store.RecordLiveResult("999999999999", "offline", packetAt.Add(72*time.Hour)); err != nil || !cleaned {
+		t.Fatalf("three full days without a packet must recycle: cleaned=%v err=%v", cleaned, err)
+	}
+}
+
 func TestLoadRemovesRoomsWithoutValidWebRID(t *testing.T) {
 	dataDir := t.TempDir()
 	path := filepath.Join(dataDir, "rooms.json")
@@ -352,6 +518,45 @@ func TestPageKeepsHundredThousandRoomResponseBounded(t *testing.T) {
 	page := store.Page(0, 300, "")
 	if page.Total != len(values) || len(page.Items) != 300 {
 		t.Fatalf("high-volume page must return 300/%d rows, got %d/%d", len(values), len(page.Items), page.Total)
+	}
+}
+
+func TestPageBySourceFiltersBeforePagination(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Format(time.RFC3339Nano)
+	store.mu.Lock()
+	store.rooms = map[string]*Room{
+		"100001": {ID: "100001", WebRID: "100001", Source: "manual", CreatedAt: now, UpdatedAt: now},
+		"100002": {ID: "100002", WebRID: "100002", Source: "dy-kiro", CreatedAt: now, UpdatedAt: now},
+		"100003": {ID: "100003", WebRID: "100003", Source: "center", CreatedAt: now, UpdatedAt: now},
+		"100004": {
+			ID: "100004", WebRID: "100004", Source: "manual", CreatedAt: now, UpdatedAt: now,
+			FollowSources: []FollowSource{{AccountID: "account-1", AccountName: "关注账号"}},
+		},
+	}
+	store.mu.Unlock()
+
+	tests := []struct {
+		source string
+		want   []string
+	}{
+		{source: "imported", want: []string{"100001", "100002"}},
+		{source: "center", want: []string{"100003"}},
+		{source: "following", want: []string{"100004"}},
+	}
+	for _, test := range tests {
+		page := store.PageBySource(0, 10, "", test.source)
+		if page.Total != len(test.want) || len(page.Items) != len(test.want) {
+			t.Fatalf("source %q returned %d/%d rooms, want %d", test.source, len(page.Items), page.Total, len(test.want))
+		}
+		for index, id := range test.want {
+			if page.Items[index].ID != id {
+				t.Fatalf("source %q item %d=%q, want %q", test.source, index, page.Items[index].ID, id)
+			}
+		}
 	}
 }
 

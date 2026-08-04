@@ -90,6 +90,8 @@ func detectCPUUsage() float64 {
 		}
 	case "linux":
 		return detectLinuxCPUUsage()
+	case "windows":
+		return detectWindowsCPUUsage()
 	}
 	return 0
 }
@@ -120,11 +122,21 @@ func detectLinuxCPUUsage() float64 {
 	}
 	time.Sleep(100 * time.Millisecond)
 	secondTotal, secondIdle, ok := readLinuxCPUTimes()
-	if !ok || secondTotal <= firstTotal {
+	if !ok {
+		return 0
+	}
+	return cpuUsageFromSamples(firstTotal, firstIdle, secondTotal, secondIdle)
+}
+
+func cpuUsageFromSamples(firstTotal, firstIdle, secondTotal, secondIdle uint64) float64 {
+	if secondTotal <= firstTotal {
 		return 0
 	}
 	totalDelta := secondTotal - firstTotal
-	idleDelta := secondIdle - firstIdle
+	idleDelta := uint64(0)
+	if secondIdle > firstIdle {
+		idleDelta = secondIdle - firstIdle
+	}
 	if idleDelta > totalDelta {
 		idleDelta = totalDelta
 	}
@@ -232,6 +244,8 @@ func detectMemory() (uint64, uint64) {
 		return detectDarwinMemory()
 	case "linux":
 		return detectLinuxMemory()
+	case "windows":
+		return detectWindowsMemory()
 	default:
 		return 0, 0
 	}

@@ -548,6 +548,55 @@ func TestPageParticipantWaitsForPreparedLiveContext(t *testing.T) {
 	}
 }
 
+func TestPageParticipantChallengeStopsNativeContextAndTask(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationStarted("account-challenge", "验证账号"); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeParticipationStore{
+		credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-challenge", AccountName: "验证账号"}},
+		notify:      make(chan struct{}, 1),
+	}
+	executor := &fakePageParticipationExecutor{
+		ready: true,
+		response: PageParticipationResponse{
+			Endpoint: "page", Error: "验证码/安全验证拦截", ChallengeBlocked: true,
+		},
+	}
+	participant := NewPageParticipant(store, executor, recordStore)
+	participant.HandleEvent(Event{
+		ID: "monitor:challenge-event", WebRID: "7654321", ActualRoomID: "700001",
+		JoinBoxID: "7669047909329177395", Title: "钻石红包",
+	})
+	select {
+	case <-store.notify:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for challenge classification")
+	}
+
+	store.mu.Lock()
+	if len(store.records) != 1 || store.records[0].status != "challenge_blocked" || store.records[0].cookieExpired {
+		t.Fatalf("challenge must remain distinct from CK expiry: %+v", store.records)
+	}
+	store.mu.Unlock()
+	executor.mu.Lock()
+	stopped := append([]string(nil), executor.stopped...)
+	executor.mu.Unlock()
+	if len(stopped) != 1 || stopped[0] != "account-challenge" {
+		t.Fatalf("challenge must stop native account context: %+v", stopped)
+	}
+	deadline := time.Now().Add(time.Second)
+	for recordStore.GetParticipationState("account-challenge", time.Now()).Active && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if state := recordStore.GetParticipationState("account-challenge", time.Now()); state.Active {
+		t.Fatalf("challenge task must become terminal: %+v", state)
+	}
+}
+
 func TestPageParticipantStoppedBeforeRequestReleasesReservation(t *testing.T) {
 	recordStore, err := NewStore(t.TempDir())
 	if err != nil {
@@ -731,6 +780,7 @@ func TestParticipantResponseClassification(t *testing.T) {
 		{name: "already joined", response: jsonResponse(200, `{"status_code":0,"data":{"rush_too_much":1}}`), status: "already_joined", joined: true},
 		{name: "expired overrides already", response: jsonResponse(200, `{"status_code":0,"data":{"rush_too_much":1,"expired":true}}`), status: "expired"},
 		{name: "risk", response: jsonResponse(200, `{"status_code":0,"data":{"rush_spam":true},"status_msg":"操作频繁"}`), status: "risk_control", cooldown: true},
+		{name: "captcha", response: jsonResponse(200, `{"status_code":0,"data":{"need_verify":true},"status_msg":"请完成安全验证"}`), status: "challenge_blocked"},
 		{name: "login body", response: jsonResponse(200, `{"status_code":1,"status_msg":"请登录后重试"}`), status: "login_expired", cookieExpired: true},
 		{name: "login http", response: jsonResponse(403, `{}`), status: "login_expired", cookieExpired: true},
 		{name: "network", err: errors.New("connection reset by peer"), status: "network_error", cooldown: true},
@@ -751,22 +801,35 @@ func TestParticipantResponseClassification(t *testing.T) {
 
 func TestReceiveResponseClassification(t *testing.T) {
 	tests := []struct {
-		name    string
-		body    string
-		status  string
-		message string
-		award   string
+		name     string
+		body     string
+		status   string
+		message  string
+		award    string
+		alias    string
+		fallback bool
 	}{
-		{name: "empty result means not won", body: `{"status_code":0,"data":{"receive_info":[]}}`, status: "not_won", message: "未中奖"},
+		{name: "empty result stays pending", body: `{"status_code":0,"data":{"receive_info":[]}}`},
 		{name: "explicit loss", body: `{"status_code":0,"data":{"receive_info":[{"box_id_str":"box-1","succeed":false}]}}`, status: "not_won", message: "未中奖"},
 		{name: "diamond win", body: `{"status_code":0,"data":{"receive_info":[{"box_id_str":"box-1","succeed":true,"diamond_count":8}]}}`, status: "won", message: "已中8钻", award: "8钻"},
 		{name: "gift win", body: `{"status_code":0,"data":{"receive_info":[{"box_id_str":"box-1","succeed":true,"gift_name":"小心心","gift_count":2}]}}`, status: "won", message: "已中2个小心心", award: "2个小心心"},
 		{name: "mismatched result stays pending", body: `{"status_code":0,"data":{"receive_info":[{"box_id_str":"another-box","succeed":false}]}}`},
+		{name: "single mismatched definitive result can use event fallback", body: `{"status_code":0,"data":{"receive_info":[{"box_id_str":"receive-box","succeed":true,"diamond_count":1}]}}`, status: "won", message: "已中1钻", award: "1钻", fallback: true},
+		{name: "packet alias resolves numeric box response", body: `{"status_code":0,"data":{"receive_info":[{"succeed":true,"box_id":7654448853667941163,"box_id_str":"7654448853667941163","diamond_count":1,"gift_name":""}]}}`, status: "won", message: "已中1钻", award: "1钻", alias: "7654448853667941163"},
 		{name: "missing personal result stays pending", body: `{"status_code":0,"data":{}}`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := classifyReceiveResponse(tt.body, "box-1")
+			aliases := []string{"box-1"}
+			if tt.alias != "" {
+				aliases = append(aliases, tt.alias)
+			}
+			var got drawOutcome
+			if tt.fallback {
+				got = classifyReceiveResponseWithSingleFallback(tt.body, aliases...)
+			} else {
+				got = classifyReceiveResponse(tt.body, aliases...)
+			}
 			if got.status != tt.status || got.message != tt.message || got.award != tt.award {
 				t.Fatalf("unexpected receive classification: %+v", got)
 			}

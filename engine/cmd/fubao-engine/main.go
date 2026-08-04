@@ -130,6 +130,17 @@ func main() {
 	}
 	if redPacketStoreErr == nil && (redPacketParticipant != nil || remoteSyncManager != nil) {
 		redPacketStore.SetEventHandler(func(event redpacket.Event) {
+			if roomStoreErr == nil {
+				detectedAt, err := time.Parse(time.RFC3339Nano, event.DetectedAt)
+				if err != nil {
+					detectedAt = time.Now()
+				}
+				roomID := strings.TrimSpace(event.RoomID)
+				if roomID == "" {
+					roomID = strings.TrimSpace(event.WebRID)
+				}
+				_ = roomStore.RecordRedPacketEvent(roomID, detectedAt)
+			}
 			if redPacketParticipant != nil {
 				redPacketParticipant.HandleEvent(event)
 			}
@@ -965,6 +976,7 @@ func main() {
 				Offset int    `json:"offset"`
 				Limit  int    `json:"limit"`
 				Query  string `json:"query"`
+				Source string `json:"source"`
 			}
 			if len(req.Params) > 0 {
 				if err := json.Unmarshal(req.Params, &params); err != nil {
@@ -972,7 +984,7 @@ func main() {
 					continue
 				}
 			}
-			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: roomStore.Page(params.Offset, params.Limit, params.Query)})
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: roomStore.PageBySource(params.Offset, params.Limit, params.Query, params.Source)})
 		case "room.settings":
 			if roomStoreErr != nil {
 				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
@@ -1001,6 +1013,52 @@ func main() {
 				continue
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: roomStore.RecycleBin()})
+		case "room.center_exclusions":
+			if roomStoreErr != nil {
+				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: roomStore.CenterExclusions()})
+		case "room.center_exclusion.restore":
+			if roomStoreErr != nil {
+				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			var params struct {
+				RoomID string `json:"room_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.RoomID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "解除中心库排除参数无效")
+				continue
+			}
+			exclusion, exists := roomStore.CenterExclusion(params.RoomID)
+			if !exists {
+				writeError(encoder, req.ID, "room_center_exclusion_restore_failed", "中心库排除记录不存在")
+				continue
+			}
+			if remoteSyncManagerErr != nil || remoteSyncManager == nil || remoteSyncPullScope(licenseManager) != remotesync.PullAll {
+				writeError(encoder, req.ID, "room_center_exclusion_restore_failed", "只有已绑定中心库的永久专业版可以解除中心库排除")
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			err := remoteSyncManager.SyncCenterExclusions(ctx, roomStore)
+			if err == nil {
+				err = remoteSyncManager.RestoreCenterExclusion(ctx, exclusion.WebRID)
+			}
+			cancel()
+			if err != nil {
+				writeError(encoder, req.ID, "room_center_exclusion_restore_failed", err.Error())
+				continue
+			}
+			result, err := roomStore.RestoreCenterExclusion(params.RoomID)
+			if err != nil {
+				writeError(encoder, req.ID, "room_center_exclusion_restore_failed", err.Error())
+				continue
+			}
+			if redPacketStoreErr == nil {
+				_ = redPacketStore.SyncRooms(roomStore.All())
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
 		case "room.recycle.restore":
 			if roomStoreErr != nil {
 				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
@@ -1037,6 +1095,15 @@ func main() {
 			if err := roomStore.DeleteRecycled(params.RoomID); err != nil {
 				writeError(encoder, req.ID, "room_delete_failed", err.Error())
 				continue
+			}
+			if remoteSyncManager != nil && remoteSyncManagerErr == nil && remoteSyncPullScope(licenseManager) == remotesync.PullAll {
+				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				err := remoteSyncManager.SyncCenterExclusions(ctx, roomStore)
+				cancel()
+				if err != nil {
+					writeError(encoder, req.ID, "room_center_exclusion_sync_failed", "已在本机排除，中心库同步失败并将在后台重试："+err.Error())
+					continue
+				}
 			}
 			if redPacketStoreErr == nil {
 				_ = redPacketStore.SyncRooms(roomStore.All())
@@ -1342,6 +1409,12 @@ func main() {
 				continue
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.Activities()})
+		case "red_packet_participation.overview":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.ParticipationOverview()})
 		case "activity.stop_participation_batch":
 			if redPacketStoreErr != nil {
 				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
@@ -1471,15 +1544,16 @@ func main() {
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: task})
 		case "red_packet_participation.native_complete":
 			var params struct {
-				TaskID         string `json:"task_id"`
-				Endpoint       string `json:"endpoint"`
-				HTTPStatus     int    `json:"http_status"`
-				Body           string `json:"body"`
-				Error          string `json:"error"`
-				Attempts       int    `json:"attempts"`
-				ContextMissing bool   `json:"context_missing"`
-				LoginExpired   bool   `json:"login_expired"`
-				Secret         string `json:"secret"`
+				TaskID           string `json:"task_id"`
+				Endpoint         string `json:"endpoint"`
+				HTTPStatus       int    `json:"http_status"`
+				Body             string `json:"body"`
+				Error            string `json:"error"`
+				Attempts         int    `json:"attempts"`
+				ContextMissing   bool   `json:"context_missing"`
+				LoginExpired     bool   `json:"login_expired"`
+				ChallengeBlocked bool   `json:"challenge_blocked"`
+				Secret           string `json:"secret"`
 			}
 			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.TaskID) == "" {
 				writeError(encoder, req.ID, "invalid_params", "原生红包参与结果参数无效")
@@ -1493,6 +1567,7 @@ func main() {
 				Endpoint: params.Endpoint, HTTPStatus: params.HTTPStatus, Body: params.Body,
 				Error: params.Error, Attempts: params.Attempts,
 				ContextMissing: params.ContextMissing, LoginExpired: params.LoginExpired,
+				ChallengeBlocked: params.ChallengeBlocked,
 			}) {
 				writeError(encoder, req.ID, "participation_task_missing", "原生红包参与任务已结束或不存在")
 				continue

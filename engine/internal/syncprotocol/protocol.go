@@ -117,6 +117,30 @@ type RedPacket struct {
 	ShareCount       int     `json:"share_count,omitempty"`
 }
 
+// CenterRoomExclusion is a server-authoritative tombstone for a room that must
+// not be accepted into the shared center library again. Display metadata is
+// intentionally limited to safe room fields.
+type CenterRoomExclusion struct {
+	WebRID       string `json:"web_rid"`
+	ActualRoomID string `json:"actual_room_id,omitempty"`
+	Name         string `json:"name,omitempty"`
+	StreamerName string `json:"streamer_name,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	ExcludedAt   string `json:"excluded_at"`
+}
+
+type CenterRoomExclusionsRequest struct {
+	Items []CenterRoomExclusion `json:"items"`
+}
+
+type CenterRoomExclusionsResponse struct {
+	Items []CenterRoomExclusion `json:"items"`
+}
+
+type CenterRoomExclusionRestoreRequest struct {
+	WebRID string `json:"web_rid"`
+}
+
 func NormalizeEndpoint(value string) (string, error) {
 	value = strings.TrimRight(strings.TrimSpace(value), "/")
 	if value == "" {

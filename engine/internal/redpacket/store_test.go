@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -440,6 +441,112 @@ func TestParticipationBatchActivityConsolidatesAccountStarts(t *testing.T) {
 	stoppedActivities := store.Activities()
 	if len(stoppedActivities) != 1 || stoppedActivities[0].Active || stoppedActivities[0].StoppedAt == "" {
 		t.Fatalf("batch activity did not persist stopped state: %+v", stoppedActivities)
+	}
+}
+
+func TestParticipationTaskCompletionActivityAndOverviewPersist(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordParticipationStarted("account-summary", "账号甲"); err != nil {
+		t.Fatal(err)
+	}
+	for index, won := range []bool{true, false} {
+		event := Event{
+			ID: fmt.Sprintf("event-summary-%d", index), RoomID: "room-summary", WebRID: "123456",
+			JoinBoxID: fmt.Sprintf("box-summary-%d", index), Title: "钻石红包",
+		}
+		reserved, reserveErr := store.ReserveParticipation(event, "account-summary", "账号甲")
+		if reserveErr != nil || !reserved {
+			t.Fatalf("reserve %d failed: reserved=%v err=%v", index, reserved, reserveErr)
+		}
+		if err := store.CompleteParticipation(event.ID, "account-summary", "join", "joined", "已受理", 1, true, false, 0); err != nil {
+			t.Fatal(err)
+		}
+		if won {
+			if _, err := store.ResolveParticipationDraw(event.ID, "account-summary", "won", "已中8钻", "8钻", 1); err != nil {
+				t.Fatal(err)
+			}
+		} else if _, err := store.ResolveParticipationDraw(event.ID, "account-summary", "not_won", "未中奖", "", 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.FinishParticipationTask("account-summary", "本次任务达到上限"); err != nil {
+		t.Fatal(err)
+	}
+	// Finishing the same task again must not append a duplicate activity.
+	if err := store.FinishParticipationTask("account-summary", "重复结束"); err != nil {
+		t.Fatal(err)
+	}
+	activities := store.Activities()
+	if len(activities) != 1 || activities[0].Kind != "participation_task_completed" || activities[0].Label != "账号甲已完成：参与 2 次，中奖 1 次 / 8 钻" {
+		t.Fatalf("unexpected completion activity: %+v", activities)
+	}
+	if activities[0].JoinCount != 2 || activities[0].WinCount != 1 || activities[0].WinDiamonds != 8 || len(activities[0].AccountSummaries) != 1 {
+		t.Fatalf("unexpected completion summary: %+v", activities[0])
+	}
+	if overview := store.ParticipationOverview(); overview.JoinCount != 2 || overview.WinCount != 1 || overview.WinDiamonds != 8 {
+		t.Fatalf("unexpected participation overview: %+v", overview)
+	}
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if overview := reloaded.ParticipationOverview(); overview.JoinCount != 2 || overview.WinCount != 1 || overview.WinDiamonds != 8 {
+		t.Fatalf("overview did not persist: %+v", overview)
+	}
+	if activities := reloaded.Activities(); len(activities) != 1 || activities[0].Label != "账号甲已完成：参与 2 次，中奖 1 次 / 8 钻" {
+		t.Fatalf("completion activity did not persist: %+v", activities)
+	}
+}
+
+func TestParticipationBatchCompletesAsOneAggregatedActivity(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, account := range []struct{ id, name string }{{"batch-a", "账号甲"}, {"batch-b", "账号乙"}} {
+		if err := store.RecordParticipationStarted(account.id, account.name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.RecordParticipationBatchResult("", "immediate", 2, 0, []string{"batch-a", "batch-b"}); err != nil {
+		t.Fatal(err)
+	}
+	for index, accountID := range []string{"batch-a", "batch-b"} {
+		event := Event{ID: fmt.Sprintf("batch-event-%d", index), RoomID: "room", WebRID: "123456", JoinBoxID: fmt.Sprintf("batch-box-%d", index), Title: "钻石红包"}
+		if reserved, err := store.ReserveParticipation(event, accountID, ""); err != nil || !reserved {
+			t.Fatalf("batch reserve failed: reserved=%v err=%v", reserved, err)
+		}
+		if err := store.CompleteParticipation(event.ID, accountID, "join", "joined", "已受理", 1, true, false, 0); err != nil {
+			t.Fatal(err)
+		}
+		award := "8钻"
+		if index == 1 {
+			award = "2个小心心"
+		}
+		if _, err := store.ResolveParticipationDraw(event.ID, accountID, "won", "已中奖", award, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.FinishParticipationTask("batch-a", "已完成"); err != nil {
+		t.Fatal(err)
+	}
+	activities := store.Activities()
+	if len(activities) != 1 || !activities[0].Active || strings.Contains(activities[0].Label, "已完成") {
+		t.Fatalf("batch completed before every child task ended: %+v", activities)
+	}
+	if err := store.FinishParticipationTask("batch-b", "已完成"); err != nil {
+		t.Fatal(err)
+	}
+	activities = store.Activities()
+	if len(activities) != 1 || activities[0].Active || activities[0].Label != "“立即执行”已完成：2 个账号，参与 2 次，中奖 2 次 / 8 钻" {
+		t.Fatalf("unexpected aggregated completion activity: %+v", activities)
+	}
+	if len(activities[0].AccountSummaries) != 2 || activities[0].JoinCount != 2 || activities[0].WinCount != 2 || activities[0].WinDiamonds != 8 {
+		t.Fatalf("unexpected aggregated account details: %+v", activities[0])
 	}
 }
 
@@ -1080,6 +1187,96 @@ func TestMonitorStaggerDelayIsStableAndBounded(t *testing.T) {
 	}
 	if first < 0 || first >= 10*time.Second {
 		t.Fatalf("stagger delay out of range: %s", first)
+	}
+}
+
+func TestBulkMonitoringPrioritizesLocalRoomsBeforeCenterRooms(t *testing.T) {
+	monitors := map[string]*Monitor{
+		"room_center_b": {ID: "room_center_b", Source: "center"},
+		"room_manual_b": {ID: "room_manual_b", Source: "manual"},
+		"room_center_a": {ID: "room_center_a", Source: "center"},
+		"room_follow_a": {ID: "room_follow_a", Source: "following-live"},
+		"room_legacy_a": {ID: "room_legacy_a", Source: "dy-kiro"},
+	}
+	ids := []string{"room_center_b", "room_manual_b", "room_center_a", "room_follow_a", "room_legacy_a"}
+	localCount := prioritizeBulkMonitorIDs(ids, monitors)
+	if localCount != 3 {
+		t.Fatalf("expected three local rooms before center rows, got %d: %v", localCount, ids)
+	}
+	want := []string{"room_follow_a", "room_legacy_a", "room_manual_b", "room_center_a", "room_center_b"}
+	for index := range want {
+		if ids[index] != want[index] {
+			t.Fatalf("unexpected source priority order: got %v want %v", ids, want)
+		}
+	}
+}
+
+func TestBulkMonitoringUsesFollowingThenImportedThenCenterTiers(t *testing.T) {
+	monitors := map[string]*Monitor{
+		"a-imported": {ID: "a-imported", Source: "manual"},
+		"m-center":   {ID: "m-center", Source: "center"},
+		"z-follow":   {ID: "z-follow", Source: "following-live"},
+	}
+	ids := []string{"a-imported", "m-center", "z-follow"}
+	prioritizeBulkMonitorIDs(ids, monitors)
+	want := []string{"z-follow", "a-imported", "m-center"}
+	for index := range want {
+		if ids[index] != want[index] {
+			t.Fatalf("source tier %d=%q, want %q; order=%v", index, ids[index], want[index], ids)
+		}
+	}
+}
+
+func TestBulkMonitoringPriorityBurstAllowsLowerTiers(t *testing.T) {
+	now := time.Now()
+	queues := [3]bulkMonitorHeap{
+		{{id: "follow", due: now}},
+		{{id: "imported", due: now}},
+		{{id: "center", due: now}},
+	}
+	if rank, ok := nextReadyBulkQueue(queues, now, 0); !ok || rank != 0 {
+		t.Fatalf("first ready slot should prefer following tier, rank=%d ready=%v", rank, ok)
+	}
+	if rank, ok := nextReadyBulkQueue(queues, now, bulkPriorityBurst); !ok || rank != 1 {
+		t.Fatalf("priority burst should yield to imported tier, rank=%d ready=%v", rank, ok)
+	}
+	queues[1] = nil
+	if rank, ok := nextReadyBulkQueue(queues, now, bulkPriorityBurst); !ok || rank != 2 {
+		t.Fatalf("priority burst should yield to center tier when imports are absent, rank=%d ready=%v", rank, ok)
+	}
+}
+
+func TestSyncRoomsPersistsRoomSourceForNativeScheduling(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncRooms([]rooms.Room{
+		{ID: "local", WebRID: "123456", Source: "manual", Enabled: true},
+		{ID: "remote", WebRID: "654321", Source: "center", Enabled: true},
+		{ID: "followed", WebRID: "777777", Source: "manual", FollowSources: []rooms.FollowSource{{AccountID: "account-1"}}, Enabled: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	if err := store.saveLocked(); err != nil {
+		store.mu.Unlock()
+		t.Fatal(err)
+	}
+	store.mu.Unlock()
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	local, _ := reloaded.Get("room_local")
+	remote, _ := reloaded.Get("room_remote")
+	followed, _ := reloaded.Get("room_followed")
+	if local.Source != "manual" || remote.Source != "center" {
+		t.Fatalf("monitor sources were not persisted: local=%q center=%q", local.Source, remote.Source)
+	}
+	if followed.Source != "following-live" {
+		t.Fatalf("follow attribution must raise a monitor into the following tier, got %q", followed.Source)
 	}
 }
 

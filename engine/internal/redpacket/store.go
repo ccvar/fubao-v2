@@ -4,6 +4,7 @@
 package redpacket
 
 import (
+	"container/heap"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -23,13 +24,18 @@ import (
 )
 
 const (
-	storeVersion         = 12
+	storeVersion         = 14
 	unknownProbeInterval = 10 * time.Second
 	offlineProbeInterval = 60 * time.Second
 	livePacketInterval   = 15 * time.Second
 	activePacketInterval = 5 * time.Second
 	defaultProbeSlots    = 64
 	defaultBulkWorkers   = 64
+	// A high-priority source may fill a small burst of ready slots, after
+	// which a ready lower-priority source gets a turn. This preserves the
+	// source order without starving imported or center-library rooms while a
+	// busy following feed is continuously producing due probes.
+	bulkPriorityBurst = 8
 
 	ParticipationPacketTypeAll     = "all"
 	ParticipationPacketTypeGift    = "gift"
@@ -49,6 +55,7 @@ type Monitor struct {
 	ActualRoomID           string `json:"actual_room_id,omitempty"`
 	Name                   string `json:"name,omitempty"`
 	StreamerName           string `json:"streamer_name,omitempty"`
+	Source                 string `json:"source,omitempty"`
 	AccountID              string `json:"account_id,omitempty"`
 	AccountName            string `json:"account_name,omitempty"`
 	Status                 string `json:"status"`
@@ -171,12 +178,35 @@ type ParticipationState struct {
 // scoped to this task; historical participation records remain statistics and
 // never prevent a later start from creating a fresh task.
 type ParticipationTask struct {
-	ID        string `json:"id"`
-	AccountID string `json:"account_id"`
-	Active    bool   `json:"active"`
-	StartedAt string `json:"started_at"`
-	EndedAt   string `json:"ended_at,omitempty"`
-	EndReason string `json:"end_reason,omitempty"`
+	ID              string `json:"id"`
+	AccountID       string `json:"account_id"`
+	AccountName     string `json:"account_name,omitempty"`
+	BatchActivityID string `json:"batch_activity_id,omitempty"`
+	Active          bool   `json:"active"`
+	StartedAt       string `json:"started_at"`
+	EndedAt         string `json:"ended_at,omitempty"`
+	EndReason       string `json:"end_reason,omitempty"`
+}
+
+// ParticipationOverview is the safe all-time aggregate shown in the sidebar.
+// It is derived from idempotent account/event records, never from frontend
+// counters, so relaunching the client cannot duplicate totals.
+type ParticipationOverview struct {
+	JoinCount   int     `json:"join_count"`
+	WinCount    int     `json:"win_count"`
+	WinDiamonds float64 `json:"win_diamonds"`
+}
+
+// ActivityAccountSummary freezes one exact task's result for activity detail.
+// A later task for the same canonical account therefore cannot change history.
+type ActivityAccountSummary struct {
+	AccountID   string  `json:"account_id"`
+	AccountName string  `json:"account_name,omitempty"`
+	TaskID      string  `json:"task_id"`
+	JoinCount   int     `json:"join_count"`
+	WinCount    int     `json:"win_count"`
+	WinDiamonds float64 `json:"win_diamonds"`
+	EndReason   string  `json:"end_reason,omitempty"`
 }
 
 // ParticipationRestartReconciliation reports task state repaired after a
@@ -232,14 +262,22 @@ type MonitoringSettings struct {
 // Activity is safe sidebar history. It never contains credentials, request
 // URLs, signatures, headers, or raw interface responses.
 type Activity struct {
-	ID         string   `json:"id"`
-	Kind       string   `json:"kind"`
-	AccountID  string   `json:"account_id,omitempty"`
-	AccountIDs []string `json:"account_ids,omitempty"`
-	Label      string   `json:"label"`
-	Active     bool     `json:"active,omitempty"`
-	CreatedAt  string   `json:"created_at"`
-	StoppedAt  string   `json:"stopped_at,omitempty"`
+	ID               string                   `json:"id"`
+	Kind             string                   `json:"kind"`
+	AccountID        string                   `json:"account_id,omitempty"`
+	AccountIDs       []string                 `json:"account_ids,omitempty"`
+	TaskIDs          map[string]string        `json:"task_ids,omitempty"`
+	AccountSummaries []ActivityAccountSummary `json:"account_summaries,omitempty"`
+	Title            string                   `json:"title,omitempty"`
+	Label            string                   `json:"label"`
+	Active           bool                     `json:"active,omitempty"`
+	JoinCount        int                      `json:"join_count,omitempty"`
+	WinCount         int                      `json:"win_count,omitempty"`
+	WinDiamonds      float64                  `json:"win_diamonds,omitempty"`
+	CreatedAt        string                   `json:"created_at"`
+	FinishedAt       string                   `json:"finished_at,omitempty"`
+	StoppedAt        string                   `json:"stopped_at,omitempty"`
+	EndReason        string                   `json:"end_reason,omitempty"`
 }
 
 // ParticipationSchedule is a credential-free persisted trigger definition.
@@ -945,6 +983,7 @@ func (s *Store) ResolveParticipationDraw(eventID, accountID, status, message, aw
 
 // RecordParticipationStarted appends one real explicit start action.
 func (s *Store) RecordParticipationStarted(accountID, accountName string) error {
+	accountID = strings.TrimSpace(accountID)
 	accountName = strings.TrimSpace(accountName)
 	if accountName == "" {
 		accountName = "参与账号"
@@ -952,13 +991,15 @@ func (s *Store) RecordParticipationStarted(accountID, accountName string) error 
 	now := time.Now()
 	sum := sha256.Sum256([]byte(accountID + "\x00" + now.Format(time.RFC3339Nano)))
 	activity := &Activity{
-		ID: hex.EncodeToString(sum[:12]), Kind: "participation_started", AccountID: strings.TrimSpace(accountID),
+		ID: hex.EncodeToString(sum[:12]), Kind: "participation_started", AccountID: accountID,
+		AccountIDs: []string{accountID}, Title: accountName, Active: true,
 		Label: fmt.Sprintf("参与账号“%s”启动了红包参与", accountName), CreatedAt: now.Format(time.RFC3339Nano),
 	}
+	activity.TaskIDs = map[string]string{accountID: activity.ID}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.participationTasks[accountID] = &ParticipationTask{
-		ID: activity.ID, AccountID: strings.TrimSpace(accountID), Active: true, StartedAt: now.Format(time.RFC3339Nano),
+		ID: activity.ID, AccountID: accountID, AccountName: accountName, Active: true, StartedAt: now.Format(time.RFC3339Nano),
 	}
 	s.activities[activity.ID] = activity
 	return s.saveLocked()
@@ -973,10 +1014,156 @@ func (s *Store) FinishParticipationTask(accountID, reason string) error {
 	if task == nil || !task.Active {
 		return nil
 	}
+	now := time.Now()
 	task.Active = false
-	task.EndedAt = time.Now().Format(time.RFC3339Nano)
+	task.EndedAt = now.Format(time.RFC3339Nano)
 	task.EndReason = strings.TrimSpace(reason)
+	s.finalizeParticipationTaskActivityLocked(task, now)
 	return s.saveLocked()
+}
+
+// ParticipationOverview returns persisted all-time totals across every
+// account and task. A joined account/event record contributes exactly once.
+func (s *Store) ParticipationOverview() ParticipationOverview {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	result := ParticipationOverview{}
+	for _, record := range s.participations {
+		if record == nil {
+			continue
+		}
+		if record.Joined {
+			result.JoinCount++
+		}
+		if record.Won {
+			result.WinCount++
+			result.WinDiamonds += participationAwardDiamonds(record.Award)
+		}
+	}
+	return result
+}
+
+func (s *Store) participationTaskSummaryLocked(accountID, taskID string) ActivityAccountSummary {
+	accountID, taskID = strings.TrimSpace(accountID), strings.TrimSpace(taskID)
+	summary := ActivityAccountSummary{AccountID: accountID, TaskID: taskID}
+	if task := s.participationTasks[accountID]; task != nil && task.ID == taskID {
+		summary.AccountName = strings.TrimSpace(task.AccountName)
+		summary.EndReason = strings.TrimSpace(task.EndReason)
+	}
+	for _, record := range s.participations {
+		if record == nil || record.AccountID != accountID || record.TaskID != taskID {
+			continue
+		}
+		if summary.AccountName == "" {
+			summary.AccountName = strings.TrimSpace(record.AccountName)
+		}
+		if record.Joined {
+			summary.JoinCount++
+		}
+		if record.Won {
+			summary.WinCount++
+			summary.WinDiamonds += participationAwardDiamonds(record.Award)
+		}
+	}
+	if summary.AccountName == "" {
+		summary.AccountName = "参与账号"
+	}
+	return summary
+}
+
+func (s *Store) finalizeParticipationTaskActivityLocked(task *ParticipationTask, now time.Time) {
+	if task == nil {
+		return
+	}
+	if batchID := strings.TrimSpace(task.BatchActivityID); batchID != "" {
+		s.finalizeParticipationBatchActivityLocked(batchID, false, now)
+		return
+	}
+	summary := s.participationTaskSummaryLocked(task.AccountID, task.ID)
+	activity := s.activities[task.ID]
+	if activity == nil {
+		activity = &Activity{ID: task.ID, CreatedAt: task.StartedAt}
+		s.activities[task.ID] = activity
+	}
+	activity.Kind = "participation_task_completed"
+	activity.AccountID = task.AccountID
+	activity.AccountIDs = []string{task.AccountID}
+	activity.TaskIDs = map[string]string{task.AccountID: task.ID}
+	activity.AccountSummaries = []ActivityAccountSummary{summary}
+	activity.Title = summary.AccountName
+	activity.Label = fmt.Sprintf("%s已完成：参与 %d 次，中奖 %d 次 / %s 钻",
+		summary.AccountName, summary.JoinCount, summary.WinCount, formatParticipationDiamonds(summary.WinDiamonds))
+	activity.Active = false
+	activity.JoinCount = summary.JoinCount
+	activity.WinCount = summary.WinCount
+	activity.WinDiamonds = summary.WinDiamonds
+	activity.FinishedAt = now.Format(time.RFC3339Nano)
+	activity.EndReason = strings.TrimSpace(task.EndReason)
+}
+
+func (s *Store) finalizeParticipationBatchActivityLocked(activityID string, stopped bool, now time.Time) bool {
+	activity := s.activities[strings.TrimSpace(activityID)]
+	if activity == nil || activity.Kind != "participation_batch_executed" {
+		return false
+	}
+	if !stopped {
+		for accountID, taskID := range activity.TaskIDs {
+			if task := s.participationTasks[accountID]; task != nil && task.ID == taskID && task.Active {
+				return false
+			}
+		}
+	}
+	summaries := make([]ActivityAccountSummary, 0, len(activity.AccountIDs))
+	joins, wins := 0, 0
+	diamonds := 0.0
+	for _, accountID := range activity.AccountIDs {
+		taskID := activity.TaskIDs[accountID]
+		if taskID == "" {
+			continue
+		}
+		summary := s.participationTaskSummaryLocked(accountID, taskID)
+		summaries = append(summaries, summary)
+		joins += summary.JoinCount
+		wins += summary.WinCount
+		diamonds += summary.WinDiamonds
+	}
+	title := strings.TrimSpace(activity.Title)
+	if title == "" {
+		title = "红包参与任务"
+	}
+	state := "已完成"
+	if stopped {
+		state = "已停止"
+		activity.StoppedAt = now.Format(time.RFC3339Nano)
+	}
+	activity.Label = fmt.Sprintf("“%s”%s：%d 个账号，参与 %d 次，中奖 %d 次 / %s 钻",
+		title, state, len(activity.AccountIDs), joins, wins, formatParticipationDiamonds(diamonds))
+	activity.Active = false
+	activity.AccountSummaries = summaries
+	activity.JoinCount = joins
+	activity.WinCount = wins
+	activity.WinDiamonds = diamonds
+	activity.FinishedAt = now.Format(time.RFC3339Nano)
+	return true
+}
+
+func participationAwardDiamonds(award string) float64 {
+	award = strings.TrimSpace(award)
+	if !strings.HasSuffix(award, "钻") {
+		return 0
+	}
+	value, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimSuffix(award, "钻")), 64)
+	if err != nil || value <= 0 {
+		return 0
+	}
+	return value
+}
+
+func formatParticipationDiamonds(value float64) string {
+	if value <= 0 {
+		return "0"
+	}
+	return strconv.FormatFloat(value, 'f', -1, 64)
 }
 
 // ReconcileParticipationTasksAfterRestart removes stale "active" state left
@@ -1010,6 +1197,7 @@ func (s *Store) ReconcileParticipationTasksAfterRestart(now time.Time) (Particip
 		task.Active = false
 		task.EndedAt = now.Format(time.RFC3339Nano)
 		task.EndReason = "客户端重启，原生参与上下文已结束"
+		s.finalizeParticipationTaskActivityLocked(task, now)
 		result.StoppedAccountIDs = append(result.StoppedAccountIDs, accountID)
 	}
 	sort.Strings(result.StoppedAccountIDs)
@@ -1035,10 +1223,18 @@ func (s *Store) Activities() []Activity {
 	for _, activity := range s.activities {
 		copy := *activity
 		copy.AccountIDs = append([]string(nil), activity.AccountIDs...)
+		copy.AccountSummaries = append([]ActivityAccountSummary(nil), activity.AccountSummaries...)
+		if len(activity.TaskIDs) > 0 {
+			copy.TaskIDs = make(map[string]string, len(activity.TaskIDs))
+			for accountID, taskID := range activity.TaskIDs {
+				copy.TaskIDs[accountID] = taskID
+			}
+		}
 		if copy.Kind == "participation_batch_executed" && copy.Active {
 			copy.Active = false
 			for _, accountID := range copy.AccountIDs {
-				if task := s.participationTasks[accountID]; task != nil && task.Active {
+				taskID := copy.TaskIDs[accountID]
+				if task := s.participationTasks[accountID]; task != nil && task.Active && (taskID == "" || task.ID == taskID) {
 					copy.Active = true
 					break
 				}
@@ -1046,7 +1242,16 @@ func (s *Store) Activities() []Activity {
 		}
 		items = append(items, copy)
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].CreatedAt > items[j].CreatedAt })
+	activityTime := func(item Activity) string {
+		if item.FinishedAt != "" {
+			return item.FinishedAt
+		}
+		if item.StoppedAt != "" {
+			return item.StoppedAt
+		}
+		return item.CreatedAt
+	}
+	sort.Slice(items, func(i, j int) bool { return activityTime(items[i]) > activityTime(items[j]) })
 	if len(items) > 100 {
 		items = items[:100]
 	}
@@ -1120,6 +1325,9 @@ func (s *Store) RecordParticipationTrace(task PageParticipationTask, response Pa
 	params := map[string]string{
 		"aid": "6383", "app_name": "douyin_web", "device_platform": "web", "live_id": "1",
 		"web_rid": task.WebRID, "room_id": task.ActualRoomID, "box_id": task.BoxID,
+	}
+	if strings.TrimSpace(task.PacketID) != "" {
+		params["packet_id"] = strings.TrimSpace(task.PacketID)
 	}
 	for key, value := range map[string]string{
 		"anchor_id": task.AnchorID, "box_type": task.BoxType, "send_time": task.SendTime, "delay_time": task.DelayTime,
@@ -1262,6 +1470,14 @@ func (s *Store) SyncRooms(items []rooms.Room) error {
 	for _, room := range items {
 		id := "room_" + room.ID
 		roomMonitorIDs[id] = struct{}{}
+		// Follow attribution is canonical even when the followed room is
+		// currently offline. Keep that source visible to the native scheduler
+		// so a room learned through the following list remains in the highest
+		// priority tier instead of falling back to its original import label.
+		monitorSource := room.Source
+		if len(room.FollowSources) > 0 {
+			monitorSource = "following-live"
+		}
 		monitor := s.monitors[id]
 		if monitor == nil {
 			monitor = &Monitor{ID: id, RoomID: room.ID, Status: "stopped", ConnectionStatus: "disconnected", LiveStatus: "unknown", CreatedAt: now}
@@ -1272,12 +1488,13 @@ func (s *Store) SyncRooms(items []rooms.Room) error {
 			monitor.LiveStatus = "unknown"
 			changed = true
 		}
-		if monitor.RoomID != room.ID || monitor.WebRID != room.WebRID || monitor.ActualRoomID != room.ActualRoomID || monitor.Name != room.Name || monitor.StreamerName != room.StreamerName || monitor.Enabled != room.Enabled {
+		if monitor.RoomID != room.ID || monitor.WebRID != room.WebRID || monitor.ActualRoomID != room.ActualRoomID || monitor.Name != room.Name || monitor.StreamerName != room.StreamerName || monitor.Source != monitorSource || monitor.Enabled != room.Enabled {
 			monitor.RoomID = room.ID
 			monitor.WebRID = room.WebRID
 			monitor.ActualRoomID = room.ActualRoomID
 			monitor.Name = room.Name
 			monitor.StreamerName = room.StreamerName
+			monitor.Source = monitorSource
 			monitor.Enabled = room.Enabled
 			monitor.UpdatedAt = now
 			changed = true
@@ -1569,12 +1786,10 @@ func (s *Store) StartAllPool(credentials []AccountCredential) (PoolStartResult, 
 		ids = append(ids, monitor.ID)
 		s.bulkIDs[monitor.ID] = struct{}{}
 	}
+	prioritizeBulkMonitorIDs(ids, s.monitors)
 	s.scheduleSaveLocked()
 	s.mu.Unlock()
-	workerCount := minInt(defaultBulkWorkers, len(ids))
-	for worker := 0; worker < workerCount; worker++ {
-		go s.runBulkWorker(ctx, ids, worker, workerCount, pool)
-	}
+	go s.runBulkScheduler(ctx, ids, pool)
 	return PoolStartResult{Started: len(ids), AccountCount: len(pool.ordered), Assignments: pool.summary()}, nil
 }
 
@@ -1851,97 +2066,261 @@ func (s *Store) runPooled(ctx context.Context, id string, pool *accountPool, ini
 	}
 }
 
-// runBulkWorker schedules a stable partition of room IDs without allocating a
-// goroutine per room. With 100k imported rooms this keeps the Go scheduler and
-// the desktop message pump responsive while preserving per-room probe cadence.
-func (s *Store) runBulkWorker(ctx context.Context, ids []string, worker, workerCount int, pool *accountPool) {
-	due := make(map[string]time.Time, (len(ids)+workerCount-1)/workerCount)
-	startedAt := time.Now()
-	for index := worker; index < len(ids); index += workerCount {
-		due[ids[index]] = startedAt.Add(monitorStaggerDelay(ids[index]))
+// bulkMonitorJob is kept in one of three source queues. A scheduler chooses
+// only ready jobs, preferring the lowest source rank, and workers perform the
+// actual network probe. This gives "关注列表 > 导入 > 中心库" a real queue
+// boundary without creating one goroutine per room.
+type bulkMonitorJob struct {
+	id       string
+	due      time.Time
+	sequence uint64
+}
+
+type bulkMonitorHeap []bulkMonitorJob
+
+func (h bulkMonitorHeap) Len() int { return len(h) }
+
+func (h bulkMonitorHeap) Less(i, j int) bool {
+	if h[i].due.Equal(h[j].due) {
+		if h[i].id == h[j].id {
+			return h[i].sequence < h[j].sequence
+		}
+		return h[i].id < h[j].id
 	}
+	return h[i].due.Before(h[j].due)
+}
+
+func (h bulkMonitorHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *bulkMonitorHeap) Push(value any) { *h = append(*h, value.(bulkMonitorJob)) }
+
+func (h *bulkMonitorHeap) Pop() any {
+	items := *h
+	last := len(items) - 1
+	value := items[last]
+	*h = items[:last]
+	return value
+}
+
+type bulkMonitorResult struct {
+	job       bulkMonitorJob
+	next      time.Duration
+	stillBulk bool
+}
+
+func (s *Store) runBulkScheduler(ctx context.Context, ids []string, pool *accountPool) {
+	workerCount := minInt(defaultBulkWorkers, len(ids))
+	if workerCount == 0 {
+		return
+	}
+	var queues [3]bulkMonitorHeap
+	startedAt := time.Now()
+	sequence := uint64(0)
+	s.mu.Lock()
+	for _, id := range ids {
+		rank := monitorSourcePriority(s.monitors[id])
+		// Hash staggering spreads a large first probe window, while the source
+		// queues still ensure a ready follow room is chosen before a ready
+		// imported or center-library room.
+		heap.Push(&queues[rank], bulkMonitorJob{id: id, due: startedAt.Add(monitorStaggerDelay(id)), sequence: sequence})
+		sequence++
+	}
+	s.mu.Unlock()
+	for rank := range queues {
+		heap.Init(&queues[rank])
+	}
+
+	jobs := make(chan bulkMonitorJob, workerCount)
+	results := make(chan bulkMonitorResult, workerCount)
+	workerCtx, workerCancel := context.WithCancel(ctx)
+	defer workerCancel()
+	for worker := 0; worker < workerCount; worker++ {
+		go s.runBulkWorker(workerCtx, pool, jobs, results)
+	}
+
+	inflight := 0
+	priorityBurst := 0
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		now := time.Now()
-		nextWake := now.Add(time.Minute)
-		processed := false
-		for index := worker; index < len(ids); index += workerCount {
-			id := ids[index]
-			if when := due[id]; when.After(now) {
-				if when.Before(nextWake) {
-					nextWake = when
+		for inflight < workerCount {
+			rank, ok := nextReadyBulkQueue(queues, now, priorityBurst)
+			if !ok {
+				break
+			}
+			job := heap.Pop(&queues[rank]).(bulkMonitorJob)
+			select {
+			case jobs <- job:
+				inflight++
+				if rank == 0 {
+					priorityBurst++
+				} else {
+					priorityBurst = 0
 				}
-				continue
-			}
-			s.mu.Lock()
-			monitor := s.monitors[id]
-			_, bulk := s.bulkIDs[id]
-			if monitor == nil || !bulk || !monitor.Enabled || monitor.Status != "running" {
-				s.mu.Unlock()
-				due[id] = now.Add(time.Second)
-				continue
-			}
-			webRID := firstNonEmpty(monitor.WebRID, monitor.RoomID)
-			actualRoomID := firstNonEmpty(monitor.ActualRoomID, monitor.RoomID)
-			s.mu.Unlock()
-
-			account, err := pool.accountFor(id)
-			if err != nil {
-				s.updatePoolWaitState(id, err)
-				due[id] = now.Add(time.Second)
-				continue
-			}
-			s.mu.Lock()
-			if monitor := s.monitors[id]; monitor != nil {
-				monitor.AccountID, monitor.AccountName = account.credential.AccountID, account.credential.AccountName
-				monitor.UpdatedAt = time.Now().Format(time.RFC3339Nano)
-			}
-			s.mu.Unlock()
-			observed := &observedMonitorSource{inner: pool.sourceFor(account, webRID, actualRoomID)}
-			releaseProbe, acquired := s.acquireProbeSlot(ctx)
-			if !acquired {
+			case <-ctx.Done():
 				return
 			}
-			next := s.pollOnce(ctx, id, observed)
-			releaseProbe()
-			s.mu.Lock()
-			_, stillBulk := s.bulkIDs[id]
-			if !stillBulk {
-				if monitor := s.monitors[id]; monitor != nil {
-					monitor.Status, monitor.ConnectionStatus = "stopped", "disconnected"
-					monitor.UpdatedAt = time.Now().Format(time.RFC3339Nano)
-					s.scheduleSaveLocked()
-				}
-			}
-			s.mu.Unlock()
-			if !stillBulk {
-				continue
-			}
-			if observed.lastErr == nil {
-				pool.markSuccess(account.credential.AccountID)
-			} else if pool.markFailure(account.credential.AccountID, observed.lastErr) {
-				pool.dropAssignment(id, account.credential.AccountID)
-				next = time.Second
-			}
-			if next <= 0 {
-				next = unknownProbeInterval
-			}
-			due[id] = time.Now().Add(next)
-			processed = true
 		}
-		if processed {
+
+		if inflight == 0 {
+			due, ok := nextBulkDue(queues)
+			if !ok {
+				return
+			}
+			if !waitContext(ctx, time.Until(due)) {
+				return
+			}
 			continue
 		}
-		delay := time.Until(nextWake)
-		if delay < 50*time.Millisecond {
-			delay = 50 * time.Millisecond
+
+		var timer *time.Timer
+		var wake <-chan time.Time
+		if inflight < workerCount {
+			if due, ok := nextBulkDue(queues); ok {
+				delay := time.Until(due)
+				if delay < 50*time.Millisecond {
+					delay = 50 * time.Millisecond
+				}
+				timer = time.NewTimer(delay)
+				wake = timer.C
+			}
 		}
-		if !waitContext(ctx, delay) {
+		select {
+		case result := <-results:
+			inflight--
+			if result.stillBulk {
+				if result.next <= 0 {
+					result.next = unknownProbeInterval
+				}
+				rank := monitorSourcePriorityForID(s, result.job.id)
+				heap.Push(&queues[rank], bulkMonitorJob{
+					id: result.job.id, due: time.Now().Add(result.next), sequence: sequence,
+				})
+				sequence++
+			}
+		case <-wake:
+		case <-ctx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
 			return
 		}
+		if timer != nil {
+			timer.Stop()
+		}
 	}
+}
+
+func nextReadyBulkQueue(queues [3]bulkMonitorHeap, now time.Time, priorityBurst int) (int, bool) {
+	ready := func(rank int) bool {
+		return queues[rank].Len() > 0 && !queues[rank][0].due.After(now)
+	}
+	if ready(0) {
+		if priorityBurst >= bulkPriorityBurst {
+			if ready(1) {
+				return 1, true
+			}
+			if ready(2) {
+				return 2, true
+			}
+		}
+		return 0, true
+	}
+	if ready(1) {
+		return 1, true
+	}
+	if ready(2) {
+		return 2, true
+	}
+	return 0, false
+}
+
+func nextBulkDue(queues [3]bulkMonitorHeap) (time.Time, bool) {
+	var earliest time.Time
+	found := false
+	for rank := range queues {
+		if queues[rank].Len() == 0 {
+			continue
+		}
+		candidate := queues[rank][0].due
+		if !found || candidate.Before(earliest) {
+			earliest, found = candidate, true
+		}
+	}
+	return earliest, found
+}
+
+func (s *Store) runBulkWorker(ctx context.Context, pool *accountPool, jobs <-chan bulkMonitorJob, results chan<- bulkMonitorResult) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job := <-jobs:
+			next, stillBulk := s.pollBulkMonitor(ctx, job.id, pool)
+			select {
+			case results <- bulkMonitorResult{job: job, next: next, stillBulk: stillBulk}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+func (s *Store) pollBulkMonitor(ctx context.Context, id string, pool *accountPool) (time.Duration, bool) {
+	s.mu.Lock()
+	monitor := s.monitors[id]
+	_, bulk := s.bulkIDs[id]
+	if monitor == nil || !bulk || !monitor.Enabled || monitor.Status != "running" {
+		s.mu.Unlock()
+		return 0, false
+	}
+	webRID := firstNonEmpty(monitor.WebRID, monitor.RoomID)
+	actualRoomID := firstNonEmpty(monitor.ActualRoomID, monitor.RoomID)
+	s.mu.Unlock()
+
+	account, err := pool.accountFor(id)
+	if err != nil {
+		s.updatePoolWaitState(id, err)
+		return time.Second, true
+	}
+	s.mu.Lock()
+	if monitor := s.monitors[id]; monitor != nil {
+		monitor.AccountID, monitor.AccountName = account.credential.AccountID, account.credential.AccountName
+		monitor.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+	}
+	s.mu.Unlock()
+	observed := &observedMonitorSource{inner: pool.sourceFor(account, webRID, actualRoomID)}
+	releaseProbe, acquired := s.acquireProbeSlot(ctx)
+	if !acquired {
+		return 0, false
+	}
+	next := s.pollOnce(ctx, id, observed)
+	releaseProbe()
+	s.mu.Lock()
+	_, stillBulk := s.bulkIDs[id]
+	if !stillBulk {
+		if monitor := s.monitors[id]; monitor != nil {
+			monitor.Status, monitor.ConnectionStatus = "stopped", "disconnected"
+			monitor.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+			s.scheduleSaveLocked()
+		}
+	}
+	s.mu.Unlock()
+	if !stillBulk {
+		return 0, false
+	}
+	if observed.lastErr == nil {
+		pool.markSuccess(account.credential.AccountID)
+	} else if pool.markFailure(account.credential.AccountID, observed.lastErr) {
+		pool.dropAssignment(id, account.credential.AccountID)
+		next = time.Second
+	}
+	if next <= 0 {
+		next = unknownProbeInterval
+	}
+	return next, true
 }
 
 func (s *Store) updatePoolWaitState(id string, waitErr error) {
@@ -2248,6 +2627,51 @@ func monitorStaggerDelay(id string) time.Duration {
 	sum := sha256.Sum256([]byte(id))
 	bucket := int(sum[0])<<8 | int(sum[1])
 	return time.Duration(bucket%int(unknownProbeInterval/time.Millisecond)) * time.Millisecond
+}
+
+// monitorSourcePriority defines the native monitoring order. Following rooms
+// are the most actionable local resources, imported/legacy rooms are next,
+// and rows learned only from the center library form the lower-priority tier.
+func monitorSourcePriority(monitor *Monitor) int {
+	if monitor == nil {
+		return 1
+	}
+	switch strings.ToLower(strings.TrimSpace(monitor.Source)) {
+	case "following", "following-live", "follow", "关注列表", "关注":
+		return 0
+	case "center", "center_sync", "center-library":
+		return 2
+	default:
+		return 1
+	}
+}
+
+func monitorSourcePriorityForID(s *Store, id string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return monitorSourcePriority(s.monitors[id])
+}
+
+// prioritizeBulkMonitorIDs applies the same three-tier order used by the
+// runtime queues. The return value remains the local-room count for callers
+// and tests that use it to verify center rows stay in the lower tier.
+func prioritizeBulkMonitorIDs(ids []string, monitors map[string]*Monitor) int {
+	sort.Slice(ids, func(i, j int) bool {
+		leftRank := monitorSourcePriority(monitors[ids[i]])
+		rightRank := monitorSourcePriority(monitors[ids[j]])
+		if leftRank != rightRank {
+			return leftRank < rightRank
+		}
+		return ids[i] < ids[j]
+	})
+	localCount := 0
+	for _, id := range ids {
+		if monitorSourcePriority(monitors[id]) == 2 {
+			break
+		}
+		localCount++
+	}
+	return localCount
 }
 
 type packetMeta struct {

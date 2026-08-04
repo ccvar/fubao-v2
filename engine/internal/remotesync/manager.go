@@ -683,6 +683,9 @@ func (m *Manager) PullOnceScoped(ctx context.Context, roomStore *rooms.Store, re
 		return err
 	}
 	if scope == PullAll {
+		if err := m.SyncCenterExclusions(ctx, roomStore); err != nil {
+			return err
+		}
 		if err := m.pullType(ctx, roomStore, redPacketStore, syncprotocol.ItemRoomState); err != nil {
 			return err
 		}
@@ -690,6 +693,95 @@ func (m *Manager) PullOnceScoped(ctx context.Context, roomStore *rooms.Store, re
 	if scope == PullAll || scope == PullRedPackets {
 		return m.pullType(ctx, roomStore, redPacketStore, syncprotocol.ItemRedPacket)
 	}
+	return nil
+}
+
+// SyncCenterExclusions uploads only locally-pending tombstones, then replaces
+// the local acknowledged cache with the server-authoritative global list.
+func (m *Manager) SyncCenterExclusions(ctx context.Context, roomStore *rooms.Store) error {
+	if roomStore == nil {
+		return nil
+	}
+	m.mu.Lock()
+	allowed := m.config.Enabled && m.deviceAccessLocked() == syncprotocol.DeviceAccessFull
+	m.mu.Unlock()
+	if !allowed {
+		return nil
+	}
+	if err := m.ensureRegistered(ctx); err != nil {
+		m.recordError(err)
+		return err
+	}
+	m.mu.Lock()
+	deviceToken := m.config.DeviceToken
+	m.mu.Unlock()
+	pending := roomStore.PendingCenterExclusions()
+	for start := 0; start < len(pending); start += syncprotocol.MaxBatchItems {
+		end := start + syncprotocol.MaxBatchItems
+		if end > len(pending) {
+			end = len(pending)
+		}
+		requestItems := make([]syncprotocol.CenterRoomExclusion, 0, end-start)
+		webRIDs := make([]string, 0, end-start)
+		for _, item := range pending[start:end] {
+			requestItems = append(requestItems, syncprotocol.CenterRoomExclusion{
+				WebRID: item.WebRID, ActualRoomID: item.ActualRoomID, Name: item.Name,
+				StreamerName: item.StreamerName, Reason: item.Reason, ExcludedAt: item.ExcludedAt,
+			})
+			webRIDs = append(webRIDs, item.WebRID)
+		}
+		var response map[string]any
+		if err := m.postJSON(ctx, "/rooms/exclusions", deviceToken, syncprotocol.CenterRoomExclusionsRequest{Items: requestItems}, &response); err != nil {
+			m.recordError(err)
+			return err
+		}
+		if err := roomStore.MarkCenterExclusionsSynced(webRIDs); err != nil {
+			return err
+		}
+	}
+	var response syncprotocol.CenterRoomExclusionsResponse
+	if err := m.getJSON(ctx, "/rooms/exclusions", deviceToken, &response); err != nil {
+		m.recordError(err)
+		return err
+	}
+	items := make([]rooms.CenterExclusion, 0, len(response.Items))
+	for _, item := range response.Items {
+		items = append(items, rooms.CenterExclusion{
+			ID: item.WebRID, WebRID: item.WebRID, ActualRoomID: item.ActualRoomID,
+			Name: item.Name, StreamerName: item.StreamerName, Reason: item.Reason, ExcludedAt: item.ExcludedAt,
+		})
+	}
+	if err := roomStore.MergeGlobalCenterExclusions(items); err != nil {
+		return err
+	}
+	m.recordSuccess()
+	return nil
+}
+
+// RestoreCenterExclusion removes the server tombstone first. The caller may
+// restore its local room only after this succeeds, avoiding a UI state that
+// claims recovery while the center still rejects the room.
+func (m *Manager) RestoreCenterExclusion(ctx context.Context, webRID string) error {
+	webRID = strings.TrimSpace(webRID)
+	if webRID == "" {
+		return errors.New("中心库排除的直播间标识为空")
+	}
+	if err := m.ensureRegistered(ctx); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	allowed := m.config.Enabled && m.deviceAccessLocked() == syncprotocol.DeviceAccessFull
+	deviceToken := m.config.DeviceToken
+	m.mu.Unlock()
+	if !allowed {
+		return errors.New("当前设备未绑定可管理中心库的同步授权")
+	}
+	var response map[string]bool
+	if err := m.postJSON(ctx, "/rooms/exclusions/restore", deviceToken, syncprotocol.CenterRoomExclusionRestoreRequest{WebRID: webRID}, &response); err != nil {
+		m.recordError(err)
+		return err
+	}
+	m.recordSuccess()
 	return nil
 }
 
