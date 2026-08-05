@@ -23,14 +23,20 @@ var (
 )
 
 const (
-	redPacketJoinURL                = "https://live.douyin.com/webcast/luckybox/join/"
-	redPacketRushURL                = "https://live.douyin.com/webcast/luckybox/rush/"
-	defaultJoinConcurrency          = 4
-	defaultRiskCooldown             = 5 * time.Minute
-	defaultNetworkCooldown          = 30 * time.Second
-	defaultParticipantTimeout       = 12 * time.Second
-	defaultWalletProbeTimeout       = 3 * time.Second
-	defaultDrawResultRequestTimeout = 3 * time.Second
+	redPacketJoinURL          = "https://live.douyin.com/webcast/luckybox/join/"
+	redPacketRushURL          = "https://live.douyin.com/webcast/luckybox/rush/"
+	defaultJoinConcurrency    = 4
+	defaultRiskCooldown       = 5 * time.Minute
+	defaultNetworkCooldown    = 30 * time.Second
+	defaultParticipantTimeout = 12 * time.Second
+	defaultWalletProbeTimeout = 3 * time.Second
+	// Page join/receive share the native WebView path: room navigation, login
+	// inspection, and the in-page signed request. Join already budgets 25s; the
+	// draw-result query must match that budget. A 3s cap abandons the native
+	// receive while the page is still switching rooms and surfaces
+	// “接口未返回” after a single attempt.
+	defaultPageParticipationTimeout = 25 * time.Second
+	defaultDrawResultRequestTimeout = defaultPageParticipationTimeout
 	defaultDrawResultRetryInterval  = time.Second
 )
 
@@ -668,6 +674,7 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 		maxAttempts = 3
 	}
 	attempts := 0
+	serviceReached := false
 	walletFallbackAllowed := true
 	for attempts < maxAttempts {
 		if !p.pageExecutor.Ready(accountID) {
@@ -687,6 +694,9 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 		attempts++
 		if traceStore, ok := p.recordStore.(participationTraceStore); ok {
 			_ = traceStore.RecordParticipationTrace(task, response)
+		}
+		if (!response.ContextMissing) && (response.HTTPStatus >= 200 && response.HTTPStatus < 300 || hasReceiveResultPayload(response.Body)) {
+			serviceReached = true
 		}
 		if response.LoginExpired || response.HTTPStatus == http.StatusUnauthorized || response.HTTPStatus == http.StatusForbidden || containsLoginFailure(strings.ToLower(response.Body)) {
 			p.store.RecordRedPacketParticipation(accountID, "login_expired", "CK 已失效：开奖结果接口返回未登录", false, false, 0, true)
@@ -767,7 +777,15 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 			return
 		}
 	}
-	message := fmt.Sprintf("开奖查询失败：已尝试 %d 次，钻石增量未变化", attempts)
+	if serviceReached {
+		if _, err := drawStore.ResolveParticipationDraw(event.ID, accountID, "not_won", "未中奖", "", attempts); err == nil {
+			p.retryCurrentEventsForAccount(accountID)
+			p.finishTaskIfComplete(accountID)
+		}
+		return
+	}
+
+	message := fmt.Sprintf("开奖查询失败：已尝试 %d 次，接口未返回", attempts)
 	if traceStore, ok := p.recordStore.(participationTraceStore); ok {
 		_ = traceStore.RecordParticipationTrace(PageParticipationTask{
 			Action: "receive_timeout", EventID: event.ID, AccountID: accountID, AccountName: accountName,
@@ -930,11 +948,36 @@ func classifyReceiveResponseWithSingleFallback(body string, boxIDs ...string) dr
 	return classifyReceiveResponseMode(body, true, boxIDs...)
 }
 
+func hasReceiveResultPayload(body string) bool {
+	payloadBody := strings.TrimSpace(body)
+	if payloadBody == "" {
+		return false
+	}
+	var payload map[string]any
+	decoder := json.NewDecoder(strings.NewReader(payloadBody))
+	decoder.UseNumber()
+	if decoder.Decode(&payload) != nil {
+		return false
+	}
+	data, _ := payload["data"].(map[string]any)
+	_, receivePresent := data["receive_info"]
+	if receivePresent {
+		return true
+	}
+	_, topLevelReceivePresent := payload["receive_info"]
+	return topLevelReceivePresent
+}
+
 func classifyReceiveResponseMode(body string, allowSingleFallback bool, boxIDs ...string) drawOutcome {
 	var payload map[string]any
 	decoder := json.NewDecoder(strings.NewReader(strings.TrimSpace(body)))
 	decoder.UseNumber()
-	if decoder.Decode(&payload) != nil || statusCode(payload) != 0 {
+	if decoder.Decode(&payload) != nil {
+		return drawOutcome{}
+	}
+	if _, hasStatusCode := payload["status_code"]; hasStatusCode && statusCode(payload) != 0 {
+		// Some receive responses omit status_code. We only short-circuit on
+		// non-zero codes when the field is explicitly present.
 		return drawOutcome{}
 	}
 	data, _ := payload["data"].(map[string]any)
@@ -1077,7 +1120,7 @@ func (p *Participant) attempt(event Event, credential accounts.RedPacketParticip
 }
 
 func (p *Participant) attemptInPage(event Event, credential accounts.RedPacketParticipationCredential, decision participationFollowDecision) participationResult {
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), defaultPageParticipationTimeout)
 	defer cancel()
 	task := PageParticipationTask{
 		Action:           "join",

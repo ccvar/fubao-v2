@@ -36,6 +36,10 @@ type pageParticipationPending struct {
 	task      nativePageParticipationTask
 	accountID string
 	delivered bool
+	// abandoned is set when the Go waiter timed out after the native task was
+	// already delivered. The account stays busy until Complete so a later
+	// join/receive cannot race the same WebView; the late result is discarded.
+	abandoned bool
 	result    chan redpacket.PageParticipationResponse
 }
 
@@ -175,8 +179,19 @@ func (b *pageParticipationBroker) Execute(ctx context.Context, request redpacket
 		return response
 	case <-ctx.Done():
 		b.mu.Lock()
-		delete(b.pending, taskID)
-		delete(b.busyAccounts, request.AccountID)
+		current := b.pending[taskID]
+		if current == nil {
+			b.mu.Unlock()
+			return redpacket.PageParticipationResponse{Error: "直播页面红包请求等待超时"}
+		}
+		if current.delivered {
+			// Native work is already running in the account WebView. Keep the
+			// busy gate until Complete arrives; only stop waiting for the body.
+			current.abandoned = true
+		} else {
+			delete(b.pending, taskID)
+			delete(b.busyAccounts, request.AccountID)
+		}
 		b.mu.Unlock()
 		return redpacket.PageParticipationResponse{Error: "直播页面红包请求等待超时"}
 	}
@@ -222,7 +237,13 @@ func (b *pageParticipationBroker) Complete(taskID string, response redpacket.Pag
 	}
 	delete(b.pending, taskID)
 	delete(b.busyAccounts, pending.accountID)
+	abandoned := pending.abandoned
 	b.mu.Unlock()
+	if abandoned {
+		// The Go waiter already timed out; release the busy gate and drop the
+		// late page result so it cannot be mis-attributed to a later task.
+		return true
+	}
 	pending.result <- response
 	return true
 }

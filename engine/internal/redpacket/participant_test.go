@@ -1003,6 +1003,7 @@ func TestReceiveResponseClassification(t *testing.T) {
 		fallback bool
 	}{
 		{name: "empty result is a definitive loss", body: `{"status_code":0,"data":{"receive_info":[]}}`, status: "not_won", message: "未中奖"},
+		{name: "empty result without status_code is a definitive loss", body: `{"data":{"receive_info":[]}}`, status: "not_won", message: "未中奖"},
 		{name: "explicit loss", body: `{"status_code":0,"data":{"receive_info":[{"box_id_str":"box-1","succeed":false}]}}`, status: "not_won", message: "未中奖"},
 		{name: "diamond win", body: `{"status_code":0,"data":{"receive_info":[{"box_id_str":"box-1","succeed":true,"diamond_count":8}]}}`, status: "won", message: "已中8钻", award: "8钻"},
 		{name: "gift win", body: `{"status_code":0,"data":{"receive_info":[{"box_id_str":"box-1","succeed":true,"gift_name":"小心心","gift_count":2}]}}`, status: "won", message: "已中2个小心心", award: "2个小心心"},
@@ -1030,7 +1031,7 @@ func TestReceiveResponseClassification(t *testing.T) {
 	}
 }
 
-func TestDrawResultTimeoutMarksErrorAndReleasesNextRound(t *testing.T) {
+func TestDrawResultTimeoutWithoutServiceResponseMarksError(t *testing.T) {
 	recordStore, err := NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -1054,7 +1055,7 @@ func TestDrawResultTimeoutMarksErrorAndReleasesNextRound(t *testing.T) {
 	store := &fakeParticipationStore{credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-timeout"}}}
 	executor := &fakePageParticipationExecutor{
 		ready:    true,
-		response: PageParticipationResponse{Endpoint: "receive", HTTPStatus: 200, Body: `{"status_code":0,"data":{}}`, Attempts: 1},
+		response: PageParticipationResponse{Endpoint: "receive", HTTPStatus: 500, Error: "server error", Attempts: 1},
 	}
 	participant := NewPageParticipant(store, executor, recordStore)
 	participant.resolveDraw(event, "account-timeout", "超时账号")
@@ -1068,6 +1069,74 @@ func TestDrawResultTimeoutMarksErrorAndReleasesNextRound(t *testing.T) {
 	}
 	if allowed, _ := recordStore.ParticipationPolicy("account-timeout", time.Now()); !allowed {
 		t.Fatal("draw timeout must release the account for the next round")
+	}
+}
+
+func TestDrawResultServiceFallbackMarksNoWin(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{DrawResultDelaySeconds: 0, DrawResultMaxAttempts: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationStarted("account-service-fallback", "服务应答账号"); err != nil {
+		t.Fatal(err)
+	}
+	event := Event{
+		ID: "event-service-fallback", WebRID: "123456", ActualRoomID: "700001", JoinBoxID: "7669063194534955828",
+		ExpiresAt: time.Now().Add(-100 * time.Millisecond).Format(time.RFC3339Nano),
+	}
+	if reserved, err := recordStore.ReserveParticipation(event, "account-service-fallback", "服务应答账号"); err != nil || !reserved {
+		t.Fatalf("reserve service fallback draw: %v %v", reserved, err)
+	}
+	if err := recordStore.CompleteParticipation(event.ID, "account-service-fallback", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeParticipationStore{credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-service-fallback"}}}
+	executor := &fakePageParticipationExecutor{
+		ready:    true,
+		response: PageParticipationResponse{Endpoint: "receive", HTTPStatus: 200, Body: `{"data":{}}`, Attempts: 1},
+	}
+	participant := NewPageParticipant(store, executor, recordStore)
+	participant.resolveDraw(event, "account-service-fallback", "服务应答账号")
+	records := recordStore.ParticipationRecords()
+	if len(records) != 1 || records[0].Status != "not_won" || records[0].Message != "未中奖" {
+		t.Fatalf("service reachable without outcome should be recorded as no-win: %+v", records)
+	}
+}
+
+func TestDrawResultStatusZeroPayloadCanStillResolveAsNoWin(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{DrawResultDelaySeconds: 0, DrawResultMaxAttempts: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationStarted("account-status-zero", "状态零账号"); err != nil {
+		t.Fatal(err)
+	}
+	event := Event{
+		ID: "event-status-zero", WebRID: "123456", ActualRoomID: "700001", JoinBoxID: "7669063194534955828",
+		ExpiresAt: time.Now().Add(-100 * time.Millisecond).Format(time.RFC3339Nano),
+	}
+	if reserved, err := recordStore.ReserveParticipation(event, "account-status-zero", "状态零账号"); err != nil || !reserved {
+		t.Fatalf("reserve status-zero draw: %v %v", reserved, err)
+	}
+	if err := recordStore.CompleteParticipation(event.ID, "account-status-zero", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeParticipationStore{credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-status-zero"}}}
+	executor := &fakePageParticipationExecutor{
+		ready:    true,
+		response: PageParticipationResponse{Endpoint: "receive", HTTPStatus: 0, Body: `{"status_code":0,"data":{"receive_info":[]}}`, Attempts: 1},
+	}
+	participant := NewPageParticipant(store, executor, recordStore)
+	participant.resolveDraw(event, "account-status-zero", "状态零账号")
+	records := recordStore.ParticipationRecords()
+	if len(records) != 1 || records[0].Status != "not_won" || records[0].Message != "未中奖" {
+		t.Fatalf("status-zero payload should be treated as no-win: %+v", records)
 	}
 }
 

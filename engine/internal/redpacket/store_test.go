@@ -697,7 +697,9 @@ func TestReloadMigratesOverduePendingDrawToError(t *testing.T) {
 		t.Fatal(err)
 	}
 	store.mu.Lock()
-	store.participations[participationRecordID("account-overdue", event.ID)].JoinedAt = time.Now().Add(-20 * time.Second).Format(time.RFC3339Nano)
+	// Reload cleanup only rewrites records that are already beyond the full
+	// native query budget (delay + attempts * page-participation timeout).
+	store.participations[participationRecordID("account-overdue", event.ID)].JoinedAt = time.Now().Add(-3 * time.Minute).Format(time.RFC3339Nano)
 	if err := store.saveLocked(); err != nil {
 		store.mu.Unlock()
 		t.Fatal(err)

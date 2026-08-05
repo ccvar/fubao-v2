@@ -88,6 +88,68 @@ func TestPageParticipationBrokerStopAccountReleasesRuntime(t *testing.T) {
 	}
 }
 
+func TestPageParticipationBrokerTimeoutKeepsDeliveredAccountBusy(t *testing.T) {
+	browserStore, err := browsers.NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance, err := browserStore.Create("account-timeout", "超时账号", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker := newPageParticipationBroker(browserStore)
+	if _, err := broker.SetContext(instance.ID, true); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	defer cancel()
+	resultChannel := make(chan redpacket.PageParticipationResponse, 1)
+	go func() {
+		resultChannel <- broker.Execute(ctx, redpacket.PageParticipationTask{
+			AccountID: "account-timeout", WebRID: "7654321", ActualRoomID: "700001", BoxID: "7669047909329177395",
+		})
+	}()
+
+	var task nativePageParticipationTask
+	var ok bool
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		task, ok = broker.Next()
+		if ok {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !ok {
+		t.Fatal("page task was not delivered before waiter timeout")
+	}
+
+	select {
+	case result := <-resultChannel:
+		if result.Error != "直播页面红包请求等待超时" {
+			t.Fatalf("unexpected timeout result: %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed-out waiter did not return")
+	}
+
+	// A delivered native task must keep the account busy until Complete, even
+	// after the Go-side waiter gives up. Otherwise a later receive races the
+	// still-running WebView work and loses the definitive luckybox result.
+	if second, secondOK := broker.Next(); secondOK {
+		t.Fatalf("timed-out delivered account became free too early: %+v", second)
+	}
+	if !broker.Complete(task.TaskID, redpacket.PageParticipationResponse{
+		Endpoint: "receive", HTTPStatus: 200, Body: `{"status_code":0,"data":{"receive_info":[]}}`, Attempts: 1,
+	}) {
+		t.Fatal("late native completion should still clear the abandoned waiter")
+	}
+	if broker.busyAccounts["account-timeout"] {
+		t.Fatal("abandoned native completion left the account busy")
+	}
+}
+
 func TestPageParticipationBrokerStopCancelsUndeliveredTask(t *testing.T) {
 	browserStore, err := browsers.NewStore(t.TempDir())
 	if err != nil {
