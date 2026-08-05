@@ -414,20 +414,23 @@ func main() {
 			createdCount := 0
 			mergedCount := 0
 			failedCount := 0
-			identityCtx, identityCancel := context.WithTimeout(context.Background(), 12*time.Second)
-			total := len(records)
-			for i, record := range records {
+			// Small/manual imports resolve identity and wallet online. Large batch
+			// imports stay fast and only persist the Cookie; the list can refresh
+			// wallets later without blocking the whole import.
+			resolveOnline := len(records) <= 20
+			identityCtx, identityCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			for _, record := range records {
 				// Single Cookie/browser exports usually have no account metadata.
 				// Resolve a friendly identity for small explicit imports, while a
 				// large legacy batch remains fast and keeps its file metadata.
-				if len(records) <= 10 && strings.TrimSpace(record.UserID) == "" {
+				if resolveOnline && strings.TrimSpace(record.UserID) == "" {
 					if identity, err := accounts.ResolveDouyinIdentity(identityCtx, record.Cookie); err == nil {
 						record.Nickname = identity.Nickname
 						record.UserID = identity.UserID
 						record.SecUID = identity.SecUID
 					}
 				}
-				_, created, err := accountStore.UpsertImportedCookieWithGroup(record.Cookie, record.Nickname, record.UserID, record.SecUID, params.Role, params.GroupID)
+				view, created, err := accountStore.UpsertImportedCookieWithGroup(record.Cookie, record.Nickname, record.UserID, record.SecUID, params.Role, params.GroupID)
 				if err != nil {
 					failedCount++
 					continue
@@ -437,21 +440,14 @@ func main() {
 				} else {
 					mergedCount++
 				}
-				// Report progress
-				progress := (i + 1) * 100 / total
-				_ = encoder.Encode(response{
-					Version: protocolVersion,
-					ID:      req.ID,
-					OK:      true,
-					Result: map[string]interface{}{
-						"imported":        createdCount,
-						"merged":          mergedCount,
-						"failed":          failedCount,
-						"progress":        progress,
-						"invalid_sources": invalidSources,
-						"total":           len(accountStore.List(params.Role)),
-					},
-				})
+				// Participation diamond display requires a native wallet snapshot.
+				// Without diamond_status=valid the UI correctly shows “暂无”, even when
+				// the live account actually has diamonds.
+				if resolveOnline && params.Role == accounts.RoleParticipation && strings.TrimSpace(view.ID) != "" {
+					walletCtx, walletCancel := context.WithTimeout(identityCtx, 8*time.Second)
+					_, _ = accountStore.RefreshRedPacketWalletBalance(walletCtx, view.ID)
+					walletCancel()
+				}
 			}
 			identityCancel()
 			if params.Role == accounts.RoleMonitoring && redPacketStoreErr == nil {
@@ -587,12 +583,50 @@ func main() {
 				params.Role = accounts.RoleParticipation
 			}
 			result, err := accountStore.ValidateCookieForRole(ctx, params.AccountID, params.Role, params.Force)
+			// A valid participation CK should also refresh the wallet snapshot so
+			// the account row can leave the “钻石 暂无” placeholder.
+			if err == nil && params.Role == accounts.RoleParticipation && strings.EqualFold(strings.TrimSpace(result.Status), "valid") {
+				walletCtx, walletCancel := context.WithTimeout(ctx, 8*time.Second)
+				_, _ = accountStore.RefreshRedPacketWalletBalance(walletCtx, params.AccountID)
+				walletCancel()
+			}
 			cancel()
 			if err != nil {
 				writeError(encoder, req.ID, "cookie_validation_failed", err.Error())
 				continue
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
+		case "account.refresh_wallet":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			var params struct {
+				AccountID string `json:"account_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.AccountID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "钱包刷新参数无效")
+				continue
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			balance, err := accountStore.RefreshRedPacketWalletBalance(ctx, params.AccountID)
+			cancel()
+			if err != nil {
+				writeError(encoder, req.ID, "wallet_refresh_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result: map[string]any{
+					"account_id":         params.AccountID,
+					"diamond_balance":    balance.Diamond,
+					"diamond_x10":        balance.DiamondX10,
+					"diamond_checked_at": balance.CheckedAt,
+					"diamond_status":     "valid",
+				},
+			})
 		case "account.native_credential":
 			if accountStoreErr != nil {
 				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
@@ -653,9 +687,10 @@ func main() {
 				continue
 			}
 			var params struct {
-				AccountID string `json:"account_id"`
-				LoggedIn  bool   `json:"logged_in"`
-				Secret    string `json:"secret"`
+				AccountID            string `json:"account_id"`
+				LoggedIn             bool   `json:"logged_in"`
+				PromoteNativeSurface bool   `json:"promote_native_surface"`
+				Secret               string `json:"secret"`
 			}
 			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.AccountID) == "" {
 				writeError(encoder, req.ID, "invalid_params", "同步浏览器登录状态参数无效")
@@ -666,7 +701,7 @@ func main() {
 				writeError(encoder, req.ID, "native_auth_failed", "同步浏览器登录状态请求未授权")
 				continue
 			}
-			account, err := accountStore.SetBrowserLoginState(params.AccountID, params.LoggedIn)
+			account, err := accountStore.SetBrowserLoginStateWithPromotion(params.AccountID, params.LoggedIn, params.PromoteNativeSurface)
 			if err != nil {
 				writeError(encoder, req.ID, "account_login_state_update_failed", err.Error())
 				continue
@@ -717,7 +752,7 @@ func main() {
 				Version: protocolVersion,
 				ID:      req.ID,
 				OK:      true,
-				Result:  browserStore.List(),
+				Result:  browserInstancesWithSurfaces(browserStore, accountStore, accountStoreErr),
 			})
 		case "browser.native_following_live":
 			if accountStoreErr != nil {
@@ -868,6 +903,7 @@ func main() {
 				credential.AccountName,
 				params.Name,
 				browserInstanceCreateLimit(licenseManager),
+				browsers.SurfaceForAccountSource(credential.Source),
 			)
 			if err != nil {
 				writeError(encoder, req.ID, "browser_create_failed", err.Error())
@@ -903,6 +939,13 @@ func main() {
 			credential, err := accountStore.ParticipationCredential(accountID)
 			if err != nil {
 				writeError(encoder, req.ID, "browser_account_invalid", err.Error())
+				continue
+			}
+			// Keep surface in sync before launching so an upgraded rebind
+			// account is not forced through external Chrome by a stale flag.
+			browserStore.ApplyAccountSources(map[string]string{credential.AccountID: credential.Source})
+			if browsers.SurfaceForAccountSource(credential.Source) != browsers.SurfaceExternalChrome {
+				writeError(encoder, req.ID, "browser_open_failed", "该账号使用内嵌实例，请从卡片打开原生窗口")
 				continue
 			}
 			instance, err := browserStore.Open(params.InstanceID, credential.Cookie)
@@ -966,6 +1009,7 @@ func main() {
 				writeError(encoder, req.ID, "browser_account_invalid", err.Error())
 				continue
 			}
+			surface := string(browsers.SurfaceForAccountSource(credential.Source))
 			_ = encoder.Encode(response{
 				Version: protocolVersion,
 				ID:      req.ID,
@@ -976,6 +1020,7 @@ func main() {
 					"account_name":  credential.AccountName,
 					"cookie":        credential.Cookie,
 					"cookie_status": credential.CookieStatus,
+					"surface":       surface,
 				},
 			})
 		case "room.list":
@@ -1790,6 +1835,23 @@ func writeError(encoder *json.Encoder, id, code, message string) {
 		OK:      false,
 		Error:   &rpcError{Code: code, Message: message},
 	})
+}
+
+// browserInstancesWithSurfaces refreshes each instance host mode from the
+// current account provenance so imported accounts stay on external Chrome
+// until a native rebind/QR login promotes them to the embedded surface.
+func browserInstancesWithSurfaces(browserStore *browsers.Store, accountStore *accounts.Store, accountStoreErr error) []browsers.Instance {
+	if browserStore == nil {
+		return nil
+	}
+	if accountStore == nil || accountStoreErr != nil {
+		return browserStore.List()
+	}
+	sources := map[string]string{}
+	for _, account := range accountStore.List(accounts.RoleParticipation) {
+		sources[account.ID] = account.Source
+	}
+	return browserStore.ApplyAccountSources(sources)
 }
 
 func monitoringPoolCredentials(store *accounts.Store) []redpacket.AccountCredential {

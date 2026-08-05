@@ -44,9 +44,15 @@ func (s *Store) RefreshRedPacketWalletBalance(ctx context.Context, accountID str
 	request.Header.Set("Cookie", credential.Cookie)
 	request.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
 	request.Header.Set("Accept", "application/json, text/plain, */*")
+	request.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
 	request.Header.Set("Referer", "https://live.douyin.com/")
+	request.Header.Set("Origin", "https://live.douyin.com")
 
-	client := &http.Client{}
+	// Bypass any process-level HTTP_PROXY for this authenticated wallet probe.
+	// A misconfigured proxy can make the call fail while browser login still works.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
 	response, err := client.Do(request)
 	if err != nil {
 		return RedPacketWalletBalance{}, fmt.Errorf("钱包接口请求失败: %w", err)
@@ -83,13 +89,42 @@ func parseRedPacketWalletBalance(body []byte) (RedPacketWalletBalance, error) {
 	if payload.Data == nil {
 		return RedPacketWalletBalance{}, errors.New("钱包接口未返回账户数据")
 	}
+	// Prefer explicit diamond fields; some wallet payloads only expose diamond_x10
+	// (tenths of a diamond). Never treat a missing field as “no snapshot”.
+	diamond := firstRawInt64(payload.Data, "diamond", "diamond_count", "diamondCount", "total_diamond", "totalDiamond")
+	diamondX10 := firstRawInt64(payload.Data, "diamond_x10", "diamondX10")
+	if diamond == 0 && diamondX10 > 0 {
+		diamond = diamondX10 / 10
+	}
+	if diamondX10 == 0 && diamond > 0 {
+		diamondX10 = diamond * 10
+	}
 	return RedPacketWalletBalance{
-		UserID:     rawString(payload.Data["user_id"]),
-		Diamond:    rawInt64(payload.Data["diamond"]),
-		DiamondX10: rawInt64(payload.Data["diamond_x10"]),
-		Money:      rawInt64(payload.Data["money"]),
+		UserID:     firstRawString(payload.Data, "user_id", "userId", "uid"),
+		Diamond:    diamond,
+		DiamondX10: diamondX10,
+		Money:      firstRawInt64(payload.Data, "money", "cash", "balance"),
 		CheckedAt:  time.Now().Format(time.RFC3339Nano),
 	}, nil
+}
+
+func firstRawString(values map[string]json.RawMessage, keys ...string) string {
+	for _, key := range keys {
+		if text := rawString(values[key]); text != "" {
+			return text
+		}
+	}
+	return ""
+}
+
+func firstRawInt64(values map[string]json.RawMessage, keys ...string) int64 {
+	for _, key := range keys {
+		if _, ok := values[key]; !ok {
+			continue
+		}
+		return rawInt64(values[key])
+	}
+	return 0
 }
 
 func rawString(value json.RawMessage) string {

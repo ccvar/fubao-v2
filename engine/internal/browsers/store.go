@@ -30,6 +30,11 @@ type Status string
 
 type RuntimeState string
 
+// Surface selects how the desktop client hosts a participation browser.
+// Imported Cookie accounts use external Chromium; QR/native logins keep the
+// embedded Tauri WebView card surface.
+type Surface string
+
 const (
 	StatusStopped Status = "stopped"
 	StatusOnline  Status = "online"
@@ -37,6 +42,9 @@ const (
 	RuntimeStopped RuntimeState = "stopped"
 	RuntimeWaiting RuntimeState = "waiting"
 	RuntimeRunning RuntimeState = "running"
+
+	SurfaceEmbedded       Surface = "embedded"
+	SurfaceExternalChrome Surface = "external_chrome"
 )
 
 type Instance struct {
@@ -46,6 +54,7 @@ type Instance struct {
 	AccountName         string       `json:"account_name"`
 	Status              Status       `json:"status"`
 	Browser             string       `json:"browser"`
+	Surface             Surface      `json:"surface,omitempty"`
 	CreatedAt           string       `json:"created_at"`
 	UpdatedAt           string       `json:"updated_at"`
 	OpenedAt            string       `json:"opened_at,omitempty"`
@@ -53,6 +62,23 @@ type Instance struct {
 	RuntimeState        RuntimeState `json:"runtime_state,omitempty"`
 	QueuePosition       int          `json:"queue_position,omitempty"`
 	PID                 int          `json:"-"`
+}
+
+// SurfaceForAccountSource maps account provenance to the browser host mode.
+// External Chromium for imports was rolled back: it raced CDP/extension
+// navigation, froze the desktop client, and opened full Chrome chrome.
+// All participation instances use the embedded Tauri WebView path again
+// (same as QR login / rebind). External Chrome helpers remain in-tree unused.
+func SurfaceForAccountSource(source string) Surface {
+	_ = source
+	return SurfaceEmbedded
+}
+
+func browserLabelForSurface(surface Surface) string {
+	if surface == SurfaceExternalChrome {
+		return browserLabel()
+	}
+	return "内嵌 WebView"
 }
 
 type Admission struct {
@@ -321,13 +347,16 @@ func (s *Store) ReleaseParticipationContext(instanceID string) (Capacity, error)
 }
 
 func (s *Store) Create(accountID, accountName, requestedName string) (Instance, error) {
-	return s.CreateWithLimit(accountID, accountName, requestedName, 0)
+	return s.CreateWithLimit(accountID, accountName, requestedName, 0, SurfaceEmbedded)
 }
 
-func (s *Store) CreateWithLimit(accountID, accountName, requestedName string, maxInstances int) (Instance, error) {
+func (s *Store) CreateWithLimit(accountID, accountName, requestedName string, maxInstances int, surface Surface) (Instance, error) {
 	accountID = strings.TrimSpace(accountID)
 	if accountID == "" {
 		return Instance{}, errors.New("请选择参与账号")
+	}
+	if surface != SurfaceExternalChrome {
+		surface = SurfaceEmbedded
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -335,6 +364,14 @@ func (s *Store) CreateWithLimit(accountID, accountName, requestedName string, ma
 		if instance.AccountID == accountID {
 			// Creation is idempotent: selecting the same account always reuses its
 			// existing instance instead of creating a second login container.
+			// Refresh surface/browser labels when account provenance changes
+			// (e.g. imported account completed a native rebind).
+			if instance.Surface != surface {
+				instance.Surface = surface
+				instance.Browser = browserLabelForSurface(surface)
+				instance.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+				_ = s.saveLocked()
+			}
 			return s.decorateInstanceLocked(instance), nil
 		}
 	}
@@ -356,7 +393,8 @@ func (s *Store) CreateWithLimit(accountID, accountName, requestedName string, ma
 		AccountID:   accountID,
 		AccountName: accountName,
 		Status:      StatusStopped,
-		Browser:     browserLabel(),
+		Browser:     browserLabelForSurface(surface),
+		Surface:     surface,
 		CreatedAt:   now,
 		UpdatedAt:   now,
 	}
@@ -373,21 +411,68 @@ func (s *Store) CreateWithLimit(accountID, accountName, requestedName string, ma
 	return s.decorateInstanceLocked(instance), nil
 }
 
+// ApplyAccountSources refreshes each instance's surface from the current
+// account provenance so list/open UIs stay aligned after rebind or import.
+func (s *Store) ApplyAccountSources(sources map[string]string) []Instance {
+	s.mu.Lock()
+	changed := false
+	for _, instance := range s.instances {
+		source := ""
+		if sources != nil {
+			source = sources[instance.AccountID]
+		}
+		surface := SurfaceForAccountSource(source)
+		if instance.Surface == surface && strings.TrimSpace(instance.Browser) != "" {
+			continue
+		}
+		instance.Surface = surface
+		instance.Browser = browserLabelForSurface(surface)
+		instance.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+		changed = true
+	}
+	if changed {
+		_ = s.saveLocked()
+	}
+	s.mu.Unlock()
+	// Reuse List so online/stopped probing and queue decoration stay consistent.
+	return s.List()
+}
+
 func (s *Store) Open(instanceID, cookie string) (Instance, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.pruneRuntimeLocked()
 	instance := s.instances[instanceID]
 	if instance == nil {
+		s.mu.Unlock()
 		return Instance{}, errors.New("浏览器实例不存在")
 	}
 	if strings.TrimSpace(cookie) == "" {
+		s.mu.Unlock()
 		return Instance{}, errors.New("参与账号没有可用 Cookie")
 	}
-	// Opening an already-running account is a deliberate restart. This makes
-	// “重新打开实例” pick up the newest canonical Cookie instead of silently
-	// reusing a window that was launched with stale credentials.
+	// Re-open focuses an already-running Chrome app window when possible so the
+	// 福宝 shell can bring Douyin forward without killing a healthy session.
 	if browserSessionActive(instance) && instance.PID > 0 {
+		port := PortHint(instance.ID)
+		title := chromeWindowTitle(instance.AccountName)
+		s.mu.Unlock()
+		if err := focusChromeAppWindow(port, title); err == nil {
+			s.mu.Lock()
+			instance = s.instances[instanceID]
+			if instance == nil {
+				s.mu.Unlock()
+				return Instance{}, errors.New("浏览器实例不存在")
+			}
+			result := s.decorateInstanceLocked(instance)
+			s.mu.Unlock()
+			return result, nil
+		}
+		s.mu.Lock()
+		instance = s.instances[instanceID]
+		if instance == nil {
+			s.mu.Unlock()
+			return Instance{}, errors.New("浏览器实例不存在")
+		}
 		if process, err := os.FindProcess(instance.PID); err == nil {
 			_ = process.Kill()
 		}
@@ -397,11 +482,14 @@ func (s *Store) Open(instanceID, cookie string) (Instance, error) {
 	}
 	admission := s.acquireRuntimeLocked(instanceID, true)
 	if !admission.Granted {
-		return s.decorateInstanceLocked(instance), fmt.Errorf("当前设备安全并发为 %d，实例已进入等待队列（第 %d 位）", admission.Capacity.EffectiveLimit, admission.QueuePosition)
+		result := s.decorateInstanceLocked(instance)
+		s.mu.Unlock()
+		return result, fmt.Errorf("当前设备安全并发为 %d，实例已进入等待队列（第 %d 位）", admission.Capacity.EffectiveLimit, admission.QueuePosition)
 	}
 	chrome, err := findChrome()
 	if err != nil {
 		s.releaseExternalLocked(instanceID)
+		s.mu.Unlock()
 		return Instance{}, err
 	}
 	profileDir := s.profileDir(instance.AccountID)
@@ -412,12 +500,14 @@ func (s *Store) Open(instanceID, cookie string) (Instance, error) {
 	// this account's isolated profile before starting the canonical app window.
 	if err := stopProfileBrowserProcesses(profileDir); err != nil {
 		s.releaseExternalLocked(instanceID)
+		s.mu.Unlock()
 		return Instance{}, err
 	}
 	extensionDir := filepath.Join(profileDir, "fubao-cookie-sync")
 	endpoint, err := s.ensureCookieSyncEndpointLocked(instance)
 	if err != nil {
 		s.releaseExternalLocked(instanceID)
+		s.mu.Unlock()
 		return Instance{}, err
 	}
 	// The same authenticated loopback endpoint is reused for this stable
@@ -427,50 +517,77 @@ func (s *Store) Open(instanceID, cookie string) (Instance, error) {
 	endpoint.resetBootstrap()
 	if err := writeCookieExtension(extensionDir, cookie, endpoint.URL, endpoint.Token); err != nil {
 		s.releaseExternalLocked(instanceID)
+		s.mu.Unlock()
 		return Instance{}, err
 	}
+	debugPort := PortHint(instance.ID)
 	args := []string{
 		"--user-data-dir=" + profileDir,
 		"--no-first-run",
 		"--no-default-browser-check",
 		"--disable-background-mode",
 		"--disable-background-networking",
+		"--disable-session-crashed-bubble",
+		"--hide-crash-restore-bubble",
 		"--user-agent=" + legacyDouyinUserAgent,
-		"--remote-debugging-port=" + strconv.Itoa(PortHint(instance.ID)),
+		"--remote-debugging-port=" + strconv.Itoa(debugPort),
 		"--remote-allow-origins=http://127.0.0.1",
 		"--disable-extensions-except=" + extensionDir,
 		"--load-extension=" + extensionDir,
-		// Do not let Douyin render a logged-out page before the account Cookie is
-		// present. Go confirms the Cookie through this instance's CDP endpoint,
-		// then performs the first real navigation below.
+		// App window without tab strip / address chrome. CDP owns the first
+		// Douyin navigation after cookies are written; the extension must not
+		// race that navigation (it previously reloaded tabs and broke --app).
 		"--app=about:blank",
 		"--window-size=960,760",
 	}
 	command := exec.Command(chrome, args...)
 	if err := command.Start(); err != nil {
 		s.releaseExternalLocked(instanceID)
+		s.mu.Unlock()
 		return Instance{}, fmt.Errorf("启动浏览器失败: %w", err)
 	}
-	if err := restoreCookieThroughCDP(PortHint(instance.ID), cookie); err != nil {
+	startedPID := command.Process.Pid
+	// CDP restore can take many seconds. Never hold the store lock while waiting
+	// on Chrome or the frontend/list/open RPCs will time out and the window may
+	// be killed after the user already saw a successful login.
+	s.mu.Unlock()
+
+	accountTitle := ""
+	s.mu.Lock()
+	if current := s.instances[instanceID]; current != nil {
+		accountTitle = current.AccountName
+	}
+	s.mu.Unlock()
+	restoreErr := restoreCookieThroughCDP(debugPort, cookie, chromeWindowTitle(accountTitle))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	instance = s.instances[instanceID]
+	if instance == nil {
+		_ = command.Process.Kill()
+		_ = stopProfileBrowserProcesses(profileDir)
+		return Instance{}, errors.New("浏览器实例在启动过程中被关闭")
+	}
+	if restoreErr != nil {
 		_ = command.Process.Kill()
 		// Chrome may already have handed the app window to a child process.
 		// Ensure a rejected login never leaves that window alive or keeps the
 		// account profile locked while the UI correctly reports the open failure.
 		_ = stopProfileBrowserProcesses(profileDir)
 		s.releaseExternalLocked(instanceID)
-		return Instance{}, fmt.Errorf("恢复账号登录状态失败: %w", err)
+		return Instance{}, fmt.Errorf("恢复账号登录状态失败: %w", restoreErr)
 	}
 	now := time.Now().Format(time.RFC3339Nano)
 	instance.Status = StatusOnline
 	instance.OpenedAt = now
 	instance.UpdatedAt = now
-	instance.PID = command.Process.Pid
+	instance.PID = startedPID
 	if err := s.saveLocked(); err != nil {
 		_ = command.Process.Kill()
+		_ = stopProfileBrowserProcesses(profileDir)
 		s.releaseExternalLocked(instanceID)
 		return Instance{}, err
 	}
-	startedPID := command.Process.Pid
 	go func(pid int) {
 		_ = command.Wait()
 		s.markStopped(instanceID, pid)
@@ -855,7 +972,14 @@ func findChrome() (string, error) {
 			return path, nil
 		}
 	}
-	return "", errors.New("未找到 Chrome 或 Chromium，请先安装浏览器")
+	switch runtime.GOOS {
+	case "darwin":
+		return "", errors.New("未找到 Google Chrome。请先安装 https://www.google.com/chrome/ （安装到“应用程序”），然后重试「打开实例」")
+	case "windows":
+		return "", errors.New("未找到 Google Chrome。请先安装 https://www.google.com/chrome/ ，安装完成后重试「打开实例」")
+	default:
+		return "", errors.New("未找到 Chrome 或 Chromium。请先安装 google-chrome 或 chromium，然后重试「打开实例」")
+	}
 }
 
 func processUsesProfile(command, profileDir string) bool {
@@ -964,17 +1088,16 @@ type cdpError struct {
 	Message string `json:"message"`
 }
 
-// restoreCookieThroughCDP makes the independent Chrome window deterministic:
-// it does not navigate to Douyin until Chrome has acknowledged every canonical
-// account Cookie in the isolated account profile. The extension remains loaded
-// only for later login changes to be synchronized back to the Go account store.
-func restoreCookieThroughCDP(port int, rawCookie string) error {
-	cookies := parseCookies(rawCookie)
-	if len(cookies) == 0 {
-		return errors.New("账号 Cookie 格式无效")
+func chromeWindowTitle(accountName string) string {
+	accountName = strings.TrimSpace(accountName)
+	if accountName == "" {
+		return "福宝浏览器实例"
 	}
-	deadline := time.Now().Add(8 * time.Second)
-	var debuggerURL string
+	return "福宝 · " + accountName
+}
+
+func waitForChromeDebuggerURL(port int, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		request, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d/json/list", port), nil)
 		if err == nil {
@@ -986,27 +1109,75 @@ func restoreCookieThroughCDP(port int, rawCookie string) error {
 				if decodeErr == nil {
 					for _, target := range targets {
 						if target.Type == "page" && target.WebSocketDebuggerURL != "" {
-							debuggerURL = target.WebSocketDebuggerURL
-							break
+							return target.WebSocketDebuggerURL, nil
 						}
 					}
 				}
 			}
 		}
-		if debuggerURL != "" {
-			break
-		}
 		time.Sleep(80 * time.Millisecond)
 	}
-	if debuggerURL == "" {
-		return errors.New("独立浏览器调试端口未就绪")
-	}
+	return "", errors.New("独立浏览器调试端口未就绪")
+}
 
+func dialChromeDebugger(debuggerURL string) (*websocket.Conn, error) {
 	header := http.Header{}
 	header.Set("Origin", "http://127.0.0.1")
 	connection, _, err := websocket.DefaultDialer.Dial(debuggerURL, header)
 	if err != nil {
-		return fmt.Errorf("连接独立浏览器失败: %w", err)
+		return nil, fmt.Errorf("连接独立浏览器失败: %w", err)
+	}
+	return connection, nil
+}
+
+func applyChromeWindowChrome(connection *websocket.Conn, commandID int, windowTitle string) int {
+	windowTitle = strings.TrimSpace(windowTitle)
+	if windowTitle == "" {
+		return commandID
+	}
+	// App-mode Chrome uses the document title as the window title on both
+	// macOS and Windows, which makes the system window read as a 福宝 shell.
+	escaped, _ := json.Marshal(windowTitle)
+	_, _ = sendCDPCommand(connection, commandID, "Runtime.evaluate", map[string]any{
+		"expression":    fmt.Sprintf("document.title = %s", string(escaped)),
+		"returnByValue": true,
+	})
+	return commandID + 1
+}
+
+func focusChromeAppWindow(port int, windowTitle string) error {
+	debuggerURL, err := waitForChromeDebuggerURL(port, 2*time.Second)
+	if err != nil {
+		return err
+	}
+	connection, err := dialChromeDebugger(debuggerURL)
+	if err != nil {
+		return err
+	}
+	defer connection.Close()
+	if _, err := sendCDPCommand(connection, 1, "Page.bringToFront", map[string]any{}); err != nil {
+		return err
+	}
+	_ = applyChromeWindowChrome(connection, 2, windowTitle)
+	return nil
+}
+
+// restoreCookieThroughCDP writes the account Cookie through CDP, then opens
+// Douyin once. After login cookies are confirmed in the jar, later CDP failures
+// (slow navigate / SPA probe) must not fail the open — killing Chrome mid-load
+// was surfacing ERR_CONNECTION_CLOSED and a broken “无法打开 Chrome” shell.
+func restoreCookieThroughCDP(port int, rawCookie, windowTitle string) error {
+	cookies := parseCookies(rawCookie)
+	if len(cookies) == 0 {
+		return errors.New("账号 Cookie 格式无效")
+	}
+	debuggerURL, err := waitForChromeDebuggerURL(port, 12*time.Second)
+	if err != nil {
+		return err
+	}
+	connection, err := dialChromeDebugger(debuggerURL)
+	if err != nil {
+		return err
 	}
 	defer connection.Close()
 	cdpCookies := make([]map[string]any, 0, len(cookies))
@@ -1020,16 +1191,15 @@ func restoreCookieThroughCDP(port int, rawCookie string) error {
 			"sameSite": "None",
 		})
 	}
+	// Do not Network.clearBrowserCookies: it races the MV3 extension cookie
+	// write and aborts in-flight Douyin requests (ERR_CONNECTION_CLOSED).
 	if _, err := sendCDPCommand(connection, 1, "Network.enable", map[string]any{}); err != nil {
 		return err
 	}
-	if _, err := sendCDPCommand(connection, 2, "Network.clearBrowserCookies", map[string]any{}); err != nil {
+	if _, err := sendCDPCommand(connection, 2, "Network.setCookies", map[string]any{"cookies": cdpCookies}); err != nil {
 		return err
 	}
-	if _, err := sendCDPCommand(connection, 3, "Network.setCookies", map[string]any{"cookies": cdpCookies}); err != nil {
-		return err
-	}
-	result, err := sendCDPCommand(connection, 4, "Network.getCookies", map[string]any{
+	result, err := sendCDPCommand(connection, 3, "Network.getCookies", map[string]any{
 		"urls": []string{"https://www.douyin.com/", "https://live.douyin.com/"},
 	})
 	if err != nil {
@@ -1038,23 +1208,84 @@ func restoreCookieThroughCDP(port int, rawCookie string) error {
 	if err := verifyChromeLoginCookies(result, cookies); err != nil {
 		return err
 	}
-	if _, err := sendCDPCommand(connection, 5, "Page.enable", map[string]any{}); err != nil {
-		return err
+	// Cookies are authoritative from here. Navigation / title / focus are best
+	// effort so a slow www.douyin.com must not tear down the app window.
+	_, _ = sendCDPCommand(connection, 4, "Page.enable", map[string]any{})
+	// Fire navigate without waiting for a full document commit. A long wait
+	// was the main source of “Page.navigate i/o timeout” shell errors.
+	_ = connection.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	_ = connection.WriteJSON(map[string]any{
+		"id": 5, "method": "Page.navigate", "params": map[string]any{"url": "https://www.douyin.com/"},
+	})
+	// Drain a short window of CDP events so the navigate id (if it arrives)
+	// does not poison the next command, but never hard-fail on timeout.
+	_ = drainCDPUntil(connection, 5, 3*time.Second)
+	_ = applyChromeWindowChrome(connection, 6, windowTitle)
+	_, _ = sendCDPCommandWithTimeout(connection, 7, "Page.bringToFront", map[string]any{}, 3*time.Second)
+	return nil
+}
+
+func drainCDPUntil(connection *websocket.Conn, wantID int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		_ = connection.SetReadDeadline(time.Now().Add(time.Until(deadline)))
+		var response cdpResponse
+		if err := connection.ReadJSON(&response); err != nil {
+			return err
+		}
+		if response.ID == wantID {
+			if response.Error != nil {
+				return fmt.Errorf("浏览器命令被拒绝: %s", response.Error.Message)
+			}
+			return nil
+		}
 	}
-	if _, err := sendCDPCommand(connection, 6, "Page.navigate", map[string]any{"url": "https://www.douyin.com/"}); err != nil {
-		return err
+	return fmt.Errorf("i/o timeout")
+}
+
+func cdpCommandTimeout(method string) time.Duration {
+	switch method {
+	case "Page.navigate":
+		return 25 * time.Second
+	case "Network.setCookies", "Network.clearBrowserCookies":
+		return 20 * time.Second
+	case "Runtime.evaluate":
+		return 10 * time.Second
+	default:
+		return 12 * time.Second
 	}
-	return verifyDouyinPageLogin(connection, 7)
+}
+
+func isCDPIOTimeout(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "i/o timeout") || strings.Contains(text, "timeout")
 }
 
 func sendCDPCommand(connection *websocket.Conn, id int, method string, params map[string]any) (json.RawMessage, error) {
-	_ = connection.SetReadDeadline(time.Now().Add(5 * time.Second))
+	return sendCDPCommandWithTimeout(connection, id, method, params, cdpCommandTimeout(method))
+}
+
+func sendCDPCommandWithTimeout(connection *websocket.Conn, id int, method string, params map[string]any, timeout time.Duration) (json.RawMessage, error) {
+	if timeout <= 0 {
+		timeout = 12 * time.Second
+	}
 	if err := connection.WriteJSON(map[string]any{
 		"id": id, "method": method, "params": params,
 	}); err != nil {
 		return nil, fmt.Errorf("发送浏览器命令 %s 失败: %w", method, err)
 	}
+	// Refresh the read deadline on every frame so intermediate CDP events
+	// (Network.*, Page.*) do not burn the whole timeout before the reply id.
+	deadline := time.Now().Add(timeout)
 	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("等待浏览器命令 %s 失败: i/o timeout", method)
+		}
+		_ = connection.SetReadDeadline(time.Now().Add(remaining))
 		var response cdpResponse
 		if err := connection.ReadJSON(&response); err != nil {
 			return nil, fmt.Errorf("等待浏览器命令 %s 失败: %w", method, err)
@@ -1096,9 +1327,13 @@ func verifyChromeLoginCookies(result json.RawMessage, expected []browserCookie) 
 }
 
 func verifyDouyinPageLogin(connection *websocket.Conn, firstID int) error {
-	deadline := time.Now().Add(10 * time.Second)
+	// Keep this short: the frontend used to time out at 12s while Open held the
+	// store lock through an 8s debugger wait + 10s page probe, then killed Chrome
+	// after the user already saw a successful login frame.
+	deadline := time.Now().Add(6 * time.Second)
 	id := firstID
 	readySince := time.Time{}
+	sawReady := false
 	for time.Now().Before(deadline) {
 		result, err := sendCDPCommand(connection, id, "Runtime.evaluate", map[string]any{
 			"expression":    `(() => { const text = document.body?.innerText || ""; return { ready: document.readyState !== "loading" && !!document.body, loggedOut: text.includes("登录后免费畅享高清视频") && (text.includes("扫码登录") || text.includes("验证码登录")) }; })()`,
@@ -1119,15 +1354,23 @@ func verifyDouyinPageLogin(connection *websocket.Conn, firstID int) error {
 					return errors.New("抖音未接受当前 CK，请重新绑定 CK")
 				}
 				if payload.Result.Value.Ready {
+					sawReady = true
 					if readySince.IsZero() {
 						readySince = time.Now()
-					} else if time.Since(readySince) >= 4*time.Second {
+					} else if time.Since(readySince) >= 1500*time.Millisecond {
 						return nil
 					}
+				} else {
+					readySince = time.Time{}
 				}
 			}
 		}
-		time.Sleep(250 * time.Millisecond)
+		time.Sleep(200 * time.Millisecond)
+	}
+	if sawReady {
+		// Document painted without a login wall long enough to observe; do not
+		// fail the launch merely because the SPA was still settling.
+		return nil
 	}
 	return errors.New("无法确认抖音登录状态，请检查网络后重试")
 }
@@ -1154,11 +1397,13 @@ func writeCookieExtension(extensionDir, rawCookie, callbackURL, callbackToken st
 }`
 	callbackURLJSON, _ := json.Marshal(callbackURL)
 	callbackTokenJSON, _ := json.Marshal(callbackToken)
-	bootstrapURLJSON, _ := json.Marshal(strings.TrimSuffix(callbackURL, "/cookie") + "/bootstrap")
+	// Extension seeds cookies and syncs later login changes back to Go.
+	// It must NOT navigate/reload tabs on install: CDP owns the first Douyin
+	// navigation inside the --app window. Racing tab.update/reload was
+	// breaking app mode into a full Chrome UI and aborting loads.
 	background := fmt.Sprintf(`const cookies = %s;
 const callbackUrl = %s;
 const callbackToken = %s;
-const bootstrapUrl = %s;
 const loginCookieNames = new Set(["sessionid", "sessionid_ss", "sid_guard", "sid_tt", "sid_ucp_v1", "ssid_ucp_v1", "uid_tt", "uid_tt_ss", "passport_assist_user"]);
 function loginFingerprint(items) {
   return items
@@ -1168,7 +1413,7 @@ function loginFingerprint(items) {
     .join(";");
 }
 let lastLoginFingerprint = loginFingerprint(cookies);
-async function syncCookies() {
+async function seedCookiesOnly() {
   for (const cookie of cookies) {
     try {
       await chrome.cookies.set({
@@ -1182,32 +1427,12 @@ async function syncCookies() {
       });
     } catch (_) {}
   }
-	try {
-		await fetch(callbackUrl.replace(/\/cookie$/, "/bootstrap-ready"), {
-			method: "POST",
-			headers: { "X-Fubao-Token": callbackToken }
-		});
-	} catch (_) {}
-  // The app tab can appear just after the service worker starts. Retry briefly
-  // so the launch never remains on the local bootstrap page or a blank tab.
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const tabs = await chrome.tabs.query({});
-    let handled = false;
-    for (const tab of tabs) {
-      if (!tab.id || !tab.url) continue;
-      try {
-        if (tab.url.startsWith(bootstrapUrl)) {
-          await chrome.tabs.update(tab.id, { url: "https://www.douyin.com/" });
-          handled = true;
-        } else if (tab.url.includes("douyin.com")) {
-          await chrome.tabs.reload(tab.id);
-          handled = true;
-        }
-      } catch (_) {}
-    }
-    if (handled) return;
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
+  try {
+    await fetch(callbackUrl.replace(/\/cookie$/, "/bootstrap-ready"), {
+      method: "POST",
+      headers: { "X-Fubao-Token": callbackToken }
+    });
+  } catch (_) {}
 }
 let syncBackTimer = 0;
 function scheduleCookieSyncBack() {
@@ -1232,16 +1457,13 @@ async function syncCookiesBackToEngine() {
     if (response.ok) lastLoginFingerprint = fingerprint;
   } catch (_) {}
 }
-chrome.runtime.onInstalled.addListener(syncCookies);
-chrome.runtime.onStartup.addListener(syncCookies);
+chrome.runtime.onInstalled.addListener(seedCookiesOnly);
+chrome.runtime.onStartup.addListener(seedCookiesOnly);
 chrome.cookies.onChanged.addListener((changeInfo) => {
   if (changeInfo.cookie.domain.endsWith("douyin.com")) scheduleCookieSyncBack();
 });
-chrome.tabs.onUpdated.addListener((_tabId, changeInfo, tab) => {
-  if (changeInfo.status === "complete" && tab.url && tab.url.includes("douyin.com")) scheduleCookieSyncBack();
-});
-syncCookies();
-`, string(cookieJSON), string(callbackURLJSON), string(callbackTokenJSON), string(bootstrapURLJSON))
+seedCookiesOnly();
+`, string(cookieJSON), string(callbackURLJSON), string(callbackTokenJSON))
 	if err := os.WriteFile(filepath.Join(extensionDir, "manifest.json"), []byte(manifest), 0o600); err != nil {
 		return fmt.Errorf("写入浏览器扩展配置失败: %w", err)
 	}

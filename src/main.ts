@@ -3,6 +3,7 @@ import App from "./DesktopApp.svelte";
 import MonitorLogApp from "./MonitorLogApp.svelte";
 import ParticipationLogApp from "./ParticipationLogApp.svelte";
 import BrowserInstanceApp from "./BrowserInstanceApp.svelte";
+import ExternalBrowserShellApp from "./ExternalBrowserShellApp.svelte";
 import "./styles.css";
 
 function reportFrontendError(level: string, value: unknown) {
@@ -35,15 +36,19 @@ try {
   if (!target) throw new Error("找不到应用挂载节点");
   const isMonitorLogWindow = new URL(window.location.href).searchParams.get("window") === "monitor-log";
   const isParticipationLogWindow = new URL(window.location.href).searchParams.get("window") === "participation-log";
-  const isBrowserInstanceWindow = new URL(window.location.href).searchParams.get("window") === "browser-instance";
+  const windowKind = new URL(window.location.href).searchParams.get("window");
+  const isBrowserInstanceWindow = windowKind === "browser-instance";
+  const isExternalBrowserShell = windowKind === "browser-external";
   mount(
     isMonitorLogWindow
       ? MonitorLogApp
       : isParticipationLogWindow
         ? ParticipationLogApp
-        : isBrowserInstanceWindow
-          ? BrowserInstanceApp
-          : App,
+        : isExternalBrowserShell
+          ? ExternalBrowserShellApp
+          : isBrowserInstanceWindow
+            ? BrowserInstanceApp
+            : App,
     { target },
   );
   if (window.location.protocol === "http:" || window.location.protocol === "https:") {

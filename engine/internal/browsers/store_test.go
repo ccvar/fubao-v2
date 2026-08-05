@@ -10,6 +10,31 @@ import (
 	"time"
 )
 
+func TestSurfaceForAccountSourceIsAlwaysEmbedded(t *testing.T) {
+	for _, source := range []string{"manual-import", "qr-login", "native-rebind", ""} {
+		if got := SurfaceForAccountSource(source); got != SurfaceEmbedded {
+			t.Fatalf("source %q surface = %q, want embedded", source, got)
+		}
+	}
+}
+
+func TestCreateStoresEmbeddedSurface(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Even if a caller requests external chrome, create still records the
+	// requested surface parameter; product routing forces embedded via
+	// SurfaceForAccountSource when creating from account provenance.
+	instance, err := store.CreateWithLimit("import-1", "导入账号", "", 0, SurfaceEmbedded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if instance.Surface != SurfaceEmbedded {
+		t.Fatalf("surface = %q", instance.Surface)
+	}
+}
+
 func TestCreateKeepsOneIsolatedInstancePerAccount(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {
@@ -24,6 +49,9 @@ func TestCreateKeepsOneIsolatedInstancePerAccount(t *testing.T) {
 	}
 	if instance.Status != StatusStopped {
 		t.Fatalf("new instance status = %q", instance.Status)
+	}
+	if instance.Surface != SurfaceEmbedded {
+		t.Fatalf("default surface = %q", instance.Surface)
 	}
 	reused, err := store.Create("account-1", "测试账号", "重复实例")
 	if err != nil {
@@ -43,18 +71,18 @@ func TestCreateWithLimitReusesExistingAccountAndRejectsAnother(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := store.CreateWithLimit("account-1", "账号一", "", 1)
+	first, err := store.CreateWithLimit("account-1", "账号一", "", 1, SurfaceEmbedded)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reused, err := store.CreateWithLimit("account-1", "账号一", "重复实例", 1)
+	reused, err := store.CreateWithLimit("account-1", "账号一", "重复实例", 1, SurfaceEmbedded)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if reused.ID != first.ID {
 		t.Fatalf("limited create did not reuse the existing account instance: first=%q reused=%q", first.ID, reused.ID)
 	}
-	if _, err := store.CreateWithLimit("account-2", "账号二", "", 1); err == nil || !strings.Contains(err.Error(), "免费版最多只能创建 1 个浏览器实例") {
+	if _, err := store.CreateWithLimit("account-2", "账号二", "", 1, SurfaceEmbedded); err == nil || !strings.Contains(err.Error(), "免费版最多只能创建 1 个浏览器实例") {
 		t.Fatalf("second limited instance error = %v", err)
 	}
 	if items := store.List(); len(items) != 1 || items[0].ID != first.ID {

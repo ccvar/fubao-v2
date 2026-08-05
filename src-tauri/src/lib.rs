@@ -415,6 +415,8 @@ struct NativeBrowserCredential {
     account_name: String,
     cookie: String,
     cookie_status: String,
+    #[serde(default)]
+    surface: String,
 }
 
 #[derive(Deserialize)]
@@ -696,22 +698,105 @@ fn rebind_data_store_identifier(account_id: &str) -> [u8; 16] {
 }
 
 fn inject_douyin_cookie(webview: &tauri::Webview, raw_cookie: &str) -> Result<(), String> {
+    // WKHTTPCookieStore accepts domain without a leading dot and treats it as
+    // covering subdomains. Also seed www/live host cookies: some imported
+    // browser exports were host-scoped and a parent-only write is not enough
+    // for Douyin's first-party SPA requests.
+    const DOMAINS: [&str; 3] = ["douyin.com", "www.douyin.com", "live.douyin.com"];
+    let max_age = cookie::time::Duration::days(180);
     for item in raw_cookie.split(';') {
         let Some((name, value)) = item.trim().split_once('=') else {
             continue;
         };
-        if name.trim().is_empty() {
+        let name = name.trim();
+        let value = value.trim();
+        if name.is_empty() {
             continue;
         }
-        let cookie = Cookie::build((name.trim().to_string(), value.trim().to_string()))
-            .domain(".douyin.com")
-            .path("/")
-            .secure(true)
-            .same_site(cookie::SameSite::None)
-            .build();
-        webview
-            .set_cookie(cookie)
-            .map_err(|error| format!("同步账号 Cookie 失败：{error}"))?;
+        let is_login = DOUYIN_LOGIN_COOKIE_NAMES.contains(&name);
+        for domain in DOMAINS {
+            // Login cookies must be HttpOnly so they match Douyin's real browser
+            // jar. First-party navigations use SameSite=Lax (more reliable than
+            // None on WKWebView, which does not persist a SameSite=None flag).
+            let mut builder = Cookie::build((name.to_string(), value.to_string()))
+                .domain(domain)
+                .path("/")
+                .secure(true)
+                .same_site(cookie::SameSite::Lax)
+                .max_age(max_age);
+            if is_login {
+                builder = builder.http_only(true);
+            }
+            webview
+                .set_cookie(builder.build())
+                .map_err(|error| format!("同步账号 Cookie 失败：{error}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Seed the account WebView so Douyin's SPA boots with the store Cookie.
+/// Keep this to at most one confirm + one optional reload. Multiple full
+/// navigations used to finish after the frontend already hid its loading
+/// state, leaving a long blank window before the final SPA paint.
+async fn bootstrap_browser_account_session(
+    webview: &tauri::Webview,
+    runtime: &EngineRuntime,
+    instance_id: &str,
+    raw_cookie: &str,
+    target_url: Url,
+) -> Result<(), String> {
+    if login_cookie_values(raw_cookie).is_empty() {
+        return Err("账号 Cookie 缺少登录凭据，请重新扫码登录".into());
+    }
+    // Write cookies first, then open Douyin once. Confirm after a short bind
+    // window; only reload when the post-nav jar no longer matches.
+    inject_douyin_cookie_and_confirm(webview, raw_cookie)
+        .await
+        .map_err(|error| format!("同步账号 Cookie 失败：{error}"))?;
+    if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
+        injected.insert(instance_id.to_string(), Instant::now());
+    }
+    webview
+        .navigate(target_url.clone())
+        .map_err(|error| format!("加载抖音页面失败：{error}"))?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    match inject_douyin_cookie_and_confirm(webview, raw_cookie).await {
+        Ok(()) => {
+            if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
+                injected.insert(instance_id.to_string(), Instant::now());
+            }
+        }
+        Err(error) => {
+            if cfg!(debug_assertions) {
+                eprintln!(
+                    "[embedded-browser] post-nav cookie confirm retry instance={instance_id}: {error}"
+                );
+            }
+            inject_douyin_cookie(webview, raw_cookie)?;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            if inject_douyin_cookie_and_confirm(webview, raw_cookie)
+                .await
+                .is_ok()
+            {
+                webview
+                    .navigate(target_url)
+                    .map_err(|error| format!("重新加载已注入登录态的抖音页面失败：{error}"))?;
+                tokio::time::sleep(Duration::from_millis(350)).await;
+            }
+            if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
+                injected.insert(instance_id.to_string(), Instant::now());
+            }
+        }
+    }
+    if cfg!(debug_assertions) {
+        let login_state = inspect_douyin_login(webview)
+            .await
+            .map(|snapshot| format!("{:?}", snapshot.state))
+            .unwrap_or_else(|error| format!("error:{error}"));
+        eprintln!(
+            "[embedded-browser] session-bootstrap done instance={instance_id} state={login_state}"
+        );
     }
     Ok(())
 }
@@ -840,7 +925,8 @@ fn login_cookie_values(raw_cookie: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod cookie_tests {
     use super::{
-        begin_browser_webview_close, browser_location_matches_live_room, browser_new_window_target,
+        begin_browser_webview_close, browser_location_matches_live_room,
+        browser_login_cookie_is_safe_to_persist, browser_new_window_target,
         browser_webview_is_closing, canonical_cookie_values, login_cookie_snapshot_matches,
         login_cookie_values, remember_browser_location, EngineRuntime, Url,
     };
@@ -861,6 +947,16 @@ mod cookie_tests {
             login_cookie_values("sessionid_ss=session; ttwid=old"),
             login_cookie_values("sessionid_ss=session; ttwid=new")
         );
+    }
+
+    #[test]
+    fn partial_browser_snapshot_must_not_replace_store_login_cookies() {
+        let store = "sessionid_ss=full; sid_guard=guard; uid_tt=uid; ttwid=aux";
+        let partial = "sessionid_ss=full; ttwid=aux";
+        let complete = "sessionid_ss=rotated; sid_guard=guard; uid_tt=uid; ttwid=new";
+        assert!(!browser_login_cookie_is_safe_to_persist(store, partial));
+        assert!(browser_login_cookie_is_safe_to_persist(store, complete));
+        assert!(!browser_login_cookie_is_safe_to_persist(store, ""));
     }
 
     #[test]
@@ -971,19 +1067,18 @@ async fn inspect_douyin_login(webview: &tauri::Webview) -> Result<BrowserLoginSn
     webview
         .eval(
             r#"(() => {
-              const visible = (element) => {
-                if (!(element instanceof HTMLElement)) return false;
-                const rect = element.getBoundingClientRect();
-                const style = getComputedStyle(element);
-                return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-              };
               const text = document.body?.innerText || '';
+              // Only the dedicated login wall is authoritative. A lone visible
+              // “登录” control appears during SPA transitions and secondary
+              // prompts; treating it as logout was wiping freshly imported CK
+              // after browser-instance creation.
               const explicitDialog = text.includes('登录后免费畅享高清视频') &&
                 (text.includes('扫码登录') || text.includes('验证码登录'));
-              const explicitLoginControl = [...document.querySelectorAll('button, a, [role="button"]')]
-                .some((element) => visible(element) && element.textContent?.trim() === '登录');
+              const loginWall = explicitDialog ||
+                (text.includes('扫码登录') && text.includes('验证码登录') &&
+                  (text.includes('登录后免费畅享') || text.includes('手机号登录')));
               const ready = document.readyState !== 'loading' && Boolean(document.body);
-              const state = explicitDialog || explicitLoginControl ? 'out' : ready ? 'ready' : 'unknown';
+              const state = loginWall ? 'out' : ready ? 'ready' : 'unknown';
               document.cookie = `fubao_login_probe=${state}; Path=/; Secure; SameSite=None; Max-Age=5`;
             })();"#,
         )
@@ -1000,12 +1095,34 @@ async fn inspect_douyin_login(webview: &tauri::Webview) -> Result<BrowserLoginSn
     let raw_cookie = read_douyin_cookie(webview).ok();
     let _ = webview
         .eval("document.cookie='fubao_login_probe=; Path=/; Secure; SameSite=None; Max-Age=0'");
+    // If the page shell still looks logged-out but native login cookies are
+    // already present (fresh inject / SPA restore), keep the state unknown so
+    // a transient frame cannot expire the canonical account.
     let state = match probe.as_deref() {
-        Some("out") => BrowserLoginState::LoggedOut,
+        Some("out") if raw_cookie.is_none() => BrowserLoginState::LoggedOut,
+        Some("out") => BrowserLoginState::Unknown,
         Some("ready") if raw_cookie.is_some() => BrowserLoginState::LoggedIn,
         _ => BrowserLoginState::Unknown,
     };
     Ok(BrowserLoginSnapshot { raw_cookie, state })
+}
+
+/// Browser snapshots may miss HttpOnly login cookies briefly after inject or
+/// SPA navigation. Never overwrite a complete store Cookie with a partial read.
+fn browser_login_cookie_is_safe_to_persist(store_cookie: &str, browser_cookie: &str) -> bool {
+    let store_login = login_cookie_values(store_cookie);
+    let browser_login = login_cookie_values(browser_cookie);
+    if browser_login.is_empty() {
+        return false;
+    }
+    if store_login.is_empty() {
+        return true;
+    }
+    store_login.keys().all(|name| {
+        browser_login
+            .get(name)
+            .is_some_and(|value| !value.trim().is_empty())
+    })
 }
 
 async fn read_authenticated_douyin_cookie(webview: &tauri::Webview) -> Result<String, String> {
@@ -1990,7 +2107,12 @@ async fn complete_account_rebind(
     let account = native_engine_request(
         runtime.clone(),
         "account.native_set_browser_login_state",
-        json!({ "account_id": account_id, "logged_in": true, "secret": runtime.native_secret }),
+        json!({
+            "account_id": account_id,
+            "logged_in": true,
+            "promote_native_surface": true,
+            "secret": runtime.native_secret
+        }),
     )
     .await?;
     webview
@@ -2141,6 +2263,7 @@ async fn complete_account_create(
         json!({
             "account_id": account_id,
             "logged_in": true,
+            "promote_native_surface": true,
             "secret": runtime.native_secret
         }),
     )
@@ -2207,8 +2330,10 @@ fn schedule_browser_webview_reveal(
     revealed: Arc<AtomicBool>,
     delay: std::time::Duration,
 ) {
-    std::thread::spawn(move || {
-        std::thread::sleep(delay);
+    // Never call WKWebView/WebView2 show() from a raw OS thread — on macOS that
+    // can freeze the whole app. Sleep on the async runtime, then hop to main.
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(delay).await;
         if revealed
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
@@ -2218,7 +2343,18 @@ fn schedule_browser_webview_reveal(
         if browser_webview_is_closing(&runtime, &webview_label) {
             return;
         }
-        match webview.show() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dispatch = app.run_on_main_thread(move || {
+            let result = webview.show();
+            let _ = tx.send(result);
+        });
+        let show_result = match dispatch {
+            Ok(()) => rx
+                .recv()
+                .unwrap_or_else(|_| Err(tauri::Error::FailedToReceiveMessage)),
+            Err(error) => Err(error),
+        };
+        match show_result {
             Ok(()) => {
                 let _ = app.emit(
                     "browser-webview://ready",
@@ -2339,6 +2475,11 @@ async fn ensure_browser_webview(
     let ready_instance_id = instance_id.to_string();
     let ready_once = Arc::new(AtomicBool::new(false));
     let ready_once_for_page = ready_once.clone();
+    // Suppress page-load reveals until cookie bootstrap finishes. Intermediate
+    // Finished events during bootstrap used to clear the HTML loader and leave
+    // a long blank surface while later reloads were still running.
+    let bootstrap_active = Arc::new(AtomicBool::new(true));
+    let bootstrap_active_for_page = bootstrap_active.clone();
     let navigation_runtime = runtime.clone();
     let navigation_instance_id = instance_id.to_string();
     let new_window_app = app.clone();
@@ -2411,12 +2552,13 @@ async fn ensure_browser_webview(
                     let _ = webview.eval(RED_PACKET_RECEIVE_CAPTURE_SCRIPT);
                 }
             }
-            if reveal_when_ready && payload.event() == PageLoadEvent::Finished && is_douyin {
-                // WKWebView can report navigation completion before the
-                // remote SPA has committed its first meaningful frame. Keep
-                // the native surface hidden for a short paint-stabilization
-                // window so the HTML loading state transitions directly into
-                // real Douyin content instead of flashing an empty white card.
+            if reveal_when_ready
+                && payload.event() == PageLoadEvent::Finished
+                && is_douyin
+                && !bootstrap_active_for_page.load(Ordering::SeqCst)
+            {
+                // Only post-bootstrap loads may reveal. A short settle lets the
+                // SPA replace the blank document without a multi-second gap.
                 schedule_browser_webview_reveal(
                     webview.clone(),
                     ready_app.clone(),
@@ -2424,7 +2566,7 @@ async fn ensure_browser_webview(
                     webview.label().to_string(),
                     ready_instance_id.clone(),
                     ready_once_for_page.clone(),
-                    std::time::Duration::from_millis(1_200),
+                    std::time::Duration::from_millis(350),
                 );
             }
         });
@@ -2443,33 +2585,48 @@ async fn ensure_browser_webview(
         builder = builder.data_directory(data_dir);
     }
 
-    let webview = window
-        .add_child(
-            builder,
-            // Create the native surface outside the visible window first. A
-            // newly-created WKWebView paints white before its first page
-            // frame; keeping it off-card lets the HTML loading state remain
-            // visible until `on_page_load(Finished)` reveals the real page.
-            LogicalPosition::new(-10_000.0, -10_000.0),
-            LogicalSize::new(bounds.width.max(120.0), bounds.height.max(90.0)),
-        )
-        .map_err(|error| format!("创建嵌入浏览器失败：{error}"))?;
+    let webview = match window.add_child(
+        builder,
+        // Create the native surface outside the visible window first. A
+        // newly-created WKWebView paints white before its first page
+        // frame; keeping it off-card lets the HTML loading state remain
+        // visible until `on_page_load(Finished)` reveals the real page.
+        LogicalPosition::new(-10_000.0, -10_000.0),
+        LogicalSize::new(bounds.width.max(120.0), bounds.height.max(90.0)),
+    ) {
+        Ok(webview) => webview,
+        Err(error) => {
+            // Concurrent mount from resize/ready observers can race past the
+            // pre-check above. Reuse the winner instead of flashing an error
+            // over an already-working Douyin surface.
+            let message = error.to_string();
+            if message.contains("already exists") {
+                if let Some(existing) = app.get_webview(&label) {
+                    if reveal_when_ready {
+                        apply_browser_bounds(&existing, bounds)?;
+                    }
+                    return Ok(existing);
+                }
+            }
+            return Err(format!("创建嵌入浏览器失败：{message}"));
+        }
+    };
 
     webview
         .hide()
         .map_err(|error| format!("隐藏待加载浏览器失败：{error}"))?;
     apply_browser_geometry(&webview, &bounds)?;
-    inject_douyin_cookie_and_confirm(&webview, &credential.cookie).await?;
-    if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
-        injected.insert(instance_id.to_string(), Instant::now());
-    }
-    webview
-        .navigate(restore_url)
-        .map_err(|error| format!("加载抖音页面失败：{error}"))?;
-    // Some Douyin SPA navigations keep network work alive long enough that
-    // WKWebView postpones its Finished callback even though the first screen
-    // is already painted. Avoid an endless loading state while still giving
-    // the page enough time to replace its initial native white surface.
+    bootstrap_browser_account_session(
+        &webview,
+        runtime.as_ref(),
+        instance_id,
+        &credential.cookie,
+        restore_url,
+    )
+    .await?;
+    bootstrap_active.store(false, Ordering::SeqCst);
+    // Reveal only after bootstrap is finished. A brief settle covers the final
+    // SPA paint without the previous multi-second blank after the HTML loader.
     if reveal_when_ready {
         schedule_browser_webview_reveal(
             webview.clone(),
@@ -2478,7 +2635,7 @@ async fn ensure_browser_webview(
             webview.label().to_string(),
             instance_id.to_string(),
             ready_once,
-            std::time::Duration::from_millis(5_000),
+            std::time::Duration::from_millis(400),
         );
     }
     if cfg!(debug_assertions) {
@@ -2766,13 +2923,15 @@ async fn refresh_browser_account_cookie(
         .parse()
         .map_err(|error| format!("解析抖音地址失败：{error}"))?;
     for webview in webviews {
-        inject_douyin_cookie_and_confirm(&webview, &credential.cookie).await?;
-        if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
-            injected.insert(instance_id.clone(), Instant::now());
-        }
-        webview
-            .navigate(douyin_url.clone())
-            .map_err(|error| format!("刷新账号登录状态失败：{error}"))?;
+        bootstrap_browser_account_session(
+            &webview,
+            runtime.as_ref(),
+            &instance_id,
+            &credential.cookie,
+            douyin_url.clone(),
+        )
+        .await
+        .map_err(|error| format!("刷新账号登录状态失败：{error}"))?;
     }
     Ok(())
 }
@@ -2814,12 +2973,16 @@ async fn sync_browser_account_cookie(
     .await?;
     let credential: NativeBrowserCredential =
         serde_json::from_value(result).map_err(|error| format!("解析浏览器凭据失败：{error}"))?;
+    // Fresh mounts inject the store Cookie then navigate. Douyin SPA can paint
+    // a login shell for several seconds even while the injected session is
+    // valid. Keep a longer grace so periodic cookie sync cannot expire a just-
+    // created instance.
     let within_injection_grace = runtime
         .browser_cookie_injected_at
         .lock()
         .ok()
         .and_then(|injected| injected.get(&instance_id).copied())
-        .is_some_and(|injected_at| injected_at.elapsed() < Duration::from_secs(15));
+        .is_some_and(|injected_at| injected_at.elapsed() < Duration::from_secs(45));
     if snapshot.state == BrowserLoginState::LoggedOut && within_injection_grace {
         if !require_logged_in {
             if cfg!(debug_assertions) {
@@ -2832,11 +2995,30 @@ async fn sync_browser_account_cookie(
         // An explicit open action needs a definitive result. Give the newly
         // injected Windows profile a bounded page-restoration window instead
         // of failing on its first transient login-dialog frame.
-        for _ in 0..6 {
+        for _ in 0..10 {
             tokio::time::sleep(Duration::from_millis(500)).await;
             snapshot = inspect_douyin_login(&webview).await?;
             if snapshot.state != BrowserLoginState::LoggedOut {
                 break;
+            }
+        }
+    }
+    // Re-check native cookies after UI probe. A logout wall without cleared
+    // login cookies is usually a transient SPA frame, not a real CK expiry.
+    if snapshot.state == BrowserLoginState::LoggedOut {
+        if let Ok(current) = read_douyin_cookie(&webview) {
+            if login_cookie_snapshot_matches(&credential.cookie, &current)
+                || browser_login_cookie_is_safe_to_persist(&credential.cookie, &current)
+            {
+                if cfg!(debug_assertions) {
+                    eprintln!(
+                        "[embedded-browser] login-state demoted-to-unknown instance={instance_id} reason=login-cookies-still-present"
+                    );
+                }
+                snapshot = BrowserLoginSnapshot {
+                    raw_cookie: Some(current),
+                    state: BrowserLoginState::Unknown,
+                };
             }
         }
     }
@@ -2855,11 +3037,17 @@ async fn sync_browser_account_cookie(
                 .map_or(true, |last_sync| {
                     last_sync.elapsed() >= Duration::from_secs(60)
                 });
+            let safe_to_persist =
+                browser_login_cookie_is_safe_to_persist(&credential.cookie, raw_cookie);
             // Login-cookie changes are persisted immediately. Douyin rotates
             // auxiliary browser cookies frequently, so complete snapshots are
             // rate-limited to once per minute unless an explicit open action
-            // needs the freshest possible account state.
-            if cookie_changed && (require_logged_in || login_cookie_changed || auxiliary_sync_due) {
+            // needs the freshest possible account state. Never persist a
+            // partial browser read that would drop store login cookies.
+            if safe_to_persist
+                && cookie_changed
+                && (require_logged_in || login_cookie_changed || auxiliary_sync_due)
+            {
                 native_engine_request(
                     runtime.clone(),
                     "account.native_replace_cookie",
@@ -2874,6 +3062,10 @@ async fn sync_browser_account_cookie(
                 if let Ok(mut synced) = runtime.browser_cookie_synced_at.lock() {
                     synced.insert(instance_id.clone(), Instant::now());
                 }
+            } else if cfg!(debug_assertions) && cookie_changed && !safe_to_persist {
+                eprintln!(
+                    "[embedded-browser] cookie-replace skipped instance={instance_id} reason=partial-browser-snapshot"
+                );
             }
         }
     }
@@ -2884,6 +3076,11 @@ async fn sync_browser_account_cookie(
         return Ok(false);
     }
     if require_logged_in && snapshot.state != BrowserLoginState::LoggedIn {
+        // Explicit open failures must not permanently expire a still-valid
+        // store Cookie when the page is merely still bootstrapping.
+        if within_injection_grace || snapshot.raw_cookie.is_some() {
+            return Err("当前卡片登录页面尚未就绪，请等待加载完成后重试".into());
+        }
         native_engine_request(
             runtime.clone(),
             "account.native_set_browser_login_state",
@@ -2901,6 +3098,11 @@ async fn sync_browser_account_cookie(
     } else {
         "expired"
     };
+    // Only a definitive logout wall without login cookies may expire CK.
+    // Unknown stays untouched; LoggedIn becomes valid.
+    if snapshot.state == BrowserLoginState::LoggedOut && within_injection_grace {
+        return Ok(false);
+    }
     if !cookie_persisted && credential.cookie_status == desired_status {
         if cfg!(debug_assertions) {
             eprintln!(
@@ -3175,7 +3377,25 @@ async fn browser_instance_window_metadata(
         "account_id": credential.account_id,
         "account_name": credential.account_name,
         "cookie_status": credential.cookie_status,
+        "surface": credential.surface,
     }))
+}
+
+#[tauri::command]
+async fn launch_external_chrome_instance(
+    runtime: tauri::State<'_, Arc<EngineRuntime>>,
+    instance_id: String,
+) -> Result<Value, String> {
+    let instance_id = instance_id.trim().to_string();
+    if instance_id.is_empty() {
+        return Err("浏览器实例标识无效".into());
+    }
+    native_engine_request(
+        runtime.inner().clone(),
+        "browser.open",
+        json!({ "instance_id": instance_id }),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -3183,6 +3403,7 @@ async fn open_browser_instance_window(
     app: tauri::AppHandle,
     runtime: tauri::State<'_, Arc<EngineRuntime>>,
     instance_id: String,
+    surface: Option<String>,
 ) -> Result<(), String> {
     let instance_id = instance_id.trim().to_string();
     if instance_id.is_empty()
@@ -3191,15 +3412,6 @@ async fn open_browser_instance_window(
             .all(|character| character.is_ascii_alphanumeric() || character == '-')
     {
         return Err("浏览器实例标识无效".into());
-    }
-    let label = format!("instance-window-{}", safe_window_label_part(&instance_id));
-    // Look up the native window rather than only the WebviewWindow wrapper.
-    // On Windows the native window can already be registered while the
-    // webview lookup is briefly unavailable, which previously sent this path
-    // into a duplicate build and surfaced an `already exists` error.
-    if let Some(window) = app.get_window(&label) {
-        reveal_window(&window)?;
-        return Ok(());
     }
 
     let credential_result = native_engine_request(
@@ -3216,32 +3428,67 @@ async fn open_browser_instance_window(
     if credential.cookie_status == "expired" {
         return Err("参与账号 CK 已失效，请先重新绑定".into());
     }
+    // Frontend surface is authoritative when the card already classified the
+    // account (import vs QR). Fall back to the engine credential for re-open.
+    let requested = surface.unwrap_or_default();
+    let external_chrome =
+        requested.trim() == "external_chrome" || credential.surface.trim() == "external_chrome";
 
-    let admission = native_engine_request(
-        runtime.inner().clone(),
-        "browser.runtime.acquire",
-        json!({ "instance_id": instance_id }),
-    )
-    .await?;
-    if admission.get("granted").and_then(Value::as_bool) != Some(true) {
-        let position = admission
-            .get("queue_position")
-            .and_then(Value::as_i64)
-            .unwrap_or(1);
-        let limit = admission
-            .pointer("/capacity/effective_limit")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        return Err(format!(
-            "当前设备安全并发为 {limit}，实例已进入等待队列（第 {position} 位）"
-        ));
+    // Separate labels so an earlier embedded open cannot reuse a window that
+    // still mounts a child Douyin WebView for an import account.
+    let label = if external_chrome {
+        format!("external-chrome-{}", safe_window_label_part(&instance_id))
+    } else {
+        format!("instance-window-{}", safe_window_label_part(&instance_id))
+    };
+    // Look up the native window rather than only the WebviewWindow wrapper.
+    // On Windows the native window can already be registered while the
+    // webview lookup is briefly unavailable, which previously sent this path
+    // into a duplicate build and surfaced an `already exists` error.
+    if let Some(window) = app.get_window(&label) {
+        reveal_window(&window)?;
+        return Ok(());
     }
 
-    let route = format!("index.html?window=browser-instance&instance={instance_id}");
+    // Embedded instances consume a runtime lease for the native WebView. External
+    // Chrome instances take their lease inside browser.open instead.
+    if !external_chrome {
+        let admission = native_engine_request(
+            runtime.inner().clone(),
+            "browser.runtime.acquire",
+            json!({ "instance_id": instance_id }),
+        )
+        .await?;
+        if admission.get("granted").and_then(Value::as_bool) != Some(true) {
+            let position = admission
+                .get("queue_position")
+                .and_then(Value::as_i64)
+                .unwrap_or(1);
+            let limit = admission
+                .pointer("/capacity/effective_limit")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            return Err(format!(
+                "当前设备安全并发为 {limit}，实例已进入等待队列（第 {position} 位）"
+            ));
+        }
+    }
+
+    let route = if external_chrome {
+        format!("index.html?window=browser-external&instance={instance_id}")
+    } else {
+        format!("index.html?window=browser-instance&instance={instance_id}")
+    };
     let builder = WebviewWindowBuilder::new(&app, &label, WebviewUrl::App(route.into()))
         .title(format!("福宝浏览器实例 · {}", credential.account_name))
-        .inner_size(1080.0, 760.0)
-        .min_inner_size(640.0, 460.0)
+        .inner_size(
+            if external_chrome { 420.0 } else { 1080.0 },
+            if external_chrome { 320.0 } else { 760.0 },
+        )
+        .min_inner_size(
+            if external_chrome { 360.0 } else { 640.0 },
+            if external_chrome { 260.0 } else { 460.0 },
+        )
         .resizable(true)
         .decorations(true)
         .center()
@@ -3251,7 +3498,8 @@ async fn open_browser_instance_window(
     let builder = builder
         .title_bar_style(tauri::TitleBarStyle::Overlay)
         .hidden_title(true)
-        .traffic_light_position(LogicalPosition::new(15.0, 20.0))
+        // Align traffic lights with the compact 28px HTML title row.
+        .traffic_light_position(LogicalPosition::new(14.0, 14.0))
         .background_color(tauri::webview::Color(255, 255, 255, 255));
 
     let window = match builder.build() {
@@ -3264,12 +3512,14 @@ async fn open_browser_instance_window(
                 reveal_window(&window)?;
                 return Ok(());
             }
-            let _ = native_engine_request(
-                runtime.inner().clone(),
-                "browser.runtime.release",
-                json!({ "instance_id": instance_id }),
-            )
-            .await;
+            if !external_chrome {
+                let _ = native_engine_request(
+                    runtime.inner().clone(),
+                    "browser.runtime.release",
+                    json!({ "instance_id": instance_id }),
+                )
+                .await;
+            }
             return Err(format!("打开实例窗口失败：{error}"));
         }
     };
@@ -3285,6 +3535,13 @@ async fn open_browser_instance_window(
         window
             .set_focus()
             .map_err(|error| format!("聚焦实例窗口失败：{error}"))?;
+    }
+
+    // Embedded instance windows own a runtime lease that must be released when
+    // the shell is destroyed. External Chrome keeps its own process lease via
+    // browser.open / browser.close and must not drop that lease with the shell.
+    if external_chrome {
+        return Ok(());
     }
 
     let close_app = app.clone();
@@ -3432,6 +3689,7 @@ pub fn run() {
             open_participation_log,
             open_browser_instance_window,
             browser_instance_window_metadata,
+            launch_external_chrome_instance,
             open_page_window,
             open_live_room,
             close_monitor_log,

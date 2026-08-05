@@ -134,6 +134,9 @@ type BrowserCredential struct {
 	AccountName  string
 	Cookie       string
 	CookieStatus string
+	// Source is the account provenance used by the browser surface router
+	// (manual-import → external Chrome; qr/native → embedded WebView).
+	Source string
 }
 
 type Store struct {
@@ -427,7 +430,20 @@ func (s *Store) ParticipationCredential(accountID string) (BrowserCredential, er
 		AccountName:  firstNonEmpty(account.Nickname, account.Name, account.UserID, "抖音账号"),
 		Cookie:       account.Cookie,
 		CookieStatus: account.CookieStatus,
+		Source:       account.Source,
 	}, nil
+}
+
+// AccountSource returns the persisted provenance for surface routing without
+// exposing Cookie data.
+func (s *Store) AccountSource(accountID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account := s.accounts[strings.TrimSpace(accountID)]
+	if account == nil {
+		return ""
+	}
+	return account.Source
 }
 
 // SetRedPacketAPIEnabled persists the per-account opt-in controlled by the
@@ -595,6 +611,7 @@ func (s *Store) Credential(accountID string) (BrowserCredential, error) {
 		AccountName:  firstNonEmpty(account.Nickname, account.Name, account.UserID, "抖音账号"),
 		Cookie:       account.Cookie,
 		CookieStatus: account.CookieStatus,
+		Source:       account.Source,
 	}, nil
 }
 
@@ -724,7 +741,16 @@ func (s *Store) ReplaceCookie(accountID, rawCookie string) (AccountView, error) 
 // online API validator: a visible login dialog is authoritative evidence that
 // the browser session is invalid, while a loaded authenticated page confirms
 // the same native profile is usable even when an API endpoint is throttled.
+//
+// promoteNativeSurface must only be true for an explicit rebind/scan completion.
+// Card cookie polling must never promote manual-import accounts — that silently
+// switches them onto the embedded WebView path and can freeze macOS when the
+// card and instance window fight over one account data store.
 func (s *Store) SetBrowserLoginState(accountID string, loggedIn bool) (AccountView, error) {
+	return s.SetBrowserLoginStateWithPromotion(accountID, loggedIn, false)
+}
+
+func (s *Store) SetBrowserLoginStateWithPromotion(accountID string, loggedIn, promoteNativeSurface bool) (AccountView, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	account := s.accounts[accountID]
@@ -734,6 +760,9 @@ func (s *Store) SetBrowserLoginState(accountID string, loggedIn bool) (AccountVi
 	if loggedIn {
 		account.CookieStatus = cookieStatusValid
 		account.CookieMessage = "浏览器实例登录状态正常"
+		if promoteNativeSurface && strings.TrimSpace(account.Source) == "manual-import" {
+			account.Source = "native-rebind"
+		}
 	} else {
 		account.CookieStatus = cookieStatusExpired
 		account.CookieMessage = "CK 已失效：浏览器实例未登录"

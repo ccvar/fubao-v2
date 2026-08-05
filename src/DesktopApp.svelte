@@ -202,6 +202,8 @@
     account_name: string;
     status: "online" | "stopped";
     browser: string;
+    /** imported Cookie accounts use external Chromium; QR/native stay embedded */
+    surface?: "embedded" | "external_chrome";
     created_at: string;
     updated_at: string;
     opened_at?: string;
@@ -1062,7 +1064,11 @@
       const timer = window.setTimeout(() => {
         pendingRequests.delete(id);
         reject(new Error("Go 引擎响应超时"));
-      }, method.startsWith("account.import_") ? 60000 : method.startsWith("license.") || method.startsWith("remote_sync.") ? 35000 : 12000);
+      }, method === "browser.open" || method.startsWith("account.import_")
+        ? 90000
+        : method.startsWith("license.") || method.startsWith("remote_sync.")
+          ? 35000
+          : 12000);
       pendingRequests.set(id, {
         resolve: (value) => resolve(value as T),
         reject,
@@ -2420,6 +2426,10 @@
   }
 
   async function openFollowingLive(instance: BrowserInstance) {
+    if (isExternalChromeInstance(instance)) {
+      showToast("导入账号的 Chrome 外窗暂不支持卡片内关注直播列表；请先「重新绑定 CK」使用内嵌实例");
+      return;
+    }
     followingLiveModalInstance = instance;
     // Native child WebViews always sit above HTML, regardless of CSS z-index.
     // Invalidate any pending bounds/show work, then serialize one final hide
@@ -2862,6 +2872,7 @@
 
   async function mountEmbeddedBrowser(instance: BrowserInstance, element: HTMLElement) {
     if (
+      isExternalChromeInstance(instance) ||
       browserIndependentWindowIds.includes(instance.id) ||
       browserWebviewMountingIds.includes(instance.id) ||
       browserWebviewMountingIds.length >= browserWebviewMountConcurrency ||
@@ -2975,6 +2986,17 @@
     await Promise.all(
       browserInstances.map(async (instance) => {
         if (browserLayoutChanging || expectedRevision !== browserLayoutRevision) return;
+        // Imported accounts host Douyin in external Chromium; never attach a
+        // Tauri WebView to those cards.
+        if (isExternalChromeInstance(instance)) {
+          if (
+            browserWebviewMountedIds.includes(instance.id) ||
+            browserWebviewMountingIds.includes(instance.id)
+          ) {
+            await releaseEmbeddedBrowser(instance);
+          }
+          return;
+        }
         if (browserIndependentWindowIds.includes(instance.id)) {
           if (browserWebviewMountedIds.includes(instance.id)) await hideEmbeddedBrowser(instance.id);
           return;
@@ -3227,6 +3249,12 @@
 
   function browserCookieExpired(instance: BrowserInstance) {
     return browserCookieStatus(instance) === "expired";
+  }
+
+  function isExternalChromeInstance(_instance: BrowserInstance) {
+    // Import→system Chrome dual path is disabled. Always use embedded instance
+    // windows (stable load + login) until external Chrome is reworked.
+    return false;
   }
 
   function browserCookieStatus(instance: BrowserInstance) {
@@ -3799,6 +3827,8 @@
     if (accountRole === "participation") {
       const profile = account.participation;
       const binding = profile?.fingerprint_profile_id ? `指纹 ${profile.fingerprint_profile_id}` : "未绑定指纹";
+      // Only a successful native wallet snapshot may leave the “暂无” placeholder.
+      // diamond_status=valid means Go already read live.douyin.com/webcast/wallet/info.
       const diamond = profile?.diamond_status === "valid" && profile.diamond_checked_at
         ? `${profile.diamond_balance ?? 0} 钻`
         : "暂无";
@@ -4431,11 +4461,53 @@
       // active browser instances and immediately after a successful rebind.
       if (items.length === 0 && autoMigrate) {
         await migrateLegacyAccounts(true);
+      } else {
+        // Backfill missing diamond snapshots. Older imports never hit the wallet
+        // API, so the UI stayed on “钻石 暂无” even when the live account had balance.
+        void refreshMissingParticipationWallets(items);
       }
     } catch (error) {
       accountError = error instanceof Error ? error.message : String(error);
     } finally {
       accountsLoading = false;
+    }
+  }
+
+  async function refreshMissingParticipationWallets(items: AccountItem[]) {
+    const missing = items
+      .filter((account) =>
+        (account.roles || []).includes("participation") &&
+        account.participation &&
+        account.participation.diamond_status !== "valid",
+      )
+      .slice(0, 12);
+    for (const account of missing) {
+      try {
+        const balance = await engineRequest<{
+          account_id: string;
+          diamond_balance: number;
+          diamond_x10: number;
+          diamond_checked_at: string;
+          diamond_status: string;
+        }>("account.refresh_wallet", { account_id: account.id });
+        accounts = accounts.map((item) =>
+          item.id !== account.id
+            ? item
+            : {
+                ...item,
+                participation: {
+                  ...item.participation,
+                  enabled: item.participation?.enabled ?? true,
+                  diamond_balance: balance.diamond_balance,
+                  diamond_x10: balance.diamond_x10,
+                  diamond_checked_at: balance.diamond_checked_at,
+                  diamond_status: balance.diamond_status || "valid",
+                },
+              },
+        );
+      } catch {
+        // Leave “暂无” when the wallet probe fails; CK expiry remains separate.
+      }
     }
   }
 
@@ -4455,6 +4527,33 @@
 		}
 		return { ...account, cookie_status: result.status, cookie_message: result.message, cookie_checked_at: result.checked_at };
 	  });
+      if (role === "participation" && result.status === "valid") {
+        try {
+          const balance = await engineRequest<{
+            diamond_balance: number;
+            diamond_x10: number;
+            diamond_checked_at: string;
+            diamond_status: string;
+          }>("account.refresh_wallet", { account_id: accountId });
+          accounts = accounts.map((account) =>
+            account.id !== accountId
+              ? account
+              : {
+                  ...account,
+                  participation: {
+                    ...account.participation,
+                    enabled: account.participation?.enabled ?? true,
+                    diamond_balance: balance.diamond_balance,
+                    diamond_x10: balance.diamond_x10,
+                    diamond_checked_at: balance.diamond_checked_at,
+                    diamond_status: balance.diamond_status || "valid",
+                  },
+                },
+          );
+        } catch {
+          // CK may be valid while wallet is temporarily unavailable.
+        }
+      }
     } catch {
       // A temporary network failure must not be presented as an expired CK.
     } finally {
@@ -4853,7 +4952,15 @@
         return;
       }
       closeInstanceModal();
-      showToast(`已创建 ${created.length} 个独立实例，账号 CK 已共享`);
+      const externalCount = created.filter((item) => isExternalChromeInstance(item)).length;
+      const embeddedCount = created.length - externalCount;
+      if (externalCount > 0 && embeddedCount === 0) {
+        showToast(`已创建 ${externalCount} 个导入账号实例（Chrome 外窗），请点击「打开实例」启动`);
+      } else if (externalCount > 0) {
+        showToast(`已创建 ${created.length} 个实例：${embeddedCount} 个内嵌，${externalCount} 个 Chrome 外窗`);
+      } else {
+        showToast(`已创建 ${created.length} 个独立实例，账号 CK 已共享`);
+      }
     } finally {
       browserCreating = false;
     }
@@ -4913,26 +5020,27 @@
     if (browserOpeningId) return;
     browserOpeningId = instance.id;
     browserError = "";
+    // Reserve the independent-window slot before any await so card remount
+    // cannot attach a second WebView to the same account data store mid-open
+    // (that path freezes the macOS main run loop).
+    const alreadyIndependent = browserIndependentWindowIds.includes(instance.id);
+    if (!alreadyIndependent) {
+      browserIndependentWindowIds = [...browserIndependentWindowIds, instance.id];
+    }
     try {
-      // The card and the framed independent window use the same account-keyed
-      // native data store. Flush the latest login before moving the visible
-      // page surface into its own utility window.
-      if (isTauriDesktop()) {
-        browserCookieCheckedAt.set(instance.id, Date.now());
-        const loginStateUpdated = await invoke<boolean>("sync_browser_account_cookie", {
-          instanceId: instance.id,
-          requireLoggedIn: true,
-        });
-        if (loginStateUpdated) accounts = await engineRequest<AccountItem[]>("account.list");
-      }
+      // Release the card surface first so only the instance window mounts the
+      // account-keyed WebView (same data store must not be double-mounted).
       await releaseEmbeddedBrowser(instance);
-      await invoke("open_browser_instance_window", { instanceId: instance.id });
-      if (!browserIndependentWindowIds.includes(instance.id)) {
-        browserIndependentWindowIds = [...browserIndependentWindowIds, instance.id];
-      }
+      await invoke("open_browser_instance_window", {
+        instanceId: instance.id,
+        surface: "embedded",
+      });
       showToast(`已打开「${instance.account_name}」的独立实例窗口`);
       await loadBrowserInstances();
     } catch (error) {
+      if (!alreadyIndependent) {
+        browserIndependentWindowIds = browserIndependentWindowIds.filter((id) => id !== instance.id);
+      }
       const message = error instanceof Error ? error.message : String(error);
       browserError = message;
       await loadBrowserInstances();
@@ -4970,6 +5078,10 @@
   async function toggleBrowserRedPacketContext(instance: BrowserInstance) {
     if (browserRedPacketPreparingIds.includes(instance.id)) return;
 	if (browserCookieExpired(instance)) return;
+	if (isExternalChromeInstance(instance)) {
+		showToast("导入账号的 Chrome 外窗暂不支持页面抢包；请先对该账号「重新绑定 CK」后再启用");
+		return;
+	}
 	const participationContext = browserParticipationContexts[instance.id];
 	const challengeBlocked = browserParticipationBlocked(instance);
 	const canResumePendingResult = Boolean(
@@ -5042,6 +5154,7 @@
   async function startBrowserRedPacketFromBatch(instance: BrowserInstance) {
 	const context = browserParticipationContexts[instance.id];
 	if (context?.accepting || context?.active || context?.task_active || browserRedPacketContextIds.includes(instance.id)) return false;
+	if (isExternalChromeInstance(instance)) return false;
 	const account = accounts.find((item) => item.id === instance.account_id);
 	if (!account || account.cookie_status === "expired" || !account.roles.includes("participation") || account.participation?.last_red_packet_status === "challenge_blocked") return false;
 	const target = browserRedPacketLiveTarget(instance);
@@ -5994,7 +6107,27 @@
                     data-browser-instance={item.id}
                     use:observeBrowserMount
                   >
-                    {#if item.status === "online"}
+                    {#if isExternalChromeInstance(item)}
+                      {#if item.status === "online"}
+                        <span class="browser-preview-loading external">
+                          <ArrowSquareOut size={18} />
+                          <strong>Chrome 外窗运行中</strong>
+                          <small>导入账号使用系统 Chrome 恢复登录；点右侧打开可聚焦窗口</small>
+                        </span>
+                      {:else if item.runtime_state === "waiting"}
+                        <span class="browser-preview-loading waiting">
+                          <ClockCountdown size={18} />
+                          <strong>等待运行资源</strong>
+                          <small>队列第 {item.queue_position || 1} 位，资源释放后可打开 Chrome</small>
+                        </span>
+                      {:else}
+                        <span class="browser-preview-loading">
+                          <Browser size={18} />
+                          <strong>导入账号 · Chrome 外窗</strong>
+                          <small>点击「打开实例」用系统 Chrome 登录，不在卡片内嵌</small>
+                        </span>
+                      {/if}
+                    {:else if item.status === "online"}
                       <span class="browser-preview-loading external">
                         <ArrowSquareOut size={18} />
                         <strong>正在独立窗口运行</strong>
@@ -6082,7 +6215,7 @@
                         {#if followedLive}<span>{followedLive.total}</span>{/if}
                       </button>
                     {/if}
-                    {#if !cookieExpired}
+                    {#if !cookieExpired && !isExternalChromeInstance(item)}
                       <button
                         class="secondary-button browser-red-packet-button"
                         class:enabled={participationEnabled}
@@ -6113,8 +6246,20 @@
                     </button>
                     <button
                       class="secondary-button browser-open-button"
-                      aria-label={item.status === "online" ? "重新打开实例" : "打开实例"}
-                      data-tooltip={item.status === "online" ? "重新打开实例" : "打开实例"}
+                      aria-label={isExternalChromeInstance(item)
+                        ? item.status === "online"
+                          ? "重新打开 Chrome 实例"
+                          : "打开 Chrome 实例"
+                        : item.status === "online"
+                          ? "重新打开实例"
+                          : "打开实例"}
+                      data-tooltip={isExternalChromeInstance(item)
+                        ? item.status === "online"
+                          ? "重新打开 Chrome 外窗"
+                          : "用系统 Chrome 打开（导入账号）"
+                        : item.status === "online"
+                          ? "重新打开实例"
+                          : "打开实例"}
                       data-tooltip-placement="left"
                       disabled={browserOpeningId === item.id || browserClosingId === item.id}
                       onclick={() => openBrowserInstance(item)}
@@ -6310,7 +6455,7 @@
                   disabled={redPacketBatchAction !== "" || redPacketMonitorSummary.enabled === 0}
                   onclick={() => toggleAllRedPacketMonitors("start")}
                 >
-                  <Play size={12} weight="fill" />{redPacketBatchAction === "start" ? "启动中…" : "全部启动"}
+                  <Play size={12} weight="fill" />{redPacketBatchAction === "start" ? "启动监测中…" : "启动监测"}
                 </button>
               {/if}
               {#if canStopAnyRedPacketMonitor || redPacketBatchAction === "stop"}
@@ -6319,7 +6464,7 @@
                   disabled={redPacketBatchAction !== ""}
                   onclick={() => toggleAllRedPacketMonitors("stop")}
                 >
-                  <Pause size={12} weight="fill" />{redPacketBatchAction === "stop" ? "停止中…" : "全部停止"}
+                  <Pause size={12} weight="fill" />{redPacketBatchAction === "stop" ? "停止监测中…" : "停止监测"}
                 </button>
               {/if}
             </div>

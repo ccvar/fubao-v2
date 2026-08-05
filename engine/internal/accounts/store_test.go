@@ -408,6 +408,39 @@ func TestSetBrowserLoginStatePersistsWithoutLeakingCookie(t *testing.T) {
 	}
 }
 
+func TestSetBrowserLoginStatePromotesImportedSourceOnlyWhenRequested(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, _, err := store.UpsertImportedCookie("sessionid_ss=import-login", "导入用户", "20010", "sec-20010", RoleParticipation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Source != "manual-import" {
+		t.Fatalf("import source = %q", view.Source)
+	}
+	// Card polling / soft login signals must not flip import accounts onto the
+	// embedded surface — that path freezes when card + instance share a store.
+	view, err = store.SetBrowserLoginState(view.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Source != "manual-import" {
+		t.Fatalf("card login state must keep manual-import, got %q", view.Source)
+	}
+	view, err = store.SetBrowserLoginStateWithPromotion(view.ID, true, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.Source != "native-rebind" {
+		t.Fatalf("expected native-rebind after explicit rebind promotion, got %q", view.Source)
+	}
+	if view.CookieStatus != cookieStatusValid {
+		t.Fatalf("expected valid cookie after native login, got %+v", view)
+	}
+}
+
 func TestUpsertAuthenticatedCookieCreatesAndDeduplicates(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {
