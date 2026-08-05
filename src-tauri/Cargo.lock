@@ -884,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "fubao-desktop"
-version = "0.1.36"
+version = "0.1.37"
 dependencies = [
  "cookie",
  "futures-util",
@@ -4154,7 +4154,7 @@ dependencies = [
 
 [[package]]
 name = "tracing-core"
-version = "0.1.36"
+version = "0.1.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [

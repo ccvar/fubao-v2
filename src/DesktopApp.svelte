@@ -1480,9 +1480,9 @@
 		const nextMonitoringSettings = {
 			global_request_interval_ms: Math.max(40, Math.min(2000, normalizedParticipationSetting(monitoringSettings.global_request_interval_ms, 2000))),
 			account_request_interval_ms: Math.max(250, Math.min(5000, normalizedParticipationSetting(monitoringSettings.account_request_interval_ms, 5000))),
-			global_concurrency: Math.max(1, Math.min(128, normalizedParticipationSetting(monitoringSettings.global_concurrency, 128))),
+			global_concurrency: Math.max(1, Math.min(512, normalizedParticipationSetting(monitoringSettings.global_concurrency, 512))),
 			account_concurrency: Math.max(1, Math.min(8, normalizedParticipationSetting(monitoringSettings.account_concurrency, 8))),
-			probe_concurrency: Math.max(8, Math.min(256, normalizedParticipationSetting(monitoringSettings.probe_concurrency, 256))),
+			probe_concurrency: Math.max(8, Math.min(1024, normalizedParticipationSetting(monitoringSettings.probe_concurrency, 1024))),
 		};
 		if (!isTauriDesktop()) {
 			monitoringSettings = nextMonitoringSettings;
@@ -7174,7 +7174,7 @@
           </label>
           <label class="participation-setting-row">
             <span><strong>全局慢请求并发</strong><small>已按间隔发出的请求中，可同时等待响应的最大数量</small></span>
-            <span class="number-field"><input type="number" min="1" max="128" step="1" bind:value={monitoringSettings.global_concurrency} /><em>条</em></span>
+            <span class="number-field"><input type="number" min="1" max="512" step="1" bind:value={monitoringSettings.global_concurrency} /><em>条</em></span>
           </label>
           <label class="participation-setting-row">
             <span><strong>单账号慢请求并发</strong><small>每个监测账号可同时等待响应的最大请求数量</small></span>
@@ -7182,7 +7182,7 @@
           </label>
           <label class="participation-setting-row">
             <span><strong>原生探测窗口</strong><small>同时进入直播状态探测与红包查询流水线的任务上限</small></span>
-            <span class="number-field"><input type="number" min="8" max="256" step="8" bind:value={monitoringSettings.probe_concurrency} /><em>个</em></span>
+            <span class="number-field"><input type="number" min="8" max="1024" step="8" bind:value={monitoringSettings.probe_concurrency} /><em>个</em></span>
           </label>
         </div>
           {/if}

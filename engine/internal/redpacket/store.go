@@ -30,7 +30,12 @@ const (
 	livePacketInterval   = 15 * time.Second
 	activePacketInterval = 5 * time.Second
 	defaultProbeSlots    = 64
-	defaultBulkWorkers   = 64
+	// Soft upper bounds for user-facing monitoring throughput controls.
+	// Defaults stay conservative; these only stop unsafe extreme values.
+	maxGlobalConcurrency  = 512
+	maxAccountConcurrency = 8
+	maxProbeConcurrency   = 1024
+	defaultBulkWorkers    = 64
 	// A high-priority source may fill a small burst of ready slots, after
 	// which a ready lower-priority source gets a turn. This preserves the
 	// source order without starving imported or center-library rooms while a
@@ -357,6 +362,7 @@ type file struct {
 
 type Store struct {
 	mu                     sync.Mutex
+	saveMu                 sync.Mutex // serializes marshal+disk write outside s.mu
 	path                   string
 	monitors               map[string]*Monitor
 	events                 map[string]*Event
@@ -377,6 +383,9 @@ type Store struct {
 	persistDirty           bool
 	persistScheduled       bool
 	probeSlots             chan struct{}
+	// monitorSummary is rebuilt on list_page under a short lock (no JSON/IO).
+	// Combined with lock-free save, UI stays responsive at 10万 monitors.
+	monitorSummary MonitorSummary
 }
 
 type MonitorSummary struct {
@@ -431,7 +440,38 @@ func NewStore(dataDir string) (*Store, error) {
 	if err := s.load(); err != nil {
 		return nil, err
 	}
+	s.resetMonitorSummaryLocked()
 	return s, nil
+}
+
+func (s *Store) resetMonitorSummaryLocked() {
+	s.monitorSummary = MonitorSummary{
+		Total:        len(s.monitors),
+		Enabled:      0,
+		Running:      0,
+		PendingFirst: 0,
+		FirstChecked: 0,
+		LiveRunning:  0,
+		Errors:       0,
+	}
+	for _, monitor := range s.monitors {
+		if monitor.Enabled {
+			s.monitorSummary.Enabled++
+		}
+		if monitor.Status == "running" {
+			s.monitorSummary.Running++
+			if monitor.ConnectionStatus == "connecting" {
+				s.monitorSummary.PendingFirst++
+			} else {
+				s.monitorSummary.FirstChecked++
+			}
+			if monitor.LiveStatus == "live" {
+				s.monitorSummary.LiveRunning++
+			}
+		} else if monitor.Status == "error" || monitor.ConnectionStatus == "error" {
+			s.monitorSummary.Errors++
+		}
+	}
 }
 
 // SetRequestRecorder attaches the account-store hook used to keep the safe
@@ -580,12 +620,19 @@ func (s *Store) load() error {
 		migrated = true
 	}
 	if migrated {
-		return s.saveLocked()
+		// load runs before the store is shared; still take s.mu so saveLocked's
+		// unlock/relock contract (caller holds the lock) is satisfied.
+		s.mu.Lock()
+		err := s.saveLocked()
+		s.mu.Unlock()
+		return err
 	}
 	return nil
 }
 
 func (s *Store) saveLocked() error {
+	// Snapshot under lock for consistency, then marshal/write outside lock to
+	// avoid blocking probe state updates, list_page, and UI for minutes.
 	monitors := make([]*Monitor, 0, len(s.monitors))
 	for _, item := range s.monitors {
 		copy := *item
@@ -642,27 +689,45 @@ func (s *Store) saveLocked() error {
 	if len(activities) > 100 {
 		activities = activities[:100]
 	}
+	// Capture settings/path under lock; marshal and disk I/O must not hold s.mu
+	// or Windows UI/RPC blocks for the whole multi-MB write.
+	settings := s.settings
+	monitoringSettings := s.monitoringSettings
+	path := s.path
+	s.mu.Unlock()
+
+	s.saveMu.Lock()
 	payload, err := json.Marshal(file{
 		Version: storeVersion, Monitors: monitors, Events: events, NativeParticipation: nativeParticipation, ParticipationRecords: participations,
-		ParticipationSettings: s.settings, MonitoringSettings: s.monitoringSettings,
+		ParticipationSettings: settings, MonitoringSettings: monitoringSettings,
 		ParticipationTasks: participationTasks, ParticipationTraces: participationTraces,
 		ParticipationSchedules: participationSchedules, Activities: activities,
 	})
 	if err != nil {
+		s.saveMu.Unlock()
+		s.mu.Lock()
 		return fmt.Errorf("序列化红包监测数据失败: %w", err)
 	}
-	tmp := s.path + ".tmp"
+	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, payload, 0o600); err != nil {
+		s.saveMu.Unlock()
+		s.mu.Lock()
 		return fmt.Errorf("写入红包监测临时文件失败: %w", err)
 	}
 	if err := os.Chmod(tmp, 0o600); err != nil {
 		_ = os.Remove(tmp)
+		s.saveMu.Unlock()
+		s.mu.Lock()
 		return err
 	}
-	if err := os.Rename(tmp, s.path); err != nil {
+	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
+		s.saveMu.Unlock()
+		s.mu.Lock()
 		return fmt.Errorf("保存红包监测数据失败: %w", err)
 	}
+	s.saveMu.Unlock()
+	s.mu.Lock()
 	return nil
 }
 
@@ -889,15 +954,17 @@ func normalizeMonitoringSettings(settings MonitoringSettings) MonitoringSettings
 	if settings.GlobalConcurrency <= 0 {
 		settings.GlobalConcurrency = defaultGlobalConcurrency
 	}
-	settings.GlobalConcurrency = minInt(settings.GlobalConcurrency, 128)
+	// Soft safety caps for high-volume room monitoring. Higher values increase
+	// in-flight HTTP/probe pressure without shortening request intervals.
+	settings.GlobalConcurrency = minInt(settings.GlobalConcurrency, maxGlobalConcurrency)
 	if settings.AccountConcurrency <= 0 {
 		settings.AccountConcurrency = defaultAccountConcurrency
 	}
-	settings.AccountConcurrency = minInt(settings.AccountConcurrency, 8)
+	settings.AccountConcurrency = minInt(settings.AccountConcurrency, maxAccountConcurrency)
 	if settings.ProbeConcurrency <= 0 {
 		settings.ProbeConcurrency = defaultProbeSlots
 	}
-	settings.ProbeConcurrency = maxInt(8, minInt(settings.ProbeConcurrency, 256))
+	settings.ProbeConcurrency = maxInt(8, minInt(settings.ProbeConcurrency, maxProbeConcurrency))
 	return settings
 }
 
@@ -1744,26 +1811,17 @@ func (s *Store) PageForRooms(roomIDs []string) MonitorPage {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	page := MonitorPage{Items: make([]Monitor, 0, len(wanted))}
+
+	// Rebuild summary under the short list lock. This is O(N) integer checks only
+	// (no JSON/IO). Combined with lock-free save, list_page stays responsive even
+	// at 10万 monitors; the previous pain was save holding the same lock for seconds.
+	s.resetMonitorSummaryLocked()
+	page := MonitorPage{
+		Items:   make([]Monitor, 0, len(wanted)),
+		Summary: s.monitorSummary,
+	}
+
 	for id, monitor := range s.monitors {
-		page.Summary.Total++
-		if monitor.Enabled {
-			page.Summary.Enabled++
-		}
-		if monitor.Status == "running" {
-			page.Summary.Running++
-			if monitor.ConnectionStatus == "connecting" {
-				page.Summary.PendingFirst++
-			} else {
-				page.Summary.FirstChecked++
-			}
-			if monitor.LiveStatus == "live" {
-				page.Summary.LiveRunning++
-			}
-		}
-		if monitor.Status == "error" || monitor.ConnectionStatus == "error" {
-			page.Summary.Errors++
-		}
 		if _, ok := wanted[id]; ok {
 			page.Items = append(page.Items, *monitor)
 		}
@@ -1974,6 +2032,7 @@ func (s *Store) StartAllPool(credentials []AccountCredential) (PoolStartResult, 
 	}
 	prioritizeBulkMonitorIDs(ids, s.monitors)
 	s.scheduleSaveLocked()
+	s.resetMonitorSummaryLocked()
 	s.mu.Unlock()
 	go s.runBulkScheduler(ctx, ids, pool)
 	return PoolStartResult{Started: len(ids), AccountCount: len(pool.ordered), Assignments: pool.summary()}, nil

@@ -355,15 +355,15 @@ func TestMonitoringSettingsClampUnsafeValues(t *testing.T) {
 	settings, err := store.SetMonitoringSettings(MonitoringSettings{
 		GlobalRequestIntervalMS:  1,
 		AccountRequestIntervalMS: 1,
-		GlobalConcurrency:        999,
+		GlobalConcurrency:        9999,
 		AccountConcurrency:       999,
-		ProbeConcurrency:         999,
+		ProbeConcurrency:         9999,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if settings.GlobalRequestIntervalMS != 40 || settings.AccountRequestIntervalMS != 250 ||
-		settings.GlobalConcurrency != 128 || settings.AccountConcurrency != 8 || settings.ProbeConcurrency != 256 {
+		settings.GlobalConcurrency != maxGlobalConcurrency || settings.AccountConcurrency != maxAccountConcurrency || settings.ProbeConcurrency != maxProbeConcurrency {
 		t.Fatalf("unsafe settings were not clamped: %+v", settings)
 	}
 }
