@@ -3612,6 +3612,7 @@
   async function importAccountSources(sources: Array<{ name: string; content: string }>, role: AccountRole) {
     if (accountImportBusy || sources.length === 0) return;
     accountImportBusy = true;
+    let progress = 0;
     try {
       const result = await engineRequest<{
         imported: number;
@@ -3619,6 +3620,7 @@
         failed: number;
         invalid_sources: number;
         total: number;
+        progress?: number;
       }>("account.import_cookies", {
         role,
         sources,

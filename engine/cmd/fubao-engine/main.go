@@ -415,7 +415,8 @@ func main() {
 			mergedCount := 0
 			failedCount := 0
 			identityCtx, identityCancel := context.WithTimeout(context.Background(), 12*time.Second)
-			for _, record := range records {
+			total := len(records)
+			for i, record := range records {
 				// Single Cookie/browser exports usually have no account metadata.
 				// Resolve a friendly identity for small explicit imports, while a
 				// large legacy batch remains fast and keeps its file metadata.
@@ -436,18 +437,39 @@ func main() {
 				} else {
 					mergedCount++
 				}
+				// Report progress
+				progress := (i + 1) * 100 / total
+				_ = encoder.Encode(response{
+					Version: protocolVersion,
+					ID:      req.ID,
+					OK:      true,
+					Result: map[string]interface{}{
+						"imported":        createdCount,
+						"merged":          mergedCount,
+						"failed":          failedCount,
+						"progress":        progress,
+						"invalid_sources": invalidSources,
+						"total":           len(accountStore.List(params.Role)),
+					},
+				})
 			}
 			identityCancel()
 			if params.Role == accounts.RoleMonitoring && redPacketStoreErr == nil {
 				refreshRunningMonitoringPool(accountStore, redPacketStore)
 			}
-			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]int{
-				"imported":        createdCount,
-				"merged":          mergedCount,
-				"failed":          failedCount,
-				"invalid_sources": invalidSources,
-				"total":           len(accountStore.List(params.Role)),
-			}})
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result: map[string]interface{}{
+					"imported":        createdCount,
+					"merged":          mergedCount,
+					"failed":          failedCount,
+					"progress":        100,
+					"invalid_sources": invalidSources,
+					"total":           len(accountStore.List(params.Role)),
+				},
+			})
 		case "account.add_role":
 			if accountStoreErr != nil {
 				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
