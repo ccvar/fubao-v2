@@ -698,12 +698,13 @@ fn rebind_data_store_identifier(account_id: &str) -> [u8; 16] {
 }
 
 fn inject_douyin_cookie(webview: &tauri::Webview, raw_cookie: &str) -> Result<(), String> {
-    // WKHTTPCookieStore accepts domain without a leading dot and treats it as
-    // covering subdomains. Also seed www/live host cookies: some imported
-    // browser exports were host-scoped and a parent-only write is not enough
-    // for Douyin's first-party SPA requests.
+    // Prefer parent domain first. WebView2 is picky about host-only scopes and
+    // rejecting one cookie must not abort the whole jar write — otherwise new
+    // Windows instance cards stick on “真实浏览器暂不可用”.
     const DOMAINS: [&str; 3] = ["douyin.com", "www.douyin.com", "live.douyin.com"];
     let max_age = cookie::time::Duration::days(180);
+    let mut wrote_any = false;
+    let mut last_error = String::new();
     for item in raw_cookie.split(';') {
         let Some((name, value)) = item.trim().split_once('=') else {
             continue;
@@ -715,30 +716,54 @@ fn inject_douyin_cookie(webview: &tauri::Webview, raw_cookie: &str) -> Result<()
         }
         let is_login = DOUYIN_LOGIN_COOKIE_NAMES.contains(&name);
         for domain in DOMAINS {
-            // Login cookies must be HttpOnly so they match Douyin's real browser
-            // jar. First-party navigations use SameSite=Lax (more reliable than
-            // None on WKWebView, which does not persist a SameSite=None flag).
-            let mut builder = Cookie::build((name.to_string(), value.to_string()))
-                .domain(domain)
-                .path("/")
-                .secure(true)
-                .same_site(cookie::SameSite::Lax)
-                .max_age(max_age);
-            if is_login {
-                builder = builder.http_only(true);
+            // Try a conservative profile first (Lax + optional HttpOnly), then
+            // fall back without HttpOnly — WebView2 rejects some HttpOnly writes
+            // before the first first-party navigation.
+            let attempts = [
+                (cookie::SameSite::Lax, is_login),
+                (cookie::SameSite::Lax, false),
+                (cookie::SameSite::None, false),
+            ];
+            let mut domain_ok = false;
+            for (same_site, http_only) in attempts {
+                let mut builder = Cookie::build((name.to_string(), value.to_string()))
+                    .domain(domain)
+                    .path("/")
+                    .secure(true)
+                    .same_site(same_site)
+                    .max_age(max_age);
+                if http_only {
+                    builder = builder.http_only(true);
+                }
+                match webview.set_cookie(builder.build()) {
+                    Ok(()) => {
+                        wrote_any = true;
+                        domain_ok = true;
+                        break;
+                    }
+                    Err(error) => last_error = error.to_string(),
+                }
             }
-            webview
-                .set_cookie(builder.build())
-                .map_err(|error| format!("同步账号 Cookie 失败：{error}"))?;
+            // Parent domain is enough for most sessions; keep trying siblings.
+            if domain == "douyin.com" && domain_ok {
+                break;
+            }
         }
+    }
+    if !wrote_any {
+        return Err(if last_error.is_empty() {
+            "同步账号 Cookie 失败：没有可写入的 Cookie".into()
+        } else {
+            format!("同步账号 Cookie 失败：{last_error}")
+        });
     }
     Ok(())
 }
 
 /// Seed the account WebView so Douyin's SPA boots with the store Cookie.
-/// Keep this to at most one confirm + one optional reload. Multiple full
-/// navigations used to finish after the frontend already hid its loading
-/// state, leaving a long blank window before the final SPA paint.
+/// On Windows WebView2, cookie-manager confirmation is asynchronous and often
+/// incomplete before the first navigation — never fail the whole mount only
+/// because confirmation lagged. Navigate first-class, re-inject after load.
 async fn bootstrap_browser_account_session(
     webview: &tauri::Webview,
     runtime: &EngineRuntime,
@@ -749,18 +774,25 @@ async fn bootstrap_browser_account_session(
     if login_cookie_values(raw_cookie).is_empty() {
         return Err("账号 Cookie 缺少登录凭据，请重新扫码登录".into());
     }
-    // Write cookies first, then open Douyin once. Confirm after a short bind
-    // window; only reload when the post-nav jar no longer matches.
-    inject_douyin_cookie_and_confirm(webview, raw_cookie)
-        .await
-        .map_err(|error| format!("同步账号 Cookie 失败：{error}"))?;
+    // Best-effort pre-nav write. Confirmation may fail on a fresh WebView2
+    // profile; still open Douyin so the card is not stuck unavailable.
+    if let Err(error) = inject_douyin_cookie_and_confirm(webview, raw_cookie).await {
+        if cfg!(debug_assertions) {
+            eprintln!(
+                "[embedded-browser] pre-nav cookie confirm soft-failed instance={instance_id}: {error}"
+            );
+        }
+        let _ = inject_douyin_cookie(webview, raw_cookie);
+    }
     if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
         injected.insert(instance_id.to_string(), Instant::now());
     }
     webview
         .navigate(target_url.clone())
         .map_err(|error| format!("加载抖音页面失败：{error}"))?;
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // WebView2 needs longer for CookieManager propagation after first paint.
+    let settle_ms = if cfg!(target_os = "windows") { 900 } else { 500 };
+    tokio::time::sleep(Duration::from_millis(settle_ms)).await;
     match inject_douyin_cookie_and_confirm(webview, raw_cookie).await {
         Ok(()) => {
             if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
@@ -773,15 +805,13 @@ async fn bootstrap_browser_account_session(
                     "[embedded-browser] post-nav cookie confirm retry instance={instance_id}: {error}"
                 );
             }
-            inject_douyin_cookie(webview, raw_cookie)?;
-            tokio::time::sleep(Duration::from_millis(120)).await;
+            let _ = inject_douyin_cookie(webview, raw_cookie);
+            tokio::time::sleep(Duration::from_millis(200)).await;
             if inject_douyin_cookie_and_confirm(webview, raw_cookie)
                 .await
                 .is_ok()
             {
-                webview
-                    .navigate(target_url)
-                    .map_err(|error| format!("重新加载已注入登录态的抖音页面失败：{error}"))?;
+                let _ = webview.navigate(target_url);
                 tokio::time::sleep(Duration::from_millis(350)).await;
             }
             if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
@@ -810,6 +840,24 @@ fn login_cookie_snapshot_matches(expected: &str, actual: &str) -> bool {
             .all(|(name, value)| actual.get(name).is_some_and(|current| current == value))
 }
 
+fn login_cookie_snapshot_usable(expected: &str, actual: &str) -> bool {
+    if login_cookie_snapshot_matches(expected, actual) {
+        return true;
+    }
+    // WebView2 often surfaces only a subset of login cookies immediately after
+    // set_cookie. One matching primary login cookie is enough to proceed.
+    let expected = login_cookie_values(expected);
+    let actual = login_cookie_values(actual);
+    if actual.is_empty() {
+        return false;
+    }
+    expected.iter().any(|(name, value)| {
+        actual
+            .get(name)
+            .is_some_and(|current| current == value && !current.trim().is_empty())
+    })
+}
+
 async fn inject_douyin_cookie_and_confirm(
     webview: &tauri::Webview,
     raw_cookie: &str,
@@ -817,17 +865,24 @@ async fn inject_douyin_cookie_and_confirm(
     if login_cookie_values(raw_cookie).is_empty() {
         return Err("账号 Cookie 缺少登录凭据，请重新扫码登录".into());
     }
+    let attempts = if cfg!(target_os = "windows") { 8 } else { 6 };
     let mut last_error = "等待浏览器接收账号 Cookie".to_string();
-    for attempt in 0..6 {
-        inject_douyin_cookie(webview, raw_cookie)?;
-        tokio::time::sleep(Duration::from_millis(160)).await;
+    for attempt in 0..attempts {
+        let _ = inject_douyin_cookie(webview, raw_cookie);
+        let wait_ms = if cfg!(target_os = "windows") { 220 } else { 160 };
+        tokio::time::sleep(Duration::from_millis(wait_ms)).await;
         match read_douyin_cookie(webview) {
-            Ok(actual) if login_cookie_snapshot_matches(raw_cookie, &actual) => return Ok(()),
+            Ok(actual) if login_cookie_snapshot_usable(raw_cookie, &actual) => return Ok(()),
             Ok(_) => last_error = "浏览器尚未写入完整登录 Cookie".into(),
             Err(error) => last_error = error,
         }
-        if attempt < 5 {
-            tokio::time::sleep(Duration::from_millis(140)).await;
+        if attempt + 1 < attempts {
+            tokio::time::sleep(Duration::from_millis(if cfg!(target_os = "windows") {
+                180
+            } else {
+                140
+            }))
+            .await;
         }
     }
     Err(format!("同步账号 Cookie 失败：{last_error}"))
@@ -2612,18 +2667,45 @@ async fn ensure_browser_webview(
         }
     };
 
+    // WebView2 can stall cookie/network init when created fully off-screen.
+    // Keep it hidden but on a valid on-screen geometry for Windows profiles.
+    #[cfg(target_os = "windows")]
+    {
+        let safe = BrowserBounds {
+            x: bounds.x.max(0.0),
+            y: bounds.y.max(0.0),
+            width: bounds.width.max(120.0),
+            height: bounds.height.max(90.0),
+        };
+        apply_browser_geometry(&webview, &safe)?;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        apply_browser_geometry(&webview, &bounds)?;
+    }
     webview
         .hide()
         .map_err(|error| format!("隐藏待加载浏览器失败：{error}"))?;
-    apply_browser_geometry(&webview, &bounds)?;
-    bootstrap_browser_account_session(
+    if let Err(error) = bootstrap_browser_account_session(
         &webview,
         runtime.as_ref(),
         instance_id,
         &credential.cookie,
         restore_url,
     )
-    .await?;
+    .await
+    {
+        // Still expose the native surface so the card is not permanently dead.
+        // Cookie/login can recover on the next sync or user rebind.
+        if cfg!(debug_assertions) {
+            eprintln!(
+                "[embedded-browser] bootstrap soft-failed instance={instance_id}: {error}"
+            );
+        }
+        if let Ok(url) = restore_url_text.parse::<Url>() {
+            let _ = webview.navigate(url);
+        }
+    }
     bootstrap_active.store(false, Ordering::SeqCst);
     // Reveal only after bootstrap is finished. A brief settle covers the final
     // SPA paint without the previous multi-second blank after the HTML loader.
