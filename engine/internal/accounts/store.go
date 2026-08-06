@@ -9,9 +9,11 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // storeVersion 3 adds the opt-in API red-packet participation state. Existing
@@ -46,26 +48,41 @@ type MonitoringProfile struct {
 }
 
 type ParticipationProfile struct {
-	Enabled                bool     `json:"enabled"`
-	RedPacketAPIEnabled    bool     `json:"red_packet_api_enabled"`
-	RedPacketCooldownUntil string   `json:"red_packet_cooldown_until,omitempty"`
-	LastRedPacketStatus    string   `json:"last_red_packet_status,omitempty"`
-	LastRedPacketMessage   string   `json:"last_red_packet_message,omitempty"`
-	JoinCount              int      `json:"join_count"`
-	WinCount               int      `json:"win_count"`
-	LastJoinAt             string   `json:"last_join_at,omitempty"`
-	LastError              string   `json:"last_error,omitempty"`
-	ProxyID                int      `json:"proxy_id"`
-	FingerprintProfileID   int      `json:"fingerprint_profile_id"`
-	Tags                   []string `json:"tags,omitempty"`
-	GroupID                string   `json:"group_id,omitempty"`
-	DiamondBalance         int64    `json:"diamond_balance"`
-	DiamondX10             int64    `json:"diamond_x10"`
-	DiamondCheckedAt       string   `json:"diamond_checked_at,omitempty"`
-	DiamondStatus          string   `json:"diamond_status,omitempty"`
+	Enabled                bool   `json:"enabled"`
+	RedPacketAPIEnabled    bool   `json:"red_packet_api_enabled"`
+	RedPacketCooldownUntil string `json:"red_packet_cooldown_until,omitempty"`
+	LastRedPacketStatus    string `json:"last_red_packet_status,omitempty"`
+	LastRedPacketMessage   string `json:"last_red_packet_message,omitempty"`
+	JoinCount              int    `json:"join_count"`
+	WinCount               int    `json:"win_count"`
+	// TodayStatDate is the local calendar day (YYYY-MM-DD) for the today_* counters.
+	TodayStatDate        string   `json:"today_stat_date,omitempty"`
+	TodayJoinCount       int      `json:"today_join_count"`
+	TodayWinCount        int      `json:"today_win_count"`
+	TodayWinDiamonds     float64  `json:"today_win_diamonds"`
+	LastJoinAt           string   `json:"last_join_at,omitempty"`
+	LastError            string   `json:"last_error,omitempty"`
+	ProxyID              int      `json:"proxy_id"`
+	FingerprintProfileID int      `json:"fingerprint_profile_id"`
+	Tags                 []string `json:"tags,omitempty"`
+	GroupID              string   `json:"group_id,omitempty"`
+	DiamondBalance       int64    `json:"diamond_balance"`
+	DiamondX10           int64    `json:"diamond_x10"`
+	DiamondCheckedAt     string   `json:"diamond_checked_at,omitempty"`
+	DiamondStatus        string   `json:"diamond_status,omitempty"`
 }
 
-const redPacketStatusChallengeBlocked = "challenge_blocked"
+const (
+	redPacketStatusChallengeBlocked = "challenge_blocked"
+	redPacketStatusRiskControl      = "risk_control"
+)
+
+// activeRedPacketCooldown reports whether a persisted cooldown expiry is still
+// in the future. Risk-control windows must survive task stops and API toggles.
+func activeRedPacketCooldown(until string, now time.Time) bool {
+	parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(until))
+	return err == nil && now.Before(parsed)
+}
 
 type ParticipationGroup struct {
 	ID        string `json:"id"`
@@ -87,21 +104,27 @@ type RedPacketParticipationCredential struct {
 }
 
 type Account struct {
-	ID            string                `json:"id"`
-	Name          string                `json:"name"`
-	Nickname      string                `json:"nickname,omitempty"`
-	UserID        string                `json:"user_id,omitempty"`
-	SecUID        string                `json:"sec_uid,omitempty"`
-	Cookie        string                `json:"cookie"`
-	CookieStatus  string                `json:"cookie_status,omitempty"`
-	CookieMessage string                `json:"cookie_message,omitempty"`
-	CookieChecked string                `json:"cookie_checked_at,omitempty"`
-	Source        string                `json:"source,omitempty"`
-	Roles         []Role                `json:"roles"`
-	Monitoring    *MonitoringProfile    `json:"monitoring,omitempty"`
-	Participation *ParticipationProfile `json:"participation,omitempty"`
-	CreatedAt     string                `json:"created_at"`
-	UpdatedAt     string                `json:"updated_at"`
+	ID            string `json:"id"`
+	Name          string `json:"name"`
+	Nickname      string `json:"nickname,omitempty"`
+	UserID        string `json:"user_id,omitempty"`
+	SecUID        string `json:"sec_uid,omitempty"`
+	Cookie        string `json:"cookie"`
+	CookieStatus  string `json:"cookie_status,omitempty"`
+	CookieMessage string `json:"cookie_message,omitempty"`
+	CookieChecked string `json:"cookie_checked_at,omitempty"`
+	Source        string `json:"source,omitempty"`
+	// BrowserProfileKey selects the native WebView data-store identity used by
+	// browser instances. Scan-login sets this to "create-{session}" so the
+	// instance reuses the already-authenticated create WebView store instead
+	// of an empty account-id store that cannot re-inject a live session.
+	// Empty means "use account id" (import / rebind default).
+	BrowserProfileKey string                `json:"browser_profile_key,omitempty"`
+	Roles             []Role                `json:"roles"`
+	Monitoring        *MonitoringProfile    `json:"monitoring,omitempty"`
+	Participation     *ParticipationProfile `json:"participation,omitempty"`
+	CreatedAt         string                `json:"created_at"`
+	UpdatedAt         string                `json:"updated_at"`
 }
 
 type accountFile struct {
@@ -142,6 +165,9 @@ type BrowserCredential struct {
 	// Source is the account provenance used by the browser surface router
 	// (manual-import → external Chrome; qr/native → embedded WebView).
 	Source string
+	// BrowserProfileKey is the native WebView data-store key for this account
+	// (see Account.BrowserProfileKey). Empty means account id.
+	BrowserProfileKey string
 }
 
 type Store struct {
@@ -334,10 +360,16 @@ func (s *Store) saveLocked() error {
 func (s *Store) List(role Role) []AccountView {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
 	items := make([]AccountView, 0, len(s.accounts))
 	for _, account := range s.accounts {
 		if role != "" && !hasRole(account, role) {
 			continue
+		}
+		// Roll local-day counters before exposing the row so midnight never leaves
+		// yesterday's "今日" totals on the participation account table.
+		if account.Participation != nil {
+			rollParticipationDayLocked(account.Participation, now)
 		}
 		items = append(items, safeViewForRole(account, role))
 	}
@@ -431,12 +463,30 @@ func (s *Store) ParticipationCredential(accountID string) (BrowserCredential, er
 		return BrowserCredential{}, errors.New("账号没有可用 Cookie，请重新登录或导入")
 	}
 	return BrowserCredential{
-		AccountID:    account.ID,
-		AccountName:  firstNonEmpty(account.Nickname, account.Name, account.UserID, "抖音账号"),
-		Cookie:       account.Cookie,
-		CookieStatus: account.CookieStatus,
-		Source:       account.Source,
+		AccountID:         account.ID,
+		AccountName:       firstNonEmpty(account.Nickname, account.Name, account.UserID, "抖音账号"),
+		Cookie:            account.Cookie,
+		CookieStatus:      account.CookieStatus,
+		Source:            account.Source,
+		BrowserProfileKey: strings.TrimSpace(account.BrowserProfileKey),
 	}, nil
+}
+
+// SetBrowserProfileKey persists the native WebView data-store key for an
+// account. Pass empty to fall back to the account id.
+func (s *Store) SetBrowserProfileKey(accountID, profileKey string) (AccountView, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account := s.accounts[strings.TrimSpace(accountID)]
+	if account == nil {
+		return AccountView{}, errors.New("账号不存在")
+	}
+	account.BrowserProfileKey = strings.TrimSpace(profileKey)
+	account.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+	if err := s.saveLocked(); err != nil {
+		return AccountView{}, err
+	}
+	return safeView(account), nil
 }
 
 // AccountSource returns the persisted provenance for surface routing without
@@ -465,16 +515,28 @@ func (s *Store) SetRedPacketAPIEnabled(accountID string, enabled bool) (AccountV
 	}
 	previousProfile := *account.Participation
 	previousUpdatedAt := account.UpdatedAt
+	now := time.Now()
+	cooling := activeRedPacketCooldown(account.Participation.RedPacketCooldownUntil, now)
+	riskCooling := cooling && account.Participation.LastRedPacketStatus == redPacketStatusRiskControl
 	account.Participation.RedPacketAPIEnabled = enabled
 	if !enabled {
-		account.Participation.RedPacketCooldownUntil = ""
-		account.Participation.LastRedPacketStatus = "disabled"
-		account.Participation.LastRedPacketMessage = "已关闭红包接口参与"
-	} else {
+		// Closing the participation switch (manual stop or auto task end) must
+		// not erase an active risk-control cooldown; the UI badge and skip
+		// logic depend on red_packet_cooldown_until until it expires.
+		if !cooling {
+			account.Participation.RedPacketCooldownUntil = ""
+		}
+		if riskCooling {
+			// Keep status/message so rows still show 风控冷却 + countdown.
+		} else {
+			account.Participation.LastRedPacketStatus = "disabled"
+			account.Participation.LastRedPacketMessage = "已关闭红包接口参与"
+		}
+	} else if !riskCooling {
 		account.Participation.LastRedPacketStatus = "ready"
 		account.Participation.LastRedPacketMessage = "已启用红包接口参与"
 	}
-	account.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+	account.UpdatedAt = now.Format(time.RFC3339Nano)
 	if err := s.saveLocked(); err != nil {
 		*account.Participation = previousProfile
 		account.UpdatedAt = previousUpdatedAt
@@ -519,6 +581,138 @@ func (s *Store) RedPacketParticipationCredentials(now time.Time) []RedPacketPart
 	return items
 }
 
+// ParticipationStatsPatch is applied when repairing account-row counters from
+// the durable red-packet participation record store.
+type ParticipationStatsPatch struct {
+	AccountID        string
+	JoinCount        int
+	WinCount         int
+	TodayJoinCount   int
+	TodayWinCount    int
+	TodayWinDiamonds float64
+	TodayStatDate    string
+}
+
+// ReconcileParticipationStatsFromRecords rewrites join/win and today_* fields
+// from durable successful-join records. Risk-control / failed / network-error
+// rows must never contribute. Profile counters are replaced by the record
+// rollup so inflated legacy totals cannot keep showing as “参与成功”.
+func (s *Store) ReconcileParticipationStatsFromRecords(patches []ParticipationStatsPatch, now time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if now.IsZero() {
+		now = time.Now()
+	}
+	today := now.Format("2006-01-02")
+	changed := 0
+	seen := map[string]struct{}{}
+	for _, patch := range patches {
+		accountID := strings.TrimSpace(patch.AccountID)
+		account := s.accounts[accountID]
+		if account == nil || account.Participation == nil {
+			continue
+		}
+		seen[accountID] = struct{}{}
+		profile := account.Participation
+		statDate := strings.TrimSpace(patch.TodayStatDate)
+		if statDate == "" {
+			statDate = today
+		}
+		nextJoin := patch.JoinCount
+		if nextJoin < 0 {
+			nextJoin = 0
+		}
+		nextWin := patch.WinCount
+		if nextWin < 0 {
+			nextWin = 0
+		}
+		// Always refresh today counters from records for the current local day.
+		todayJoin, todayWin, todayDiamonds := 0, 0, 0.0
+		if statDate == today {
+			todayJoin = patch.TodayJoinCount
+			if todayJoin < 0 {
+				todayJoin = 0
+			}
+			todayWin = patch.TodayWinCount
+			if todayWin < 0 {
+				todayWin = 0
+			}
+			todayDiamonds = patch.TodayWinDiamonds
+			if todayDiamonds < 0 {
+				todayDiamonds = 0
+			}
+		}
+		if profile.JoinCount == nextJoin &&
+			profile.WinCount == nextWin &&
+			profile.TodayStatDate == today &&
+			profile.TodayJoinCount == todayJoin &&
+			profile.TodayWinCount == todayWin &&
+			profile.TodayWinDiamonds == todayDiamonds {
+			continue
+		}
+		profile.JoinCount = nextJoin
+		profile.WinCount = nextWin
+		profile.TodayStatDate = today
+		profile.TodayJoinCount = todayJoin
+		profile.TodayWinCount = todayWin
+		profile.TodayWinDiamonds = todayDiamonds
+		account.UpdatedAt = now.Format(time.RFC3339Nano)
+		changed++
+	}
+	// Full record rollup is authoritative: participation accounts missing from
+	// the patch set have zero successful-join / win rows and must not keep
+	// inflated legacy totals (risk_control / failed / network_error used to
+	// bump join_count incorrectly).
+	for accountID, account := range s.accounts {
+		if account == nil || account.Participation == nil {
+			continue
+		}
+		if _, ok := seen[accountID]; ok {
+			continue
+		}
+		profile := account.Participation
+		if profile.JoinCount == 0 && profile.WinCount == 0 &&
+			profile.TodayStatDate == today && profile.TodayJoinCount == 0 &&
+			profile.TodayWinCount == 0 && profile.TodayWinDiamonds == 0 {
+			continue
+		}
+		profile.JoinCount = 0
+		profile.WinCount = 0
+		profile.TodayStatDate = today
+		profile.TodayJoinCount = 0
+		profile.TodayWinCount = 0
+		profile.TodayWinDiamonds = 0
+		account.UpdatedAt = now.Format(time.RFC3339Nano)
+		changed++
+	}
+	// Also roll every other participation profile's today counters to the
+	// current local day so stale today_* values cannot linger after midnight.
+	for _, account := range s.accounts {
+		if account == nil || account.Participation == nil {
+			continue
+		}
+		beforeDate := account.Participation.TodayStatDate
+		beforeJoin := account.Participation.TodayJoinCount
+		beforeWin := account.Participation.TodayWinCount
+		beforeDiamonds := account.Participation.TodayWinDiamonds
+		rollParticipationDayLocked(account.Participation, now)
+		if account.Participation.TodayStatDate != beforeDate ||
+			account.Participation.TodayJoinCount != beforeJoin ||
+			account.Participation.TodayWinCount != beforeWin ||
+			account.Participation.TodayWinDiamonds != beforeDiamonds {
+			changed++
+			account.UpdatedAt = now.Format(time.RFC3339Nano)
+		}
+	}
+	if changed == 0 {
+		return 0, nil
+	}
+	if err := s.saveLocked(); err != nil {
+		return 0, err
+	}
+	return changed, nil
+}
+
 // RecordRedPacketParticipation stores only safe result metadata and counters.
 // Raw response bodies and Cookie values never enter the account view.
 func (s *Store) RecordRedPacketParticipation(accountID, status, message string, joined, won bool, cooldown time.Duration, cookieExpired bool) {
@@ -530,23 +724,65 @@ func (s *Store) RecordRedPacketParticipation(accountID, status, message string, 
 	}
 	now := time.Now()
 	profile := account.Participation
-	profile.LastRedPacketStatus = strings.TrimSpace(status)
-	profile.LastRedPacketMessage = strings.TrimSpace(message)
+	status = strings.TrimSpace(status)
+	message = strings.TrimSpace(message)
+	// A later non-risk row (for example a concurrent context-missing attempt
+	// after the task already stopped) must not wipe an active risk cooldown.
+	// Only challenge_blocked intentionally clears the timer below.
+	previousStatus := profile.LastRedPacketStatus
+	previousMessage := profile.LastRedPacketMessage
+	existingCooldown := profile.RedPacketCooldownUntil
+	wasRiskCooling := previousStatus == redPacketStatusRiskControl && activeRedPacketCooldown(existingCooldown, now)
+
+	profile.LastRedPacketStatus = status
+	profile.LastRedPacketMessage = message
 	if profile.LastRedPacketStatus == redPacketStatusChallengeBlocked {
 		profile.RedPacketAPIEnabled = false
 		profile.RedPacketCooldownUntil = ""
+		existingCooldown = ""
+		wasRiskCooling = false
 	}
-	if joined {
+	if profile.LastRedPacketStatus == redPacketStatusRiskControl {
+		// Risk control ends the current task and cools the account; keep the
+		// API switch off so UI matches “not accepting new joins”.
+		profile.RedPacketAPIEnabled = false
+	}
+	rollParticipationDayLocked(profile, now)
+	// Only count true join accepts. Risk-control / failed / network / login /
+	// challenge must never inflate “参与成功” even if a caller passes joined.
+	if joined && accountParticipationStatusIsSuccessfulJoin(status) {
 		profile.JoinCount++
+		profile.TodayJoinCount++
 		profile.LastJoinAt = now.Format(time.RFC3339Nano)
 	}
-	if won {
+	if won && (status == "" || status == "won" || !accountParticipationStatusIsFailure(status)) {
 		profile.WinCount++
+		profile.TodayWinCount++
+		if diamonds := parseWinDiamonds(message); diamonds > 0 {
+			profile.TodayWinDiamonds += diamonds
+		}
 	}
 	if cooldown > 0 {
-		profile.RedPacketCooldownUntil = now.Add(cooldown).Format(time.RFC3339Nano)
-	} else {
-		profile.RedPacketCooldownUntil = ""
+		nextUntil := now.Add(cooldown)
+		// Keep the later of the new window and any already-running risk window.
+		if existing, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(existingCooldown)); err == nil && existing.After(nextUntil) {
+			profile.RedPacketCooldownUntil = existing.Format(time.RFC3339Nano)
+		} else {
+			profile.RedPacketCooldownUntil = nextUntil.Format(time.RFC3339Nano)
+		}
+	} else if profile.LastRedPacketStatus != redPacketStatusChallengeBlocked {
+		// cooldown == 0 means "no additional cool-down from this event", not
+		// "clear risk control". Preserve any still-active window.
+		if activeRedPacketCooldown(existingCooldown, now) {
+			profile.RedPacketCooldownUntil = existingCooldown
+		}
+		// Keep the risk badge copy until the timer expires unless this event is
+		// itself a stronger account-level block (challenge/login).
+		if wasRiskCooling && status != redPacketStatusChallengeBlocked && status != "login_expired" {
+			profile.LastRedPacketStatus = previousStatus
+			profile.LastRedPacketMessage = previousMessage
+			profile.RedPacketAPIEnabled = false
+		}
 	}
 	if cookieExpired {
 		account.CookieStatus = cookieStatusExpired
@@ -566,14 +802,109 @@ func (s *Store) RecordRedPacketDrawResult(accountID, message string, won bool) {
 	if account == nil || account.Participation == nil {
 		return
 	}
-	account.Participation.LastRedPacketStatus = "not_won"
+	now := time.Now()
+	profile := account.Participation
+	rollParticipationDayLocked(profile, now)
+	profile.LastRedPacketStatus = "not_won"
 	if won {
-		account.Participation.WinCount++
-		account.Participation.LastRedPacketStatus = "won"
+		profile.WinCount++
+		profile.TodayWinCount++
+		if diamonds := parseWinDiamonds(message); diamonds > 0 {
+			profile.TodayWinDiamonds += diamonds
+		}
+		profile.LastRedPacketStatus = "won"
 	}
-	account.Participation.LastRedPacketMessage = strings.TrimSpace(message)
-	account.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+	profile.LastRedPacketMessage = strings.TrimSpace(message)
+	account.UpdatedAt = now.Format(time.RFC3339Nano)
 	_ = s.saveLocked()
+}
+
+// rollParticipationDayLocked resets today counters when the local calendar day
+// changes. Callers must hold s.mu.
+func rollParticipationDayLocked(profile *ParticipationProfile, now time.Time) {
+	if profile == nil {
+		return
+	}
+	today := now.Format("2006-01-02")
+	if profile.TodayStatDate == today {
+		return
+	}
+	profile.TodayStatDate = today
+	profile.TodayJoinCount = 0
+	profile.TodayWinCount = 0
+	profile.TodayWinDiamonds = 0
+}
+
+func accountParticipationStatusIsFailure(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "risk_control", "failed", "network_error", "login_expired", "challenge_blocked",
+		"context_required", "expired", "pending":
+		return true
+	default:
+		return false
+	}
+}
+
+func accountParticipationStatusIsSuccessfulJoin(status string) bool {
+	status = strings.ToLower(strings.TrimSpace(status))
+	if accountParticipationStatusIsFailure(status) {
+		return false
+	}
+	switch status {
+	case "joined", "already_joined", "not_won", "won", "draw_error", "":
+		return true
+	default:
+		// Unknown status with joined=true still counts as a successful accept.
+		return true
+	}
+}
+
+// parseWinDiamonds extracts a positive diamond amount from safe award copy such
+// as "8钻", "已中8钻", or "已中1.5钻（钱包增量确认）".
+func parseWinDiamonds(text string) float64 {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 0
+	}
+	// Collapse spaces so "1.5 钻" still parses.
+	compact := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, text)
+	for i := 0; i < len(compact); {
+		r, size := utf8.DecodeRuneInString(compact[i:])
+		if r == '钻' && i > 0 {
+			end := i
+			start := end
+			dot := false
+			for start > 0 {
+				prev, psz := utf8.DecodeLastRuneInString(compact[:start])
+				if prev >= '0' && prev <= '9' {
+					start -= psz
+					continue
+				}
+				if prev == '.' && !dot {
+					dot = true
+					start -= psz
+					continue
+				}
+				break
+			}
+			if start < end {
+				value, err := strconv.ParseFloat(compact[start:end], 64)
+				if err == nil && value > 0 {
+					return value
+				}
+			}
+		}
+		if size <= 0 {
+			break
+		}
+		i += size
+	}
+	return 0
 }
 
 // MonitoringCredential returns the internal credential used by the local Go

@@ -156,6 +156,9 @@
 	last_red_packet_message?: string;
 	join_count?: number;
 	win_count?: number;
+	today_join_count?: number;
+	today_win_count?: number;
+	today_win_diamonds?: number;
 	diamond_balance?: number;
 	diamond_x10?: number;
 	diamond_checked_at?: string;
@@ -452,6 +455,7 @@
 	draw_result_delay_seconds: number;
 	draw_result_max_attempts: number;
 	participation_countdown_seconds: number;
+	risk_control_cooldown_minutes: number;
 	minimum_diamonds: number;
 	packet_type: ParticipationPacketType;
 	follow_policy: ParticipationFollowPolicy;
@@ -483,6 +487,9 @@
 	join_count: number;
 	win_count: number;
 	win_diamonds: number;
+	today_join_count?: number;
+	today_win_count?: number;
+	today_win_diamonds?: number;
   };
 
   type ActivityAccountSummary = {
@@ -501,6 +508,7 @@
 	account_id?: string;
 	account_ids?: string[];
 	account_summaries?: ActivityAccountSummary[];
+	title?: string;
 	label: string;
 	active?: boolean;
 	join_count?: number;
@@ -542,12 +550,12 @@
 
   const navItems = [
     { key: "browsers" as NavKey, label: "浏览器实例", icon: Browser },
-    { key: "accounts" as NavKey, label: "账号与直播间", icon: UserFocus },
+    { key: "accounts" as NavKey, label: "账号与红包池", icon: UserFocus },
   ];
 
   const viewMeta: Record<NavKey, { title: string; subtitle: string }> = {
     browsers: { title: "浏览器实例", subtitle: "3 个实例 · 2 个在线" },
-    accounts: { title: "账号与直播间", subtitle: "直播间与账号数据" },
+    accounts: { title: "账号与红包池", subtitle: "红包池与账号数据" },
   };
 
   const isWindowsPlatform =
@@ -630,6 +638,7 @@
 	draw_result_delay_seconds: 1,
 	draw_result_max_attempts: 3,
 	participation_countdown_seconds: 10,
+	risk_control_cooldown_minutes: 60,
 	minimum_diamonds: 1,
 	packet_type: "diamond",
 	follow_policy: "follow_priority",
@@ -665,7 +674,10 @@
   let participationScheduleResizeStartHeight = 440;
   let participationScheduleResizeTarget: HTMLElement | null = null;
   let sidebarActivities: SidebarActivity[] = [];
-  let participationOverview: ParticipationOverview = { join_count: 0, win_count: 0, win_diamonds: 0 };
+  let participationOverview: ParticipationOverview = {
+	join_count: 0, win_count: 0, win_diamonds: 0,
+	today_join_count: 0, today_win_count: 0, today_win_diamonds: 0,
+  };
   let recentActivityScroller: HTMLDivElement | null = null;
   let recentActivityScrollTop = 0;
   let recentActivityClientHeight = 0;
@@ -736,7 +748,7 @@
   let selectedParticipationAccountIds: string[] = [];
   let instanceParticipationGroupFilter: ParticipationGroupFilter = "all";
   let instanceAccountsRefreshing = false;
-  let managementTab: ManagementTab = "redpackets";
+  let managementTab: ManagementTab = "participation";
   let monitoringManagementExpanded = false;
   let rooms: RoomItem[] = [];
   let roomTotalCount = 0;
@@ -751,6 +763,8 @@
   let roomRecycleBusyId = "";
   let roomRecycleError = "";
   let roomPendingPermanentDelete: RoomItem | null = null;
+  let roomPendingClearRecycleBin = false;
+  let roomPendingRestoreAllRecycleBin = false;
   let roomRenderLimit = 300;
   let roomImportModalOpen = false;
   let roomImportText = "";
@@ -895,6 +909,7 @@
   $: recentActivityItems = sidebarActivities.map((activity) => ({
 		id: activity.id,
 		kind: activity.kind,
+		title: activity.title || "",
 		label: activity.label,
 		accountIDs: activity.account_ids ?? [],
 		accountSummaries: activity.account_summaries ?? [],
@@ -910,6 +925,7 @@
 		icon: activity.kind.startsWith("participation_") ? (activity.kind.includes("schedule") ? ClockCountdown : Gift) : Radio,
 		tone: activity.kind.startsWith("participation_") ? "live" : "neutral",
 		view: activity.kind.startsWith("participation_") ? ("browsers" as NavKey) : ("accounts" as NavKey),
+		completionStats: activityCompletionStats(activity),
 	}));
   $: sidebarActivityDetail = recentActivityItems.find((activity) => activity.id === sidebarActivityDetailID);
   $: filteredRooms = rooms.filter((room) => {
@@ -958,6 +974,7 @@
 	$: accountSubtitle = `${activeRedPacketCount} 个红包 · ${runningRedPacketMonitorCount} 个房间正在监测${runningRedPacketMonitorCount > 0 ? ` · ${redPacketMonitorSummary.first_checked} 个已完成首轮检测 · ${redPacketMonitorSummary.pending_first} 个待检测 · ${liveRunningRedPacketMonitorCount} 个正在直播` : ""} · ${participationAccounts.length} 个参与 · ${monitoringAccounts.length} 个监测`;
 	$: expiredParticipationAccountCount = participationAccounts.filter((account) => accountCookieStatus(account, "participation") === "expired").length;
 	$: expiredMonitoringAccountCount = monitoringAccounts.filter((account) => accountCookieStatus(account, "monitoring") === "expired").length;
+	$: riskCoolingParticipationAccountCount = participationAccounts.filter((account) => participationCooldownRemainingMs(account, redPacketClock) > 0).length;
 	$: scopedRedPacketEvents = redPacketEvents.filter((event) => redPacketHistoryVisible
 		? !redPacketEventInLibraryWindow(event, redPacketClock)
 		: redPacketEventInLibraryWindow(event, redPacketClock));
@@ -1008,7 +1025,7 @@
     const haystack = `${item.name} ${item.account_name} ${item.browser}`.toLowerCase();
     return haystack.includes(query.trim().toLowerCase());
   });
-  $: browserWebviewLayoutKey = `${activeView}:${browserViewSettled}:${instanceModalOpen}:${licenseModalOpen}:${participationSettingsModalOpen}:${participationScheduleModalOpen}:${sidebarActivityDetailID}:${participationTaskMenuOpen}:${sidebarCollapsed}:${query}:${visibleBrowserInstances
+  $: browserWebviewLayoutKey = `${activeView}:${browserViewSettled}:${instanceModalOpen}:${licenseModalOpen}:${updateModalOpen}:${participationSettingsModalOpen}:${participationScheduleModalOpen}:${sidebarActivityDetailID}:${participationTaskMenuOpen}:${sidebarCollapsed}:${query}:${visibleBrowserInstances
     .map((instance) => instance.id)
     .join(",")}`;
   $: if (browserWebviewLayoutKey) scheduleEmbeddedBrowserSync();
@@ -1249,6 +1266,31 @@
 	return Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/0+$/, "").replace(/\.$/, "");
   }
 
+  /** Completed task/batch rows render structured stats so numbers can use the condensed face. */
+  function activityCompletionStats(activity: SidebarActivity) {
+	const isSingleComplete = activity.kind === "participation_task_completed";
+	const isBatchComplete = activity.kind === "participation_batch_executed" && !activity.active;
+	if (!isSingleComplete && !isBatchComplete) return null;
+	const joins = Math.max(0, activity.join_count ?? 0);
+	const wins = Math.max(0, activity.win_count ?? 0);
+	const diamonds = formatParticipationDiamondTotal(activity.win_diamonds ?? 0);
+	const won = wins > 0;
+	if (isSingleComplete) {
+		const name = (activity.title || activity.account_summaries?.[0]?.account_name || "参与账号").trim() || "参与账号";
+		return { prefix: `${name}已完成:`, joins, wins, diamonds, won };
+	}
+	const title = (activity.title || "红包参与任务").trim() || "红包参与任务";
+	const state = activity.stopped_at ? "已停止" : "已完成";
+	return { prefix: `“${title}”${state}:`, joins, wins, diamonds, won };
+  }
+
+  function showRiskCoolingAccounts() {
+	switchView("accounts");
+	managementTab = "participation";
+	accountRole = "participation";
+	accountStatusFilter = "cooldown";
+  }
+
   function syncRecentActivityScrollbar() {
 	if (!recentActivityScroller) return;
 	recentActivityScrollTop = recentActivityScroller.scrollTop;
@@ -1458,6 +1500,10 @@
 			participation_countdown_seconds: Number.isFinite(loadedParticipationSettings.participation_countdown_seconds)
 				? loadedParticipationSettings.participation_countdown_seconds
 				: 10,
+			risk_control_cooldown_minutes: Number.isFinite(loadedParticipationSettings.risk_control_cooldown_minutes) &&
+				loadedParticipationSettings.risk_control_cooldown_minutes > 0
+				? loadedParticipationSettings.risk_control_cooldown_minutes
+				: 60,
 		};
 		roomSettings = loadedRoomSettings;
 		monitoringSettings = loadedMonitoringSettings;
@@ -1548,6 +1594,7 @@
 		draw_result_delay_seconds: normalizedParticipationSetting(participationSettings.draw_result_delay_seconds, 60),
 		draw_result_max_attempts: Math.max(1, normalizedParticipationSetting(participationSettings.draw_result_max_attempts, 20)),
 		participation_countdown_seconds: normalizedParticipationSetting(participationSettings.participation_countdown_seconds, 300),
+		risk_control_cooldown_minutes: Math.max(1, normalizedParticipationSetting(participationSettings.risk_control_cooldown_minutes || 60, 1440)),
 		minimum_diamonds: Math.max(1, normalizedParticipationSetting(participationSettings.minimum_diamonds, 1000000)),
 		packet_type: (["all", "gift", "diamond"] as ParticipationPacketType[]).includes(participationSettings.packet_type)
 			? participationSettings.packet_type
@@ -1606,6 +1653,9 @@
 
   function closeRoomRecycleBin() {
 	if (roomRecycleBusyId) return;
+	roomPendingClearRecycleBin = false;
+	roomPendingRestoreAllRecycleBin = false;
+	roomPendingPermanentDelete = null;
 	roomRecycleModalOpen = false;
 	roomRecycleError = "";
 	scheduleEmbeddedBrowserSync();
@@ -1628,7 +1678,22 @@
 
   function requestPermanentDeleteRoom(room: RoomItem) {
 	roomPendingPermanentDelete = room;
+	roomPendingClearRecycleBin = false;
 	}
+
+  function requestClearRecycleBin() {
+	if (roomRecycleBusyId || recycledRooms.length === 0) return;
+	roomPendingPermanentDelete = null;
+	roomPendingRestoreAllRecycleBin = false;
+	roomPendingClearRecycleBin = true;
+  }
+
+  function requestRestoreAllRecycleBin() {
+	if (roomRecycleBusyId || recycledRooms.length === 0) return;
+	roomPendingPermanentDelete = null;
+	roomPendingClearRecycleBin = false;
+	roomPendingRestoreAllRecycleBin = true;
+  }
 
   async function permanentlyDeleteRecycledRoom() {
 	const room = roomPendingPermanentDelete;
@@ -1640,6 +1705,49 @@
 		roomPendingPermanentDelete = null;
 		await Promise.all([loadRooms(false), loadRedPacketMonitors(true), loadRoomRecycleBin()]);
 		showToast(`已永久删除直播间「${roomDisplayName(room)}」`);
+	} catch (error) {
+		roomRecycleError = error instanceof Error ? error.message : String(error);
+	} finally {
+		roomRecycleBusyId = "";
+	}
+  }
+
+  async function permanentlyClearRecycleBin() {
+	if (!roomPendingClearRecycleBin || !isTauriDesktop() || roomRecycleBusyId) return;
+	const total = recycledRooms.length;
+	if (total === 0) {
+		roomPendingClearRecycleBin = false;
+		return;
+	}
+	roomRecycleBusyId = "__clear_all__";
+	roomRecycleError = "";
+	try {
+		const result = await engineRequest<{ deleted: number }>("room.recycle.delete_all", {});
+		const deleted = Math.max(0, Number(result?.deleted) || 0);
+		roomPendingClearRecycleBin = false;
+		await Promise.all([loadRooms(false), loadRedPacketMonitors(true), loadRoomRecycleBin()]);
+		showToast(deleted > 0 ? `已清空回收站，永久删除 ${deleted} 个直播间` : "回收站已是空的");
+	} catch (error) {
+		roomRecycleError = error instanceof Error ? error.message : String(error);
+	} finally {
+		roomRecycleBusyId = "";
+	}
+  }
+
+  async function restoreAllRecycleBin() {
+	if (!roomPendingRestoreAllRecycleBin || !isTauriDesktop() || roomRecycleBusyId) return;
+	if (recycledRooms.length === 0) {
+		roomPendingRestoreAllRecycleBin = false;
+		return;
+	}
+	roomRecycleBusyId = "__restore_all__";
+	roomRecycleError = "";
+	try {
+		const result = await engineRequest<{ restored: number }>("room.recycle.restore_all", {});
+		const restored = Math.max(0, Number(result?.restored) || 0);
+		roomPendingRestoreAllRecycleBin = false;
+		await Promise.all([loadRooms(false), loadRedPacketMonitors(true), loadRoomRecycleBin()]);
+		showToast(restored > 0 ? `已恢复 ${restored} 个直播间到列表（未启动）` : "回收站已是空的");
 	} catch (error) {
 		roomRecycleError = error instanceof Error ? error.message : String(error);
 	} finally {
@@ -2099,9 +2207,11 @@
       await checkForAppUpdate(false, true);
       return;
     }
-    await hideEmbeddedBrowsers();
     updateError = "";
+    // Publish the modal guard before native hide so an in-flight WebView2 mount
+    // cannot finish and paint above the upgrade dialog (Windows z-order).
     updateModalOpen = true;
+    await hideEmbeddedBrowsers();
   }
 
   function closeUpdateModal() {
@@ -2883,6 +2993,7 @@
       activeView !== "browsers" ||
       instanceModalOpen ||
       licenseModalOpen ||
+      updateModalOpen ||
 	  participationSettingsModalOpen ||
 	  participationScheduleModalOpen ||
 	  Boolean(sidebarActivityDetailID) ||
@@ -2915,7 +3026,7 @@
       // Keep that native instance alive but hidden so returning still resumes
       // the exact in-memory page. Filters and viewport exits continue to
       // release it below because they are resource-management boundaries.
-      if (activeView !== "browsers" || instanceModalOpen || licenseModalOpen || participationSettingsModalOpen || participationScheduleModalOpen || sidebarActivityDetailID) {
+      if (activeView !== "browsers" || instanceModalOpen || licenseModalOpen || updateModalOpen || participationSettingsModalOpen || participationScheduleModalOpen || sidebarActivityDetailID) {
         if (!browserWebviewMountedIds.includes(instance.id)) {
           browserWebviewMountedIds = [...browserWebviewMountedIds, instance.id];
         }
@@ -3013,10 +3124,11 @@
           activeView !== "browsers" ||
           !browserViewSettled ||
           instanceModalOpen ||
-          licenseModalOpen
-		  || participationSettingsModalOpen
-		  || participationScheduleModalOpen
-		  || sidebarActivityDetailID
+          licenseModalOpen ||
+          updateModalOpen ||
+		  participationSettingsModalOpen ||
+		  participationScheduleModalOpen ||
+		  sidebarActivityDetailID
         ) {
           if (
             browserWebviewMountedIds.includes(instance.id) ||
@@ -3224,16 +3336,42 @@
     return role === "monitoring" ? "监测账号" : "参与账号";
   }
 
+  function participationCooldownRemainingMs(account?: AccountItem, clock = Date.now()) {
+	const until = account?.participation?.red_packet_cooldown_until;
+	if (!until) return 0;
+	const cooldownUntil = new Date(until).getTime();
+	if (Number.isNaN(cooldownUntil) || cooldownUntil <= clock) return 0;
+	return cooldownUntil - clock;
+  }
+
+  function formatCooldownCountdown(ms: number) {
+	const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+	const minutes = Math.floor(totalSeconds / 60);
+	const seconds = totalSeconds % 60;
+	if (minutes >= 60) {
+		const hours = Math.floor(minutes / 60);
+		const remainMinutes = minutes % 60;
+		return `${hours}:${String(remainMinutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+	}
+	return `${minutes}:${String(seconds).padStart(2, "0")}`;
+  }
+
   function accountStatus(account: AccountItem, clock = Date.now()) {
     const profile = accountRole === "monitoring" ? account.monitoring : account.participation;
     if (accountCookieStatus(account, accountRole) === "expired") return "CK 失效";
 	if (accountRole === "participation" && participationChallengeBlocked(account)) return "拦截";
-	if (accountRole === "participation" && profile?.red_packet_cooldown_until) {
-		const cooldownUntil = new Date(profile.red_packet_cooldown_until).getTime();
-		if (!Number.isNaN(cooldownUntil) && cooldownUntil > clock) return "冷却中";
-	}
+	if (accountRole === "participation" && participationCooldownRemainingMs(account, clock) > 0) return "冷却中";
     if (!profile?.enabled || profile.last_error || /冷却|等待|cooldown/i.test(profile.last_use_status || "")) return "冷却中";
     return "可用";
+  }
+
+  function accountStatusLabel(account: AccountItem, clock = Date.now()) {
+	const status = accountStatus(account, clock);
+	if (status === "冷却中" && accountRole === "participation") {
+		const remaining = participationCooldownRemainingMs(account, clock);
+		if (remaining > 0) return `冷却中 ${formatCooldownCountdown(remaining)}`;
+	}
+	return status;
   }
 
   function accountCookieStatus(account: AccountItem, role: AccountRole) {
@@ -3251,6 +3389,13 @@
   function accountHealthMessage(account: AccountItem, role: AccountRole) {
 	if (role === "participation" && participationChallengeBlocked(account)) {
 		return account.participation?.last_red_packet_message || "验证码/安全验证拦截，处理完成后请重新启动参与";
+	}
+	if (role === "participation") {
+		const remaining = participationCooldownRemainingMs(account, Date.now());
+		if (remaining > 0) {
+			return account.participation?.last_red_packet_message ||
+				`账号冷却中，约 ${formatCooldownCountdown(remaining)} 后可再次参与`;
+		}
 	}
 	return accountCookieMessage(account, role);
   }
@@ -3880,13 +4025,17 @@
   function accountMeta(account: AccountItem) {
     if (accountRole === "participation") {
       const profile = account.participation;
-      const binding = profile?.fingerprint_profile_id ? `指纹 ${profile.fingerprint_profile_id}` : "未绑定指纹";
+      const joins = profile?.join_count ?? 0;
+      const todayJoins = profile?.today_join_count ?? 0;
+      const wins = profile?.win_count ?? 0;
+      const todayWins = profile?.today_win_count ?? 0;
       // Only a successful native wallet snapshot may leave the “暂无” placeholder.
       // diamond_status=valid means Go already read live.douyin.com/webcast/wallet/info.
+      // When balance is known, show 余额/今日中奖钻数; otherwise keep plain 暂无.
       const diamond = profile?.diamond_status === "valid" && profile.diamond_checked_at
-        ? `${profile.diamond_balance ?? 0} 钻`
+        ? `${profile.diamond_balance ?? 0}/${formatParticipationDiamondTotal(profile.today_win_diamonds ?? 0)} 钻`
         : "暂无";
-      return `参与 ${profile?.join_count ?? 0} 次 · 中奖 ${profile?.win_count ?? 0} 次 · 钻石 ${diamond} · ${binding}`;
+      return `参与 ${joins}/${todayJoins} 次 · 中奖 ${wins}/${todayWins} 次 · 钻石 ${diamond}`;
     }
     const profile = account.monitoring;
     return `${profile?.total_request_count ?? 0} / ${profile?.today_request_count ?? 0} · ${accountLastRequestAgo(profile?.last_used_at)}`;
@@ -3911,6 +4060,33 @@
       ? new Date(profile.last_used_at).toLocaleString("zh-CN", { hour12: false })
       : "暂无本客户端请求";
     return `本客户端请求统计\n请求总数：${profile?.total_request_count ?? 0}\n今日次数：${profile?.today_request_count ?? 0}\n最后请求：${lastRequest}`;
+  }
+
+  function accountParticipationUsageTip(account: AccountItem) {
+	const profile = account.participation;
+	const joins = profile?.join_count ?? 0;
+	const todayJoins = profile?.today_join_count ?? 0;
+	const wins = profile?.win_count ?? 0;
+	const todayWins = profile?.today_win_count ?? 0;
+	const todayDiamonds = formatParticipationDiamondTotal(profile?.today_win_diamonds ?? 0);
+	const hasWallet = profile?.diamond_status === "valid" && Boolean(profile?.diamond_checked_at);
+	const balance = hasWallet ? String(profile?.diamond_balance ?? 0) : "暂无";
+	const lines = [
+		"参与账号统计",
+		`参与：累计成功 ${joins} / 今日成功 ${todayJoins}`,
+		`中奖：累计中奖 ${wins} / 今日中奖 ${todayWins}`,
+		hasWallet
+			? `钻石：当前钱包余额 ${balance} / 今日中奖钻数 ${todayDiamonds}`
+			: `钻石：钱包余额暂无（今日中奖钻数 ${todayDiamonds}）`,
+		"说明：斜杠左侧为累计（或当前余额），右侧为今日；两侧不是相加关系",
+	];
+	return lines.join("\n");
+  }
+
+  function accountUsageTip(account: AccountItem) {
+	return accountRole === "monitoring"
+		? accountMonitoringUsageTip(account)
+		: accountParticipationUsageTip(account);
   }
 
   function roomDisplayName(room: RoomItem) {
@@ -4316,7 +4492,14 @@
     if (record.status === "challenge_blocked") return { label: "验证拦截", tone: "warning" };
     if (record.status === "risk_control") return { label: "风控冷却", tone: "warning" };
     if (record.status === "login_expired") return { label: "CK 失效", tone: "error" };
-    if (record.status === "network_error") return { label: "网络异常", tone: "warning" };
+    if (record.status === "network_error") {
+      // Page-context timeouts were previously labeled as generic network errors
+      // even though no Douyin join HTTP call completed.
+      if (/超时|timeout/i.test(record.message || "")) {
+        return { label: "页面超时", tone: "warning" };
+      }
+      return { label: "网络异常", tone: "warning" };
+    }
     if (record.status === "expired") return { label: "已过期", tone: "muted" };
     return { label: "参与失败", tone: "error" };
   }
@@ -4325,6 +4508,9 @@
     if (record.endpoint === "receive") return "开奖结果";
     if (record.endpoint === "rush") return "rush 回退";
     if (record.endpoint === "join") return "join 接口";
+    // endpoint=page means the native page script never returned a join/receive
+    // HTTP result (navigation/context/timeout), not a Douyin "page API".
+    if (record.endpoint === "page") return "页面上下文";
     return "等待请求";
   }
 
@@ -4689,6 +4875,19 @@
         accountCreateSessionId = "";
         accountCreateGroupId = "";
         await loadAccounts(false);
+        // Scan-login cookies live in a temporary create WebView data store.
+        // Any existing instance for this account must rebuild so the card
+        // injects the freshly captured store Cookie into the account profile.
+        const createdAccountId = result.account?.id;
+        if (createdAccountId) {
+          const accountInstances = browserInstances.filter(
+            (instance) => instance.account_id === createdAccountId,
+          );
+          await Promise.all(
+            accountInstances.map((instance) => remountBrowserAfterCredentialSync(instance.id, true)),
+          );
+          await loadBrowserInstances();
+        }
         managementTab = accountCreateRole;
         accountRole = accountCreateRole;
         showToast(result.created ? `已添加「${result.account.nickname || result.account.name}」` : `账号已存在，已更新登录信息并加入${roleLabel(accountCreateRole)}`);
@@ -5196,6 +5395,14 @@
       return;
     }
 	const enabled = browserParticipationContextEnabled(instance.id);
+	if (!enabled) {
+		const account = accounts.find((item) => item.id === instance.account_id);
+		const remaining = participationCooldownRemainingMs(account, Date.now());
+		if (remaining > 0) {
+			showToast(`该账号冷却中（剩余 ${formatCooldownCountdown(remaining)}）`);
+			return;
+		}
+	}
     if (enabled) {
       browserRedPacketPreparingIds = [...browserRedPacketPreparingIds, instance.id];
       browserError = "";
@@ -5252,6 +5459,7 @@
 	if (isExternalChromeInstance(instance)) return false;
 	const account = accounts.find((item) => item.id === instance.account_id);
 	if (!account || account.cookie_status === "expired" || !account.roles.includes("participation") || account.participation?.last_red_packet_status === "challenge_blocked") return false;
+	if (participationCooldownRemainingMs(account, Date.now()) > 0) return false;
 	const target = browserRedPacketLiveTarget(instance);
 	if (!target || browserRedPacketPreparingIds.includes(instance.id)) return false;
 	const apiWasEnabled = Boolean(account.participation?.red_packet_api_enabled);
@@ -5744,7 +5952,15 @@
           {#if item.key === "browsers" && browserParticipationTaskRunning}
 			<span class="nav-task-running-dot" aria-hidden="true"></span>
 		  {/if}
-          {#if item.key === "browsers"}<span class="nav-count">{browserInstances.length}</span>{/if}
+          {#if item.key === "browsers"}
+            <span class="nav-count">{browserInstances.length}</span>
+          {:else if item.key === "accounts"}
+            <span
+              class="nav-count"
+              data-tooltip={`参与账号 ${participationAccounts.length} · 红包发放中 ${activeRedPacketCount}`}
+              aria-label={`参与账号 ${participationAccounts.length}，红包发放中 ${activeRedPacketCount}`}
+            >{participationAccounts.length}/{activeRedPacketCount}</span>
+          {/if}
         </button>
       {/each}
     </nav>
@@ -5757,17 +5973,21 @@
           <strong class="quick-value">{runningRedPacketMonitorCount}</strong>
         </button>
       {/if}
-      <button class="quick-row" onclick={() => openManagementTab("redpackets")}>
-        <span>红包发放中</span>
-        <strong class="quick-value">{activeRedPacketCount}</strong>
-      </button>
       <button class="quick-row" onclick={() => openManagementTab("participation-records")}>
         <span>参与/中奖总次数</span>
         <strong class="quick-value">{participationOverview.join_count}/{participationOverview.win_count}</strong>
       </button>
       <button class="quick-row" onclick={() => openManagementTab("participation-records")}>
-        <span>中奖总钻数</span>
-        <strong class="quick-value">{formatParticipationDiamondTotal(participationOverview.win_diamonds)}</strong>
+        <span>中奖总钻数/今日新增</span>
+        <strong class="quick-value">
+          {formatParticipationDiamondTotal(participationOverview.win_diamonds)}/{#if (participationOverview.today_win_diamonds ?? 0) > 0}<em class="quick-value-win">{formatParticipationDiamondTotal(participationOverview.today_win_diamonds ?? 0)}</em>{:else}{formatParticipationDiamondTotal(participationOverview.today_win_diamonds ?? 0)}{/if}
+        </strong>
+      </button>
+      <button class="quick-row" onclick={() => openManagementTab("participation-records")}>
+        <span>今日参与/中奖次数</span>
+        <strong class="quick-value">
+          {participationOverview.today_join_count ?? 0}/{#if (participationOverview.today_win_count ?? 0) > 0}<em class="quick-value-win">{participationOverview.today_win_count ?? 0}</em>{:else}{participationOverview.today_win_count ?? 0}{/if}
+        </strong>
       </button>
       {#if expiredParticipationAccountCount > 0}
         <button class="quick-row warning" onclick={() => showExpiredAccounts("participation")}>
@@ -5779,6 +5999,12 @@
         <button class="quick-row warning" onclick={() => showExpiredAccounts("monitoring")}>
           <span>监测账号 CK 失效</span>
           <strong class="quick-value">{expiredMonitoringAccountCount}</strong>
+        </button>
+      {/if}
+      {#if riskCoolingParticipationAccountCount > 0}
+        <button class="quick-row warning" onclick={showRiskCoolingAccounts}>
+          <span>风控冷却中的账号</span>
+          <strong class="quick-value">{riskCoolingParticipationAccountCount}</strong>
         </button>
       {/if}
     </div>
@@ -5798,7 +6024,13 @@
                     <svelte:component this={activity.icon} size={14} weight={activity.tone === "live" ? "fill" : "regular"} />
                   </span>
                   <span class="recent-activity-copy">
-                    <span>{activity.label}</span>
+                    {#if activity.completionStats}
+                      <span class="recent-activity-label">
+                        {activity.completionStats.prefix}{#if activity.completionStats.won}<span class="recent-activity-win"><span class="recent-activity-num">{activity.completionStats.diamonds}</span>钻</span>/<span class="recent-activity-num">{activity.completionStats.wins}</span>次{:else}未中奖{/if}, 参与<span class="recent-activity-num">{activity.completionStats.joins}</span>次
+                      </span>
+                    {:else}
+                      <span>{activity.label}</span>
+                    {/if}
                     <span class="recent-activity-meta">
                       <small>{activity.time}</small>
                       {#if activity.kind === "participation_batch_executed" && activity.active}
@@ -5875,16 +6107,12 @@
             data-tooltip-placement="top"
             disabled={updateChecking}
             onclick={() => void openUpdateModal()}
-          >v{clientVersion}</button>
-          {#if updateStatus?.available}
-            <button
-              class="update-available-badge"
-              aria-label={`升级到 v${updateStatus.latest_version}`}
-              data-tooltip={`升级到 v${updateStatus.latest_version}`}
-              data-tooltip-placement="top"
-              onclick={() => void openUpdateModal()}
-            >可升级</button>
-          {/if}
+          >
+            <span>v{clientVersion}</span>
+            {#if updateStatus?.available}
+              <em class="update-available-dot" aria-hidden="true"></em>
+            {/if}
+          </button>
           <button
             class:professional={licenseStatus.state === "active"}
             class="edition-badge"
@@ -6192,11 +6420,15 @@
 			  {@const participationEnabled = browserParticipationContextEnabled(item.id)}
 			  {@const cookieExpired = browserCookieExpired(item)}
 			  {@const participationBlocked = browserParticipationBlocked(item)}
+			  {@const coolingAccount = accounts.find((account) => account.id === item.account_id)}
+			  {@const coolingRemainingMs = participationCooldownRemainingMs(coolingAccount, redPacketClock)}
 			  {@const followedLive = followingLiveSnapshot(item)}
 			  {@const followedLiveLoading = browserFollowingLiveLoadingIds.includes(item.id)}
 			  {@const pendingResultCanResume = Boolean(participationContext?.resumable && !participationContext?.prepared && participationContext?.pending_draw_count && /^\d{6,20}$/.test(participationContext?.pending_result_web_rid || ""))}
 			  {@const participationTip = participationBlocked
 				? "验证码/安全验证拦截；处理完成后可点击重新启动参与"
+				: coolingRemainingMs > 0
+				? `该账号冷却中（剩余 ${formatCooldownCountdown(coolingRemainingMs)}）`
 				: participationStopped
 				? `${participationContext?.stop_reason || "已达到红包参与停止条件"}${pendingResultCanResume ? "；点击仅恢复待开奖记录查询" : ""}`
 				: pendingResultCanResume ? "恢复待开奖记录查询" : participationEnabled ? "停止红包页面参与" : "进入直播间并启用红包页面参与"}
@@ -6291,6 +6523,13 @@
 						  data-tooltip={browserParticipationBlockedMessage(item)}
 						  data-tooltip-placement="bottom"
 						>拦截</em>
+					  {:else if coolingRemainingMs > 0}
+						<em
+						  class="browser-participation-blocked"
+						  use:portalTooltip={accountHealthMessage(coolingAccount!, "participation") || participationTip}
+						  data-tooltip={accountHealthMessage(coolingAccount!, "participation") || participationTip}
+						  data-tooltip-placement="bottom"
+						>冷却 {formatCooldownCountdown(coolingRemainingMs)}</em>
                       {/if}
                     </h2>
                   </div>
@@ -6424,15 +6663,7 @@
           </label>
         {/if}
       {:else}
-        <div class="account-tabs" role="tablist" aria-label="直播间与账号分类">
-          <button
-            class:active={managementTab === "redpackets"}
-            role="tab"
-            aria-selected={managementTab === "redpackets"}
-            onclick={() => selectManagementTab("redpackets")}
-          >
-            红包 <span>{activeRedPacketCount}</span>
-          </button>
+        <div class="account-tabs" role="tablist" aria-label="账号与红包池分类">
           <button
             class:active={managementTab === "participation"}
             role="tab"
@@ -6440,6 +6671,14 @@
             onclick={() => selectManagementTab("participation")}
           >
             参与账号 <span>{participationAccounts.length}</span>
+          </button>
+          <button
+            class:active={managementTab === "redpackets"}
+            role="tab"
+            aria-selected={managementTab === "redpackets"}
+            onclick={() => selectManagementTab("redpackets")}
+          >
+            红包池 <span>{activeRedPacketCount}</span>
           </button>
           <button
             class:active={managementTab === "participation-records"}
@@ -6503,34 +6742,34 @@
                 <button
                   class:active={roomCleanupMenuOpen || roomSettings.auto_recycle_low_live_enabled || roomSettings.auto_recycle_no_packet_enabled || roomSettings.auto_recycle_imported_no_packet_enabled}
                   class="monitor-log-button"
-                  aria-label="直播间自动清理设置"
+                  aria-label="直播间数据清理"
                   aria-haspopup="menu"
                   aria-expanded={roomCleanupMenuOpen}
-                  data-tooltip={roomCleanupMenuOpen ? undefined : "自动清理设置"}
+                  data-tooltip={roomCleanupMenuOpen ? undefined : "数据清理"}
                   data-tooltip-placement="bottom"
                   onclick={toggleRoomCleanupMenu}
                 ><GearSix size={13} /></button>
                 {#if roomCleanupMenuOpen}
-                  <div class="floating-menu room-cleanup-menu" role="menu" aria-label="直播间自动清理设置">
-                    <strong>自动清理</strong>
+                  <div class="floating-menu room-cleanup-menu" role="menu" aria-label="直播间数据清理">
+                    <strong>数据清理</strong>
                     <label class="room-cleanup-rule">
                       <input type="checkbox" bind:checked={roomSettings.auto_recycle_low_live_enabled} />
                       <span>累计开播不超过</span>
                       <span class="room-cleanup-number"><input type="number" min="0" max="100000" step="1" bind:value={roomSettings.auto_recycle_max_live_sessions} /><em>次</em></span>
                     </label>
-                    <small>从未获得有效检测结果的直播间会跳过</small>
+                    <small>仅点击「执行清理」时生效；从未获得有效检测结果的直播间会跳过</small>
                     <label class="room-cleanup-rule">
                       <input type="checkbox" bind:checked={roomSettings.auto_recycle_no_packet_enabled} />
                       <span>近</span>
                       <span class="room-cleanup-number"><input type="number" min="1" max="3650" step="1" bind:value={roomSettings.auto_recycle_no_packet_days} /><em>天</em></span>
                       <span>未发红包</span>
                     </label>
-                    <small>从首次有效检测或最后发现红包开始计算</small>
+                    <small>仅点击「执行清理」时生效；从首次有效检测或最后发现红包开始计算</small>
                     <label class="room-cleanup-rule room-cleanup-rule-wide">
                       <input type="checkbox" bind:checked={roomSettings.auto_recycle_imported_no_packet_enabled} />
                       <span>清理本地导入且从未发现红包的直播间</span>
                     </label>
-                    <small>包括尚未有效检测过的本地导入记录；不影响关注列表和中心库数据</small>
+                    <small>仅点击「执行清理」时生效；包括尚未有效检测过的本地导入记录；不影响关注列表和中心库数据</small>
                     {#if roomCleanupSettingsBusy || roomCleanupProgress}
                       <div class="room-cleanup-progress" aria-live="polite">
                         <div><span>执行进度</span><strong>{roomCleanupTotal > 0 ? Math.min(100, Math.round(roomCleanupProcessed / roomCleanupTotal * 100)) : 100}%</strong></div>
@@ -6679,7 +6918,7 @@
             {:else}
               <div class="red-packet-event-list">
                 <div class="red-packet-event-head">
-                  <span>红包</span>
+                  <span>红包池</span>
                   <span class="red-packet-event-source-head menu-anchor">
                     <span>直播间 / 监测账号</span>
                     <button
@@ -7134,7 +7373,7 @@
                   <div class="account-health">
                     <div class="account-health-status">
 					  <span class:warning={accountStatus(account, redPacketClock) === "冷却中"} class:blocked={accountStatus(account, redPacketClock) === "拦截"} class:expired={accountStatus(account, redPacketClock) === "CK 失效"} class="status-pill" data-tooltip={accountHealthMessage(account, accountRole) || undefined} data-tooltip-placement="top">
-						<span></span>{accountStatus(account, redPacketClock)}
+						<span></span>{accountStatusLabel(account, redPacketClock)}
 					  </span>
 					  {#if accountStatus(account, redPacketClock) === "CK 失效"}
                         <button
@@ -7149,7 +7388,7 @@
                       {/if}
                     </div>
                     <small
-                      use:portalTooltip={accountRole === "monitoring" ? accountMonitoringUsageTip(account) : ""}
+                      use:portalTooltip={accountUsageTip(account)}
                       data-tooltip-placement="top"
                     >{accountMeta(account)}</small>
                   </div>
@@ -7216,7 +7455,13 @@
       <div class="sidebar-activity-summary">
         <div>
           <small>活动内容</small>
-          <strong>{sidebarActivityDetail.label}</strong>
+          {#if sidebarActivityDetail.completionStats}
+            <strong class="recent-activity-label">
+              {sidebarActivityDetail.completionStats.prefix}{#if sidebarActivityDetail.completionStats.won}<span class="recent-activity-win"><span class="recent-activity-num">{sidebarActivityDetail.completionStats.diamonds}</span>钻</span>/<span class="recent-activity-num">{sidebarActivityDetail.completionStats.wins}</span>次{:else}未中奖{/if}, 参与<span class="recent-activity-num">{sidebarActivityDetail.completionStats.joins}</span>次
+            </strong>
+          {:else}
+            <strong>{sidebarActivityDetail.label}</strong>
+          {/if}
         </div>
         <span class:active={sidebarActivityDetail.active} class="sidebar-activity-status">
           {sidebarActivityDetail.active ? "进行中" : sidebarActivityDetail.stoppedAt ? "已停止" : "已结束"}
@@ -7232,7 +7477,7 @@
           <div><dt>停止时间</dt><dd>{formatLicenseDate(sidebarActivityDetail.stoppedAt, "未知")}</dd></div>
         {/if}
         {#if sidebarActivityDetail.finishedAt}
-          <div><dt>参与结果</dt><dd>参与 {sidebarActivityDetail.joinCount} 次 · 中奖 {sidebarActivityDetail.winCount} 次 / {formatParticipationDiamondTotal(sidebarActivityDetail.winDiamonds)} 钻</dd></div>
+          <div><dt>参与结果</dt><dd>{#if sidebarActivityDetail.winCount > 0}<span class="recent-activity-win"><span class="recent-activity-num">{formatParticipationDiamondTotal(sidebarActivityDetail.winDiamonds)}</span>钻</span>/<span class="recent-activity-num">{sidebarActivityDetail.winCount}</span>次{:else}未中奖{/if}, 参与<span class="recent-activity-num">{sidebarActivityDetail.joinCount}</span>次</dd></div>
         {/if}
       </dl>
 
@@ -7400,6 +7645,10 @@
             <span class="number-field"><input type="number" min="0" max="86400" step="1" bind:value={participationSettings.cooldown_seconds} /><em>秒</em></span>
           </label>
           <label class="participation-setting-row">
+            <span><strong>风控冷却</strong><small>接口返回 succeed=false 等风控结果后，账号进入冷却并不再接收新任务；单独启动会提示，批量启动会跳过</small></span>
+            <span class="number-field"><input type="number" min="1" max="1440" step="1" bind:value={participationSettings.risk_control_cooldown_minutes} /><em>分钟</em></span>
+          </label>
+          <label class="participation-setting-row">
             <span><strong>中奖停止</strong><small>累计中奖达到指定次数后，不再分配后续红包任务</small></span>
             <span class="number-field"><input type="number" min="0" max="100000" step="1" bind:value={participationSettings.stop_after_wins} /><em>次</em></span>
           </label>
@@ -7498,13 +7747,37 @@
           <button class:active={roomRecycleView === "center-exclusions"} role="tab" aria-selected={roomRecycleView === "center-exclusions"} onclick={() => (roomRecycleView = "center-exclusions")}>中心库全局排除 <span>{centerExcludedRooms.length}</span></button>
         {/if}
       </div>
-      <p class="participation-settings-intro">
-        {roomRecycleView === "recycle"
-          ? permanentCenterRoomAccess()
-            ? "自动清理会先将直播间移入回收站；永久删除中心库关联房间时会同步进入全局排除。"
-            : "自动清理会先将本地直播间移入回收站；恢复后保持未启动状态，永久删除只清除本机数据。"
-          : "全局排除会从中心库清除直播间及红包数据，并拦截其他客户端再次上传；解除后恢复为未启动直播间。"}
-      </p>
+      <div class="room-recycle-intro-row">
+        <p class="participation-settings-intro room-recycle-intro-copy">
+          {roomRecycleView === "recycle"
+            ? permanentCenterRoomAccess()
+              ? "数据清理与未开播自动回收会先将直播间移入回收站；永久删除中心库关联房间时会同步进入全局排除。"
+              : "数据清理与未开播自动回收会先将本地直播间移入回收站；恢复后保持未启动状态，永久删除只清除本机数据。"
+            : "全局排除会从中心库清除直播间及红包数据，并拦截其他客户端再次上传；解除后恢复为未启动直播间。"}
+        </p>
+        {#if roomRecycleView === "recycle" && recycledRooms.length > 0}
+          <div class="room-recycle-intro-actions">
+            <button
+              type="button"
+              class="icon-button restore room-recycle-restore-all"
+              aria-label="一键恢复全部直播间"
+              data-tooltip="一键恢复全部到直播间列表"
+              data-tooltip-placement="top"
+              disabled={Boolean(roomRecycleBusyId)}
+              onclick={requestRestoreAllRecycleBin}
+            ><ArrowClockwise size={14} /></button>
+            <button
+              type="button"
+              class="icon-button permanent-delete room-recycle-clear-all"
+              aria-label="一键清空回收站"
+              data-tooltip="一键清空回收站"
+              data-tooltip-placement="top"
+              disabled={Boolean(roomRecycleBusyId)}
+              onclick={requestClearRecycleBin}
+            ><Trash size={14} /></button>
+          </div>
+        {/if}
+      </div>
       <div class="room-recycle-list">
         {#if roomRecycleLoading && recycledRooms.length === 0 && centerExcludedRooms.length === 0}
           <div class="room-recycle-empty"><ArrowClockwise class="spinning" size={18} />正在读取回收站…</div>
@@ -8129,6 +8402,28 @@
     busy={roomRecycleBusyId === roomPendingPermanentDelete.id}
     onCancel={() => !roomRecycleBusyId && (roomPendingPermanentDelete = null)}
     onConfirm={permanentlyDeleteRecycledRoom}
+  />
+{/if}
+
+{#if roomPendingRestoreAllRecycleBin}
+  <ConfirmDialog
+    title="恢复全部直播间"
+    message={`确定将回收站内全部 ${recycledRooms.length} 个直播间恢复到列表吗？\n恢复后均为未启动状态，可重新开启监测。`}
+    confirmText="全部恢复"
+    busy={roomRecycleBusyId === "__restore_all__"}
+    onCancel={() => !roomRecycleBusyId && (roomPendingRestoreAllRecycleBin = false)}
+    onConfirm={restoreAllRecycleBin}
+  />
+{/if}
+
+{#if roomPendingClearRecycleBin}
+  <ConfirmDialog
+    title="清空回收站"
+    message={`确定永久删除回收站内全部 ${recycledRooms.length} 个直播间吗？\n本机回收站记录、对应监测快照和本地红包历史将被移除，此操作无法撤销。`}
+    confirmText="全部删除"
+    busy={roomRecycleBusyId === "__clear_all__"}
+    onCancel={() => !roomRecycleBusyId && (roomPendingClearRecycleBin = false)}
+    onConfirm={permanentlyClearRecycleBin}
   />
 {/if}
 

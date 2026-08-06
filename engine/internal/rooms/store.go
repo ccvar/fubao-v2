@@ -879,14 +879,16 @@ func (s *Store) cleanupReasonLocked(room *Room, checkedAt time.Time) (string, bo
 		localPacketMissing := strings.TrimSpace(room.LastRedPacketAt) == ""
 		centerPacketMissing := strings.TrimSpace(room.CenterLastEventAt) == "" && (room.CenterMetricsVersion == 0 || room.CenterRedPacketCount == 0)
 		if localPacketMissing && centerPacketMissing {
-			return "本地导入后从未发现红包，手动执行自动清理", true
+			return "本地导入后从未发现红包，手动执行数据清理", true
 		}
 	}
 	if !definitivelyOffline {
 		return "", false
 	}
+	// Manual 数据清理 rules — only used by ExecuteCleanup, never by monitor probes.
 	if s.settings.AutoRecycleLowLiveEnabled && liveMetricsKnown && liveSessionCount <= s.settings.AutoRecycleMaxLiveSessions {
-		return fmt.Sprintf("累计确认开播 %d 次，不超过设置的 %d 次，手动执行自动清理", liveSessionCount, s.settings.AutoRecycleMaxLiveSessions), true
+		return fmt.Sprintf("累计确认开播 %d 次，不超过设置的 %d 次，手动执行数据清理",
+			liveSessionCount, s.settings.AutoRecycleMaxLiveSessions), true
 	}
 	if s.settings.AutoRecycleNoPacketEnabled && s.settings.AutoRecycleNoPacketDays > 0 {
 		baseline := firstNonEmpty(room.LastRedPacketAt, room.FirstDefinitiveProbeAt)
@@ -894,7 +896,7 @@ func (s *Store) cleanupReasonLocked(room *Room, checkedAt time.Time) (string, bo
 			baseline = firstNonEmpty(room.CenterLastEventAt, room.FirstDefinitiveProbeAt)
 		}
 		if since, ok := parseStoredTime(baseline); ok && checkedAt.Sub(since) >= time.Duration(s.settings.AutoRecycleNoPacketDays)*24*time.Hour {
-			return fmt.Sprintf("近 %d 天未发现红包，手动执行自动清理", s.settings.AutoRecycleNoPacketDays), true
+			return fmt.Sprintf("近 %d 天未发现红包，手动执行数据清理", s.settings.AutoRecycleNoPacketDays), true
 		}
 	}
 	return "", false
@@ -964,24 +966,12 @@ func (s *Store) RecordLiveResult(roomID, status string, checkedAt time.Time) (bo
 			room.OfflineDays++
 			changed = true
 		}
+		// Only the continuous offline-day recycle runs automatically during
+		// monitoring. Low-live / no-packet / imported-no-packet rules are
+		// manual “数据清理” actions (ExecuteCleanup) and must never fire here.
 		reason := ""
-		liveSessionCount := room.LiveSessionCount
-		liveMetricsKnown := true
-		if strings.EqualFold(strings.TrimSpace(room.Source), "center") && len(room.FollowSources) == 0 {
-			liveSessionCount = room.CenterLiveSessionCount
-			liveMetricsKnown = room.CenterMetricsVersion > 0
-		}
-		if s.settings.AutoRecycleLowLiveEnabled && liveMetricsKnown && liveSessionCount <= s.settings.AutoRecycleMaxLiveSessions {
-			reason = fmt.Sprintf("累计确认开播 %d 次，不超过设置的 %d 次，系统自动清理", liveSessionCount, s.settings.AutoRecycleMaxLiveSessions)
-		}
-		if reason == "" && s.settings.AutoRecycleNoPacketEnabled && s.settings.AutoRecycleNoPacketDays > 0 {
-			baseline := firstNonEmpty(room.LastRedPacketAt, room.FirstDefinitiveProbeAt)
-			if since, ok := parseStoredTime(baseline); ok && checkedAt.Sub(since) >= time.Duration(s.settings.AutoRecycleNoPacketDays)*24*time.Hour {
-				reason = fmt.Sprintf("近 %d 天未发现红包，系统自动清理", s.settings.AutoRecycleNoPacketDays)
-			}
-		}
 		limit := s.settings.AutoRecycleOfflineDays
-		if reason == "" && limit > 0 && room.OfflineDays >= limit {
+		if limit > 0 && room.OfflineDays >= limit {
 			reason = fmt.Sprintf("连续 %d 天监测未发现直播，系统自动回收", room.OfflineDays)
 		}
 		if reason != "" {
@@ -1066,7 +1056,43 @@ func (s *Store) Restore(roomID string) (Room, error) {
 	if room == nil || !room.Recycled {
 		return Room{}, errors.New("回收站中的直播间不存在")
 	}
-	now := time.Now().Format(time.RFC3339Nano)
+	s.restoreRecycledRoomLocked(room, time.Now())
+	if err := s.saveLocked(); err != nil {
+		return Room{}, err
+	}
+	copy := *room
+	copy.FollowSources = append([]FollowSource(nil), room.FollowSources...)
+	return copy, nil
+}
+
+// RestoreAllRecycled returns every recycled room to the active list in a stopped
+// state (same semantics as single Restore). One save for the whole batch.
+func (s *Store) RestoreAllRecycled() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	count := 0
+	for _, room := range s.rooms {
+		if room == nil || !room.Recycled {
+			continue
+		}
+		s.restoreRecycledRoomLocked(room, now)
+		count++
+	}
+	if count == 0 {
+		return 0, nil
+	}
+	if err := s.saveLocked(); err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (s *Store) restoreRecycledRoomLocked(room *Room, now time.Time) {
+	if room == nil {
+		return
+	}
+	stamp := now.Format(time.RFC3339Nano)
 	room.Recycled = false
 	room.RecycledAt = ""
 	room.RecycleReason = ""
@@ -1081,13 +1107,7 @@ func (s *Store) Restore(roomID string) (Room, error) {
 	room.Enabled = true
 	room.MonitorStatus = "stopped"
 	room.ConnectionStatus = "disconnected"
-	room.UpdatedAt = now
-	if err := s.saveLocked(); err != nil {
-		return Room{}, err
-	}
-	copy := *room
-	copy.FollowSources = append([]FollowSource(nil), room.FollowSources...)
-	return copy, nil
+	room.UpdatedAt = stamp
 }
 
 func (s *Store) DeleteRecycled(roomID string) error {
@@ -1109,6 +1129,37 @@ func (s *Store) DeleteRecycledScoped(roomID string, allowCenterExclusion bool) e
 	}
 	delete(s.rooms, roomID)
 	return s.saveLocked()
+}
+
+// DeleteAllRecycledScoped permanently removes every local recycled room in one
+// save. Center-linked rooms only create global exclusions when allowed.
+func (s *Store) DeleteAllRecycledScoped(allowCenterExclusion bool) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	ids := make([]string, 0)
+	for id, room := range s.rooms {
+		if room != nil && room.Recycled {
+			ids = append(ids, id)
+		}
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	for _, id := range ids {
+		room := s.rooms[id]
+		if room == nil || !room.Recycled {
+			continue
+		}
+		if allowCenterExclusion {
+			s.excludeCenterRoomLocked(room, firstNonEmpty(room.RecycleReason, "从回收站一键清空"), now)
+		}
+		delete(s.rooms, id)
+	}
+	if err := s.saveLocked(); err != nil {
+		return 0, err
+	}
+	return len(ids), nil
 }
 
 // SyncFollowingLive merges one participation account's currently-live

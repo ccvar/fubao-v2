@@ -2,6 +2,8 @@
 
 参与记录中，“未中奖”只作为结果徽标；其下方流程状态显示“已开奖”，避免重复显示“未中奖”。
 
+红包参与接口 `luckybox/join` 返回 `status_code=0` 且 `succeed=false`（含真实浏览器仍软拒绝）时记为触发风控：参与记录显示“风控冷却”，账号进入可配置的风控冷却（默认 60 分钟，设置-红包参与），期间不接收新任务；单独启动提示“该账号冷却中”，批量启动跳过冷却中账号。账号一旦风控且无待开奖记录，立即结束该账号当前参与任务并释放原生页面上下文；批次内全部账号结束后批次摘要一并收尾，不要让任务在“全员冷却”后仍显示进行中。风控冷却的 `red_packet_cooldown_until` 与“风控冷却”状态文案在任务停止、关闭红包接口开关、以及后续 cooldown=0 的参与记录写入后仍必须保留，直到冷却到期；实例卡片与参与账号行的冷却倒计时徽标同理。页面 join 查询参数对齐真实 live 页捕获（`enter_from=link_share`、`enter_from_merge=link_share`，不强制附加 `web_rid`/`box_type`）。
+
 Run the local server yourself and open the preview in the browser available to this environment. Do not give the user server-start instructions when you can run it.
 
 Before making substantial visual changes, use the Product Design plugin's `get-context` skill when the visual source is unclear or no longer matches the current goal. When the user gives durable prototype-specific design feedback, preferences, or decisions, record them in `AGENTS.md`.
@@ -36,15 +38,15 @@ Build app UI in `src/`. Keep `.openai/hosting.json`, `worker/index.js`, `scripts
 
 The Pilot screenshot is a layout reference only. Preserve the two-column desktop structure and visual rhythm, but never reuse Pilot/gcms navigation, onboarding copy, site-management concepts, or business behavior. This product is 福宝控制台, centered on 红包监测、参与任务、浏览器实例、账号与代理, with a Go business engine.
 
-The primary sidebar exposes only “浏览器实例” and “账号与直播间”. “监测总览” and “红包任务” are not standalone pages; their live data remains available through the sidebar data overview and the 红包/直播间 tabs on “账号与直播间”. Show the current total browser-instance count as the compact badge on “浏览器实例”.
+The primary sidebar exposes only “浏览器实例” and “账号与红包池”. “监测总览” and “红包任务” are not standalone pages; their live data remains available through the sidebar data overview and the 红包/直播间 tabs on “账号与红包池”. Show the current total browser-instance count as the compact badge on “浏览器实例”. Show a compact `参与账号数/红包发放中数` badge on “账号与红包池” (same nav-count pill as browser instances); do not also list “红包发放中” as a separate row inside “数据概览”.
 
 Closing the main window hides it to the native system tray instead of terminating the client, so the Go engine and active monitoring/participation work continue running. A left click on the tray icon or the tray “打开福宝控制台” action restores and focuses the main window; macOS Dock reopen does the same. Only the explicit tray “彻底退出” action terminates the Go engine and exits the application.
 
 Keep the desktop development URL pinned to this project's dedicated port and use Vite `strictPort` so Tauri cannot silently attach to another local project's dev server.
 
-On the 账号与直播间 page, keep the 直播间/参与账号/监测账号 tab strip outside the table card so the table is the only framed surface. The account status filter belongs in that external tab strip; do not repeat the old explanatory account-copy in the content area.
+On the 账号与红包池 page, keep the 参与账号/红包池/参与记录 tab strip (plus the collapsed 监测管理 group for 直播间/监测账号) outside the table card so the table is the only framed surface. Default to the 参与账号 tab. The account status filter belongs in that external tab strip; do not repeat the old explanatory account-copy in the content area.
 
-On the 账号与直播间 page, treat room monitoring as an advanced workflow: collapse “直播间” and “监测账号” behind one compact inline “监测管理” icon by default, and expand those two tabs in the existing tab strip only after the icon is clicked. Keep the group expanded while either monitoring tab is active, then collapse it again after switching to a common tab. The sidebar data overview omits the “直播间正在监测” row entirely when its real running count is zero and reveals it only while monitoring is actually running.
+On the 账号与红包池 page, treat room monitoring as an advanced workflow: collapse “直播间” and “监测账号” behind one compact inline “监测管理” icon by default, and expand those two tabs in the existing tab strip only after the icon is clicked. Keep the group expanded while either monitoring tab is active, then collapse it again after switching to a common tab. The sidebar data overview omits the “直播间正在监测” row entirely when its real running count is zero and reveals it only while monitoring is actually running.
 
 Keep the external account tab strip vertically balanced around the table, use the same responsive inline inset for tabs and table rows, and keep the selected tab/count surfaces light and quiet rather than using a heavy fill.
 
@@ -68,13 +70,13 @@ Keep the compact sidebar footer permanently visible at the bottom of the window.
 
 The recent-activity section must never render demo or sample events. A fresh local store with no persisted activity shows only the low-contrast text “暂无活动”; real persisted activity replaces that empty state.
 
-The sidebar names its live counters section “数据概览”. Its four counter rows are text-only: do not render leading status icons, and place each count directly before the status label without the Chinese classifier “个”, while preserving the existing semantic colors and click targets. A separate “最近活动” section sits below it, reuses the same compact icon-and-copy row language, and owns the remaining scrollable space above the fixed footer.
+The sidebar names its live counters section “数据概览”. Its counter rows are text-only: do not render leading status icons, and place each count directly before the status label without the Chinese classifier “个”, while preserving the existing semantic colors and click targets. Omit the “红包发放中” overview row; that count lives only on the “账号与红包池” nav badge. A separate “最近活动” section sits below it, reuses the same compact icon-and-copy row language, and owns the remaining scrollable space above the fixed footer.
 
 In the sidebar “数据概览”, keep every status label left-aligned and every count right-aligned on a shared edge. Render counts in a compact, prominent condensed numeric face with tabular figures, visibly larger than the deliberately smaller supporting copy, while preserving warning colors.
 
 In the sidebar data overview, omit each CK-expiry row entirely when its corresponding expired-account count is zero; render it with the warning treatment only when the count is positive.
 
-In the sidebar data overview, combine the all-time participation and win counts into one compact `参与数/中奖数 参与/中奖总次数` row. Keep confirmed diamond winnings as its own row.
+In the sidebar data overview, show `参与/中奖总次数` (accepted joins / wins, all-time), `中奖总钻数/今日新增`, and `今日参与/中奖次数` (local calendar day). When any participation account is inside an active risk-control cooldown, show a warning row `风控冷却中的账号` under the CK-expiry rows, using the same warning treatment and linking to the participation cooldown filter.
 
 The sidebar recent-activity list displays the complete persisted history returned by the Go store (currently up to 100 newest entries) in its own scrollable region; never impose a smaller frontend-only item cap such as four rows.
 
@@ -90,7 +92,7 @@ The Tauri bundle must explicitly list the PNG, macOS `.icns`, and Windows `.ico`
 
 Desktop self-updates use Tauri's signed updater flow, matching Pilot: download and install the signed updater artifact, then relaunch through `tauri-plugin-process`. Never replace the installed macOS app by mounting a DMG and moving the `.app` from a detached shell script. Every desktop release must publish the macOS `.app.tar.gz`, Windows signed NSIS updater, their updater signatures, and a standard Tauri `latest.json`; the DMG remains only for first-time/manual installation.
 
-The sidebar footer always shows the current application version followed by the current license edition. A fresh installation defaults to “免费版”; successful Keygen activation changes it to “专业版”. Reuse the legacy 福宝/DY-KIRO product, device fingerprint, machine activation, refresh, unbind, and offline-grace semantics in the Go engine. License keys remain only in the permission-restricted Go store and the frontend receives only safe status and masked metadata. Free and professional editions currently have no feature-level restrictions. The active-license panel shows its absolute expiry or “永久有效” when Keygen provides no expiry, and exposes an icon-only “更换授权码” action; replacing a key must validate the new key before overwriting the current working authorization. When a professional license has a finite expiry, the sidebar footer shows a compact “剩余 N 天” reminder immediately after the edition badge and uses the shared dark in-app Tooltip to reveal the exact expiry; permanent licenses omit this reminder.
+The sidebar footer always shows the current application version followed by the current license edition. When a desktop update is available, show only a compact red corner dot on the version control (never the text badge “可升级”); the version tooltip still names the latest version. A fresh installation defaults to “免费版”; successful Keygen activation changes it to “专业版”. Reuse the legacy 福宝/DY-KIRO product, device fingerprint, machine activation, refresh, unbind, and offline-grace semantics in the Go engine. License keys remain only in the permission-restricted Go store and the frontend receives only safe status and masked metadata. Free and professional editions currently have no feature-level restrictions. The active-license panel shows its absolute expiry or “永久有效” when Keygen provides no expiry, and exposes an icon-only “更换授权码” action; replacing a key must validate the new key before overwriting the current working authorization. When a professional license has a finite expiry, the sidebar footer shows a compact “剩余 N 天” reminder immediately after the edition badge and uses the shared dark in-app Tooltip to reveal the exact expiry; permanent licenses omit this reminder.
 
 For the professional edition, show a very small cloud-download icon immediately after “福宝控制台” in the sidebar footer once the center-library state has loaded. The downward arrow represents receiving center-library data. Use green when a center-library Key is bound and gray when it is unbound; the free edition shows no icon. The icon uses the shared dark in-app Tooltip and opens the existing authorization-management dialog. Center-library icons inside that dialog use the same downward-arrow direction.
 
@@ -124,7 +126,7 @@ The compact sidebar footer gear opens 红包参与设置 rather than license man
 
 红包参与设置包含持久化的参与红包类型规则：“不限 / 礼物红包 / 钻石红包”，默认“钻石红包”。该规则必须由 Go 引擎在创建参与任务前按红包事件的真实类型过滤；类型不明确的红包只能在“不限”时参与，不能只在前端做视觉筛选，且被过滤的红包不得产生请求记录或计入任务次数。
 
-The data-management screen is named “账号与直播间” and orders its tabs as “红包 / 直播间 / 参与账号 / 监测账号”. The red-packet monitor reuses 福宝’s signed `luckybox/box/list` request path (with `lottery_info` as a safe fallback) but must surface only explicit 红包 payloads; 福袋/lottery payloads are filtered out. Legacy room migration copies `rooms_config.json` into the Go engine’s permission-restricted local store and must never modify the old 福宝 data. The top-bar action is named “导入数据”, with “导入直播间” kept as a distinct first menu action.
+The data-management screen is named “账号与红包池” and orders its primary tabs as “参与账号 / 红包池 / 参与记录”, with “直播间 / 监测账号” still collapsed behind the compact 监测管理 control. The red-packet event tab label is “红包池” (not bare “红包”). The red-packet monitor reuses 福宝’s signed `luckybox/box/list` request path (with `lottery_info` as a safe fallback) but must surface only explicit 红包 payloads; 福袋/lottery payloads are filtered out. Legacy room migration copies `rooms_config.json` into the Go engine’s permission-restricted local store and must never modify the old 福宝 data. The top-bar action is named “导入数据”, with “导入直播间” kept as a distinct first menu action.
 
 The room-management workflow owns red-packet monitoring controls: the “直播间” tab provides per-room start/stop actions plus “全部启动/全部停止” in its upper-right corner, while the adjacent “红包” tab is an event-only feed of red packets detected by running room monitors and must not show monitor controls.
 
@@ -158,7 +160,7 @@ High-volume room imports and monitoring must remain responsive at roughly 100,00
 
 Large live-room imports must remain responsive on Windows. Normalize and deduplicate the input before submission, send valid room IDs to Go in bounded batches, yield the frontend between batches, and show real completed/total progress such as “正在导入 15/1200…”. The Go room store must use indexed lookup rather than scanning every existing room for every imported ID.
 
-On the “账号与直播间” screen, the high-volume room list fills the available viewport with only a compact bottom inset and owns its internal scroll. Participation and monitoring account panels size to their actual row content instead of stretching to fill the window and leaving a large blank area inside the card.
+On the “账号与红包池” screen, the high-volume room list fills the available viewport with only a compact bottom inset and owns its internal scroll. Participation and monitoring account panels size to their actual row content instead of stretching to fill the window and leaving a large blank area inside the card.
 
 Search lives in the top toolbar as a compact progressive-disclosure control: show only the search icon by default, then expand a small inline input when clicked. Do not reserve a full content row for search. Remove decorative top-bar health/security icons that have no working behavior.
 
@@ -212,7 +214,7 @@ Browser instance cards keep a compact loading indicator visible until the native
 
 On Windows, an independently opened browser instance uses only the native system title bar; do not render the redundant in-page account/title strip above the Douyin surface. Opening an instance must restore, bring forward, and focus its independent window. Reopening the same instance reuses and foregrounds the existing native window instead of creating a duplicate WebView or surfacing an `already exists` error.
 
-Opening any settings surface from the browser-instance page must publish its modal-open guard before hiding native child WebViews. In-flight mounts must re-check that guard and remain hidden so a late native surface can never paint above the settings dialog.
+Opening any settings surface or the software-update dialog from the browser-instance page must publish its modal-open guard before hiding native child WebViews. In-flight mounts must re-check that guard and remain hidden so a late native surface can never paint above the dialog (especially Windows WebView2 z-order).
 
 In the “新建浏览器实例” dialog, keep the participation-account refresh action fixed at the far left of the modal footer. Refreshing rotates that fixed icon and preserves the existing account-list surface and modal dimensions; never replace a populated list with a loading frame that makes the dialog jump.
 
@@ -220,7 +222,7 @@ Red-packet prize parsing follows 福宝's luckybox grouping rule: group every bo
 
 The 红包 tab defaults to current, unexpired red packets only. Its tab badge and the main title subtitle count only unexpired red packets. Keep expired records behind a compact right-aligned “历史红包” entry; history mode shows non-current records and provides an equally compact return to current red packets.
 
-Differentiate red-packet kinds in the event list: use a compact faceted gemstone icon for “钻石红包” (never a plain filled rhombus) and retain the gift icon for gift/other red packets. In the “账号与直播间” title subtitle, report the live runtime workload as `x 个房间正在监测` rather than repeating the total canonical room count; whenever that monitored count is positive, append `y 个正在直播` using only monitored rooms whose current engine-probed live status is live. The 直播间 tab badge remains the total room count.
+Differentiate red-packet kinds in the event list: use a compact faceted gemstone icon for “钻石红包” (never a plain filled rhombus) and retain the gift icon for gift/other red packets. In the “账号与红包池” title subtitle, report the live runtime workload as `x 个房间正在监测` rather than repeating the total canonical room count; whenever that monitored count is positive, append `y 个正在直播` using only monitored rooms whose current engine-probed live status is live. The 直播间 tab badge remains the total room count.
 
 Expired red-packet rows must say “已过期” instead of freezing the countdown at `00:00`; keep the absolute expiry timestamp beside that label.
 
@@ -274,13 +276,13 @@ On Windows, retain the native caption and system window controls. Keep the sideb
 
 红包监测 payload 中的 `activity_id` 只是活动分组键，可能是跨直播间重复的 `AC...` 业务标识；参与接口必须优先使用当前原始盒子行里 3 位以上的纯数字 `box_id_str/box_id`，缺少真实数字 box ID 时不得发送参与请求。单个参与账号的页面参与任务必须严格串行，并在每次发送前重新检查冷却状态，禁止同账号并发 `join/rush` 造成假性 `rush_spam` 风控。
 
-红包参与页面上下文绑定参与账号及其专属原生 WebView，而不是永久绑定启动任务时所在的直播间；该直播结束不能自动终止参与任务。每个可执行红包到来后，原生层必须先将保留的 WebView 导航到该红包的目标直播间，再校验登录并发送请求。源头监测端通过中心库同步红包时，必须同时上传已真实取得的 `ActualRoomID`、纯数字 `JoinBoxID` 及可用的 anchor/box/send/delay 原生参数，使其他 Go 引擎无需重复监测即可派发；这些字段仅允许在认证的原生同步链路和权限受限 Go 存储中流转，绝不能返回前端 JavaScript。旧上传端缺少真实参数时仍须等待本地监测补齐，不能拿展示 ID 或分组 activity ID 冒充接口参数；首次补齐后准确派发一次，后续同步或轮询不得重复派发。
+红包参与页面上下文绑定参与账号及其专属原生 WebView，而不是永久绑定启动任务时所在的直播间；该直播结束不能自动终止参与任务。每个可执行红包到来后，原生层必须先将保留的 WebView 导航到该红包的目标直播间，再校验登录并发送请求。页面 join 请求的浏览器指纹必须来自真实 `navigator`（不得在 Windows 上硬编码 Mac OS）；中心库事件缺 `anchor_id` 时在发送前用本机监测 enter 探测补齐，soft-deny（`status_code=0` 且 `succeed=false`）后应短等补参再重试一次 API，仍失败才允许一次页面点击捕获真实签名请求。源头监测端通过中心库同步红包时，必须同时上传已真实取得的 `ActualRoomID`、纯数字 `JoinBoxID` 及可用的 anchor/box/send/delay 原生参数，使其他 Go 引擎无需重复监测即可派发；这些字段仅允许在认证的原生同步链路和权限受限 Go 存储中流转，绝不能返回前端 JavaScript。旧上传端缺少真实参数时仍须等待本地监测补齐，不能拿展示 ID 或分组 activity ID 冒充接口参数；首次补齐后准确派发一次，后续同步或轮询不得重复派发。
 
 客户端或 Go 引擎真实重启会销毁全部原生直播页面参与上下文。启动时必须结束所有没有待开奖记录的持久化 Active 任务，并关闭对应账号的红包接口参与开关；不得把历史 Active 标志显示成“参与任务进行中”。确有未决开奖的任务只能显示为“待恢复开奖记录”，在用户明确恢复原生页面上下文前不能计入运行中或可参与数量。卡片红包图标与顶部参与摘要必须共同以已准备好的原生上下文为真实状态来源。
 
 卡片红包按钮开启或关闭原生页面上下文时，Go 引擎必须在同一操作中同步持久化该参与账号的红包接口参与开关；开启任一步骤失败都必须结束任务并回滚上下文，关闭则立即阻止未来分配。顶部“可参与”数量必须来自账号存储的真实 eligible 结果，不能只根据页面上下文和 Active 标志推算。
 
-在“账号与直播间”的“监测账号”后保留独立“参与记录”页签。每个账号与红包事件的参与尝试必须在 Go redpacket store 中先持久化占位再发送请求，以提供跨客户端重启的幂等去重；记录只向前端暴露账号、红包、直播间、接口类型、请求次数、结果、冷却和时间等安全元数据，绝不保存或返回 CK、签名参数、请求头或原始响应体。
+在“账号与红包池”的“监测账号”后保留独立“参与记录”页签。每个账号与红包事件的参与尝试必须在 Go redpacket store 中先持久化占位再发送请求，以提供跨客户端重启的幂等去重；记录只向前端暴露账号、红包、直播间、接口类型、请求次数、结果、冷却和时间等安全元数据，绝不保存或返回 CK、签名参数、请求头或原始响应体。
 
 浏览器实例页的标题副文案在“本机运行”后紧凑显示实时 CPU 与内存占用百分比；资源数据由 Go 原生层采样并随现有容量轮询刷新，详细内存用量使用共享暗色 Tooltip 展示。
 

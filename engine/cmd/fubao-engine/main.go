@@ -93,6 +93,28 @@ func main() {
 				_, _ = accountStore.SetRedPacketAPIEnabled(accountID, false)
 			}
 		}
+		// Repair account-row 参与/中奖/今日 counters from durable participation
+		// records so today_* is not stuck at 0 after the field was introduced
+		// and profile totals cannot lag behind retained records.
+		now := time.Now()
+		stats := redPacketStore.ParticipationAccountStats(now)
+		patches := make([]accounts.ParticipationStatsPatch, 0, len(stats))
+		for _, item := range stats {
+			patches = append(patches, accounts.ParticipationStatsPatch{
+				AccountID:        item.AccountID,
+				JoinCount:        item.JoinCount,
+				WinCount:         item.WinCount,
+				TodayJoinCount:   item.TodayJoinCount,
+				TodayWinCount:    item.TodayWinCount,
+				TodayWinDiamonds: item.TodayWinDiamonds,
+				TodayStatDate:    item.TodayStatDate,
+			})
+		}
+		if n, err := accountStore.ReconcileParticipationStatsFromRecords(patches, now); err != nil {
+			fmt.Fprintf(os.Stderr, "[accounts] reconcile participation stats failed: %v\n", err)
+		} else if n > 0 {
+			fmt.Fprintf(os.Stderr, "[accounts] reconciled participation stats on %d account profile(s)\n", n)
+		}
 	}
 	if browserStoreErr == nil && accountStoreErr == nil {
 		browserStore.SetCookieUpdater(func(accountID, rawCookie string) error {
@@ -713,10 +735,11 @@ func main() {
 				continue
 			}
 			var params struct {
-				Cookie  string        `json:"cookie"`
-				Role    accounts.Role `json:"role"`
-				GroupID string        `json:"group_id"`
-				Secret  string        `json:"secret"`
+				Cookie    string        `json:"cookie"`
+				Role      accounts.Role `json:"role"`
+				GroupID   string        `json:"group_id"`
+				SessionID string        `json:"session_id"`
+				Secret    string        `json:"secret"`
 			}
 			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.Cookie) == "" {
 				writeError(encoder, req.ID, "invalid_params", "新增扫码账号参数无效")
@@ -738,6 +761,14 @@ func main() {
 			if err != nil {
 				writeError(encoder, req.ID, "account_create_failed", err.Error())
 				continue
+			}
+			// Bind the native instance data-store to the scan-login WebView store
+			// ("create-{session}") so 新建实例 reuses the live session instead of
+			// opening an empty account-id store that cannot re-inject login.
+			if sessionID := strings.TrimSpace(params.SessionID); sessionID != "" {
+				if updated, keyErr := accountStore.SetBrowserProfileKey(account.ID, "create-"+sessionID); keyErr == nil {
+					account = updated
+				}
 			}
 			if params.Role == accounts.RoleMonitoring && redPacketStoreErr == nil {
 				refreshRunningMonitoringPool(accountStore, redPacketStore)
@@ -1082,14 +1113,40 @@ func main() {
 				ID:      req.ID,
 				OK:      true,
 				Result: map[string]string{
-					"instance_id":   params.InstanceID,
-					"account_id":    credential.AccountID,
-					"account_name":  credential.AccountName,
-					"cookie":        credential.Cookie,
-					"cookie_status": credential.CookieStatus,
-					"surface":       surface,
+					"instance_id":         params.InstanceID,
+					"account_id":          credential.AccountID,
+					"account_name":        credential.AccountName,
+					"cookie":              credential.Cookie,
+					"cookie_status":       credential.CookieStatus,
+					"surface":             surface,
+					"browser_profile_key": credential.BrowserProfileKey,
 				},
 			})
+		case "account.native_set_browser_profile_key":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			var params struct {
+				AccountID  string `json:"account_id"`
+				ProfileKey string `json:"profile_key"`
+				Secret     string `json:"secret"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil || strings.TrimSpace(params.AccountID) == "" {
+				writeError(encoder, req.ID, "invalid_params", "设置浏览器数据目录参数无效")
+				continue
+			}
+			nativeSecret := strings.TrimSpace(os.Getenv("FUBAO_NATIVE_RPC_SECRET"))
+			if nativeSecret == "" || params.Secret != nativeSecret {
+				writeError(encoder, req.ID, "native_auth_failed", "设置浏览器数据目录请求未授权")
+				continue
+			}
+			account, err := accountStore.SetBrowserProfileKey(params.AccountID, params.ProfileKey)
+			if err != nil {
+				writeError(encoder, req.ID, "account_profile_key_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: account})
 		case "room.list":
 			if roomStoreErr != nil {
 				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
@@ -1152,7 +1209,7 @@ func main() {
 			}
 			if len(req.Params) > 0 {
 				if err := json.Unmarshal(req.Params, &params); err != nil {
-					writeError(encoder, req.ID, "invalid_params", "直播间自动清理参数无效")
+					writeError(encoder, req.ID, "invalid_params", "直播间数据清理参数无效")
 					continue
 				}
 			}
@@ -1244,6 +1301,20 @@ func main() {
 				_ = redPacketStore.SyncRooms(roomStore.All())
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: result})
+		case "room.recycle.restore_all":
+			if roomStoreErr != nil {
+				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			restored, err := roomStore.RestoreAllRecycled()
+			if err != nil {
+				writeError(encoder, req.ID, "room_restore_all_failed", err.Error())
+				continue
+			}
+			if redPacketStoreErr == nil {
+				_ = redPacketStore.SyncRooms(roomStore.All())
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{"restored": restored}})
 		case "room.recycle.delete":
 			if roomStoreErr != nil {
 				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
@@ -1274,6 +1345,30 @@ func main() {
 				_ = redPacketStore.SyncRooms(roomStore.All())
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]bool{"deleted": true}})
+		case "room.recycle.delete_all":
+			if roomStoreErr != nil {
+				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())
+				continue
+			}
+			allowCenterExclusion := permanentCenterRoomAccess(licenseManager)
+			deleted, err := roomStore.DeleteAllRecycledScoped(allowCenterExclusion)
+			if err != nil {
+				writeError(encoder, req.ID, "room_delete_all_failed", err.Error())
+				continue
+			}
+			if deleted > 0 && allowCenterExclusion && remoteSyncManager != nil && remoteSyncManagerErr == nil && remoteSyncPullScope(licenseManager) == remotesync.PullAll {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				err := remoteSyncManager.SyncCenterExclusions(ctx, roomStore)
+				cancel()
+				if err != nil {
+					writeError(encoder, req.ID, "room_center_exclusion_sync_failed", "已清空本机回收站，中心库同步失败并将在后台重试："+err.Error())
+					continue
+				}
+			}
+			if redPacketStoreErr == nil {
+				_ = redPacketStore.SyncRooms(roomStore.All())
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{"deleted": deleted}})
 		case "room.migrate_legacy":
 			if roomStoreErr != nil {
 				writeError(encoder, req.ID, "room_store_unavailable", roomStoreErr.Error())

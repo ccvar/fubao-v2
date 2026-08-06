@@ -127,6 +127,79 @@ func TestOfflineDaysRecycleRestoreAndPermanentDelete(t *testing.T) {
 	}
 }
 
+func TestRestoreAllRecycledReturnsStoppedRooms(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ImportIDs("111111111111\n222222222222"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetSettings(Settings{AutoRecycleOfflineDays: 1}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.Local)
+	for _, room := range store.List() {
+		if recycled, err := store.RecordLiveResult(room.ID, "offline", base); err != nil || !recycled {
+			t.Fatalf("offline should recycle: room=%s recycled=%v err=%v", room.ID, recycled, err)
+		}
+	}
+	if len(store.RecycleBin()) != 2 {
+		t.Fatalf("expected 2 recycled rooms, got %d", len(store.RecycleBin()))
+	}
+	restored, err := store.RestoreAllRecycled()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restored != 2 {
+		t.Fatalf("restored=%d, want 2", restored)
+	}
+	if len(store.RecycleBin()) != 0 || len(store.List()) != 2 {
+		t.Fatalf("after restore-all: bin=%d active=%d", len(store.RecycleBin()), len(store.List()))
+	}
+	for _, room := range store.List() {
+		if room.Recycled || room.MonitorStatus != "stopped" {
+			t.Fatalf("restored room must be active and stopped: %+v", room)
+		}
+	}
+}
+
+func TestDeleteAllRecycledClearsRecycleBin(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ImportIDs("111111111111\n222222222222\n333333333333"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetSettings(Settings{AutoRecycleOfflineDays: 1}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 8, 1, 12, 0, 0, 0, time.Local)
+	for _, room := range store.List() {
+		if recycled, err := store.RecordLiveResult(room.ID, "offline", base); err != nil || !recycled {
+			t.Fatalf("offline day should recycle with limit 1: room=%s recycled=%v err=%v", room.ID, recycled, err)
+		}
+	}
+	if len(store.RecycleBin()) != 3 || len(store.List()) != 0 {
+		t.Fatalf("expected full recycle bin, bin=%d active=%d", len(store.RecycleBin()), len(store.List()))
+	}
+	deleted, err := store.DeleteAllRecycledScoped(false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deleted != 3 {
+		t.Fatalf("deleted=%d, want 3", deleted)
+	}
+	if len(store.RecycleBin()) != 0 || len(store.All()) != 0 {
+		t.Fatalf("recycle bin and store must be empty after clear: bin=%d all=%d", len(store.RecycleBin()), len(store.All()))
+	}
+	deleted, err = store.DeleteAllRecycledScoped(false)
+	if err != nil || deleted != 0 {
+		t.Fatalf("empty clear should no-op: deleted=%d err=%v", deleted, err)
+	}
+}
+
 func TestAutoRecycleDisabledNeverArchives(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {
@@ -158,6 +231,7 @@ func TestLowLiveCleanupSkipsUnknownAndRecyclesLocalRoom(t *testing.T) {
 		t.Fatal(err)
 	}
 	settings := store.Settings()
+	// Low-live is manual 数据清理 only; monitoring must not recycle on first offline.
 	settings.AutoRecycleOfflineDays = 0
 	settings.AutoRecycleLowLiveEnabled = true
 	settings.AutoRecycleMaxLiveSessions = 0
@@ -171,11 +245,18 @@ func TestLowLiveCleanupSkipsUnknownAndRecyclesLocalRoom(t *testing.T) {
 	if len(store.List()) != 1 {
 		t.Fatal("a room without a definitive probe was removed")
 	}
-	if cleaned, err := store.RecordLiveResult("777777777777", "offline", when); err != nil || !cleaned {
-		t.Fatalf("definitively offline room with zero live sessions must recycle, cleaned=%v err=%v", cleaned, err)
+	if cleaned, err := store.RecordLiveResult("777777777777", "offline", when); err != nil || cleaned {
+		t.Fatalf("monitor probes must not run low-live cleanup, cleaned=%v err=%v", cleaned, err)
 	}
-	if len(store.List()) != 0 || len(store.RecycleBin()) != 1 {
-		t.Fatal("local room must enter the recoverable recycle bin")
+	if len(store.List()) != 1 || len(store.RecycleBin()) != 0 {
+		t.Fatal("low-live rule must wait for manual 数据清理")
+	}
+	progress, err := store.ExecuteCleanup("", 100, when)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.Recycled != 1 || len(store.RecycleBin()) != 1 {
+		t.Fatalf("manual cleanup must recycle zero-session offline room: %+v bin=%d", progress, len(store.RecycleBin()))
 	}
 }
 
@@ -185,7 +266,10 @@ func TestCenterOnlyCleanupPersistsExclusionUntilRestored(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	item := CenterRoom{WebRID: "888888888888", Title: "中心库直播间", MetricsVersion: 1, LiveSessionCount: 0, CenterUpdatedAt: "2026-08-04T09:00:00+08:00"}
+	item := CenterRoom{
+		WebRID: "888888888888", Title: "中心库直播间", LiveStatus: "offline",
+		MetricsVersion: 1, LiveSessionCount: 0, CenterUpdatedAt: "2026-08-04T09:00:00+08:00",
+	}
 	if _, err := store.MergeCenter([]CenterRoom{item}); err != nil {
 		t.Fatal(err)
 	}
@@ -196,8 +280,16 @@ func TestCenterOnlyCleanupPersistsExclusionUntilRestored(t *testing.T) {
 	if _, err := store.SetSettings(settings); err != nil {
 		t.Fatal(err)
 	}
-	if cleaned, err := store.RecordLiveResult(item.WebRID, "offline", time.Now()); err != nil || !cleaned {
-		t.Fatalf("center-only room was not cleaned, cleaned=%v err=%v", cleaned, err)
+	// Center offline is server-authoritative; monitor path must not auto low-live.
+	if cleaned, err := store.RecordLiveResult(item.WebRID, "offline", time.Now()); err != nil || cleaned {
+		t.Fatalf("monitor path must not auto low-live clean center room: cleaned=%v err=%v", cleaned, err)
+	}
+	progress, err := store.ExecuteCleanup("", 100, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.Excluded != 1 {
+		t.Fatalf("manual cleanup must exclude center-only room: %+v", progress)
 	}
 	if len(store.All()) != 0 || len(store.RecycleBin()) != 0 {
 		t.Fatal("center-only room must be deleted locally instead of archived")
@@ -427,8 +519,12 @@ func TestPermanentDeleteCenterLinkedRoomCreatesExclusion(t *testing.T) {
 	if _, err := store.SetSettings(settings); err != nil {
 		t.Fatal(err)
 	}
-	if cleaned, err := store.RecordLiveResult(item.WebRID, "offline", time.Now()); err != nil || !cleaned {
-		t.Fatalf("center-linked local room must enter recycle bin: cleaned=%v err=%v", cleaned, err)
+	if cleaned, err := store.RecordLiveResult(item.WebRID, "offline", time.Now()); err != nil || cleaned {
+		t.Fatalf("monitor path must not low-live recycle: cleaned=%v err=%v", cleaned, err)
+	}
+	progress, err := store.ExecuteCleanup("", 100, time.Now())
+	if err != nil || progress.Recycled != 1 {
+		t.Fatalf("manual cleanup must recycle center-linked local room: %+v err=%v", progress, err)
 	}
 	if err := store.DeleteRecycled(item.WebRID); err != nil {
 		t.Fatal(err)
@@ -462,10 +558,14 @@ func TestNoPacketCleanupUsesFirstProbeAndLatestPacket(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cleaned, err := store.RecordLiveResult("999999999999", "offline", first.Add(96*time.Hour)); err != nil || cleaned {
-		t.Fatalf("recent packet must reset the no-packet window: cleaned=%v err=%v", cleaned, err)
+		t.Fatalf("recent packet must keep room active on monitor path: cleaned=%v err=%v", cleaned, err)
 	}
-	if cleaned, err := store.RecordLiveResult("999999999999", "offline", packetAt.Add(72*time.Hour)); err != nil || !cleaned {
-		t.Fatalf("three full days without a packet must recycle: cleaned=%v err=%v", cleaned, err)
+	// No-packet rule is manual 数据清理 only.
+	if progress, err := store.ExecuteCleanup("", 100, packetAt.Add(24*time.Hour)); err != nil || progress.Recycled != 0 {
+		t.Fatalf("within 3 days of last packet must not clean: %+v err=%v", progress, err)
+	}
+	if progress, err := store.ExecuteCleanup("", 100, packetAt.Add(72*time.Hour)); err != nil || progress.Recycled != 1 {
+		t.Fatalf("three full days without a packet must recycle via manual cleanup: %+v err=%v", progress, err)
 	}
 }
 

@@ -137,6 +137,184 @@ func TestRedPacketParticipationEligibility(t *testing.T) {
 	}
 }
 
+func TestReconcileParticipationStatsFromRecordsBackfillsToday(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, _, err := store.UpsertAuthenticatedCookie("sessionid_ss=reconcile", "回填账号", "30008", "sec-30008", RoleParticipation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Inflated all-time counters + empty today fields (legacy profile shape).
+	store.mu.Lock()
+	store.accounts[view.ID].Participation.JoinCount = 100
+	store.accounts[view.ID].Participation.WinCount = 5
+	store.accounts[view.ID].Participation.TodayStatDate = ""
+	store.accounts[view.ID].Participation.TodayJoinCount = 0
+	store.accounts[view.ID].Participation.TodayWinCount = 0
+	store.accounts[view.ID].Participation.TodayWinDiamonds = 0
+	store.mu.Unlock()
+
+	today := time.Now().Format("2006-01-02")
+	changed, err := store.ReconcileParticipationStatsFromRecords([]ParticipationStatsPatch{{
+		AccountID: view.ID, JoinCount: 12, WinCount: 2,
+		TodayJoinCount: 3, TodayWinCount: 1, TodayWinDiamonds: 8,
+		TodayStatDate: today,
+	}}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed == 0 {
+		t.Fatal("expected reconciliation to rewrite profile")
+	}
+	got := store.List(RoleParticipation)[0].Participation
+	// Successful-join rollup replaces inflated legacy totals.
+	if got.JoinCount != 12 {
+		t.Fatalf("join_count=%d, want 12 from successful records", got.JoinCount)
+	}
+	if got.WinCount != 2 {
+		t.Fatalf("win_count=%d, want 2 from successful records", got.WinCount)
+	}
+	if got.TodayJoinCount != 3 || got.TodayWinCount != 1 || got.TodayWinDiamonds != 8 || got.TodayStatDate != today {
+		t.Fatalf("today stats not backfilled: %+v", got)
+	}
+}
+
+func TestReconcileParticipationStatsZerosAccountsWithoutRecords(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, _, err := store.UpsertAuthenticatedCookie("sessionid_ss=orphan-stats", "无记录账号", "30009", "sec-30009", RoleParticipation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.accounts[view.ID].Participation.JoinCount = 1675
+	store.accounts[view.ID].Participation.WinCount = 29
+	store.accounts[view.ID].Participation.TodayJoinCount = 40
+	store.accounts[view.ID].Participation.TodayWinCount = 2
+	store.accounts[view.ID].Participation.TodayWinDiamonds = 3
+	store.accounts[view.ID].Participation.TodayStatDate = time.Now().Format("2006-01-02")
+	store.mu.Unlock()
+
+	// Empty patch set means the durable record store has no rows for anyone.
+	changed, err := store.ReconcileParticipationStatsFromRecords(nil, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed == 0 {
+		t.Fatal("expected inflated legacy totals to be zeroed")
+	}
+	got := store.List(RoleParticipation)[0].Participation
+	if got.JoinCount != 0 || got.WinCount != 0 || got.TodayJoinCount != 0 || got.TodayWinCount != 0 || got.TodayWinDiamonds != 0 {
+		t.Fatalf("orphan profile not zeroed: %+v", got)
+	}
+}
+
+func TestParticipationTodayCountersAndParseWinDiamonds(t *testing.T) {
+	if got := parseWinDiamonds("已中8钻"); got != 8 {
+		t.Fatalf("parse 已中8钻=%v, want 8", got)
+	}
+	if got := parseWinDiamonds("已中1.5钻（钱包增量确认）"); got != 1.5 {
+		t.Fatalf("parse wallet delta=%v, want 1.5", got)
+	}
+	if got := parseWinDiamonds("未中奖"); got != 0 {
+		t.Fatalf("parse not-won should be 0, got %v", got)
+	}
+
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, _, err := store.UpsertAuthenticatedCookie("sessionid_ss=today-stat", "今日统计", "30007", "sec-30007", RoleParticipation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.RecordRedPacketParticipation(view.ID, "joined", "红包参与请求已受理", true, false, 0, false)
+	store.RecordRedPacketParticipation(view.ID, "joined", "红包参与请求已受理", true, false, 0, false)
+	store.RecordRedPacketDrawResult(view.ID, "已中8钻", true)
+	store.RecordRedPacketDrawResult(view.ID, "未中奖", false)
+
+	listed := store.List(RoleParticipation)[0]
+	if listed.Participation == nil {
+		t.Fatal("missing participation profile")
+	}
+	p := listed.Participation
+	if p.JoinCount != 2 || p.TodayJoinCount != 2 {
+		t.Fatalf("join totals: all=%d today=%d", p.JoinCount, p.TodayJoinCount)
+	}
+	if p.WinCount != 1 || p.TodayWinCount != 1 || p.TodayWinDiamonds != 8 {
+		t.Fatalf("win totals: all=%d today=%d diamonds=%v", p.WinCount, p.TodayWinCount, p.TodayWinDiamonds)
+	}
+
+	// Simulate day rollover: yesterday stats must not leak into today's list view.
+	store.mu.Lock()
+	store.accounts[view.ID].Participation.TodayStatDate = time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	store.accounts[view.ID].Participation.TodayJoinCount = 9
+	store.accounts[view.ID].Participation.TodayWinCount = 9
+	store.accounts[view.ID].Participation.TodayWinDiamonds = 99
+	store.mu.Unlock()
+	rolled := store.List(RoleParticipation)[0].Participation
+	if rolled.TodayJoinCount != 0 || rolled.TodayWinCount != 0 || rolled.TodayWinDiamonds != 0 {
+		t.Fatalf("list must roll today counters after midnight: %+v", rolled)
+	}
+	if rolled.JoinCount != 2 || rolled.WinCount != 1 {
+		t.Fatalf("all-time counters must survive day roll: join=%d win=%d", rolled.JoinCount, rolled.WinCount)
+	}
+}
+
+func TestRiskControlCooldownSurvivesDisableAndZeroCooldownRecords(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, _, err := store.UpsertAuthenticatedCookie("sessionid_ss=risk-cool", "风控账号", "30006", "sec-30006", RoleParticipation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SetRedPacketAPIEnabled(view.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	store.RecordRedPacketParticipation(view.ID, "risk_control", "触发风控，账号已进入冷却（30 分钟）", false, false, 30*time.Minute, false)
+
+	listed := store.List(RoleParticipation)[0]
+	if listed.Participation == nil || listed.Participation.RedPacketAPIEnabled {
+		t.Fatalf("risk control should disable the API switch: %+v", listed.Participation)
+	}
+	if !activeRedPacketCooldown(listed.Participation.RedPacketCooldownUntil, time.Now()) {
+		t.Fatalf("risk control must persist a future cooldown: %+v", listed.Participation)
+	}
+	until := listed.Participation.RedPacketCooldownUntil
+	status := listed.Participation.LastRedPacketStatus
+	message := listed.Participation.LastRedPacketMessage
+
+	// Task stop / closing the gift switch previously wiped the cooldown badge.
+	updated, err := store.SetRedPacketAPIEnabled(view.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Participation.RedPacketCooldownUntil != until ||
+		updated.Participation.LastRedPacketStatus != status ||
+		updated.Participation.LastRedPacketMessage != message {
+		t.Fatalf("disabling API must keep risk cooldown badge fields: %+v", updated.Participation)
+	}
+
+	// A later zero-cooldown record (for example concurrent context cleanup)
+	// must not clear the active risk window or overwrite its status copy.
+	store.RecordRedPacketParticipation(view.ID, "failed", "红包接口未确认参与结果", false, false, 0, false)
+	after := store.List(RoleParticipation)[0]
+	if after.Participation.RedPacketCooldownUntil != until ||
+		after.Participation.LastRedPacketStatus != "risk_control" ||
+		after.Participation.LastRedPacketMessage != message {
+		t.Fatalf("zero-cooldown record wiped risk cooldown: %+v", after.Participation)
+	}
+	if len(store.RedPacketParticipationCredentials(time.Now())) != 0 {
+		t.Fatal("risk-cooling account must stay out of the participation pool")
+	}
+}
+
 func TestRedPacketChallengeBlocksWithoutExpiringCookieAndPersists(t *testing.T) {
 	dataDir := t.TempDir()
 	store, err := NewStore(dataDir)

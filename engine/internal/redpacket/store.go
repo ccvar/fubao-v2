@@ -24,7 +24,7 @@ import (
 )
 
 const (
-	storeVersion         = 16
+	storeVersion         = 18
 	unknownProbeInterval = 10 * time.Second
 	offlineProbeInterval = 60 * time.Second
 	livePacketInterval   = 15 * time.Second
@@ -54,12 +54,12 @@ const (
 // Monitor is safe metadata returned to the frontend. Cookie values are never
 // present in this type or in the persisted files.
 type Monitor struct {
-	ID                     string `json:"id"`
-	RoomID                 string `json:"room_id"`
-	WebRID                 string `json:"web_rid,omitempty"`
-	ActualRoomID           string `json:"actual_room_id,omitempty"`
-	Name                   string `json:"name,omitempty"`
-	StreamerName           string `json:"streamer_name,omitempty"`
+	ID           string `json:"id"`
+	RoomID       string `json:"room_id"`
+	WebRID       string `json:"web_rid,omitempty"`
+	ActualRoomID string `json:"actual_room_id,omitempty"`
+	Name         string `json:"name,omitempty"`
+	StreamerName string `json:"streamer_name,omitempty"`
 	// StreamerID is native-only (owner uid from live enter probe) and used to
 	// fill missing red-packet join anchor_id. Never returned to the frontend.
 	StreamerID             string `json:"-"`
@@ -208,10 +208,15 @@ type ParticipationTask struct {
 // ParticipationOverview is the safe all-time aggregate shown in the sidebar.
 // It is derived from idempotent account/event records, never from frontend
 // counters, so relaunching the client cannot duplicate totals.
+// JoinCount is successful joins only (Joined=true). Today* fields use the
+// local calendar day of join/win confirmation.
 type ParticipationOverview struct {
-	JoinCount   int     `json:"join_count"`
-	WinCount    int     `json:"win_count"`
-	WinDiamonds float64 `json:"win_diamonds"`
+	JoinCount        int     `json:"join_count"`
+	WinCount         int     `json:"win_count"`
+	WinDiamonds      float64 `json:"win_diamonds"`
+	TodayJoinCount   int     `json:"today_join_count"`
+	TodayWinCount    int     `json:"today_win_count"`
+	TodayWinDiamonds float64 `json:"today_win_diamonds"`
 }
 
 // ActivityAccountSummary freezes one exact task's result for activity detail.
@@ -276,10 +281,15 @@ type ParticipationSettings struct {
 	// new join can be assigned. For example, 2 admits only when two seconds or
 	// less remain. Zero disables this extra gate; an already expired packet is
 	// still never eligible.
-	ParticipationCountdownSeconds int    `json:"participation_countdown_seconds"`
-	MinimumDiamonds               int    `json:"minimum_diamonds"`
-	PacketType                    string `json:"packet_type"`
-	FollowPolicy                  string `json:"follow_policy"`
+	ParticipationCountdownSeconds int `json:"participation_countdown_seconds"`
+	// RiskControlCooldownMinutes is applied when Douyin returns the soft-deny
+	// shape succeed=false/hit_bonus=false (including real browser captures that
+	// still fail). The account is marked 冷却中 and skipped until it expires.
+	// Default is 60 minutes.
+	RiskControlCooldownMinutes int    `json:"risk_control_cooldown_minutes"`
+	MinimumDiamonds            int    `json:"minimum_diamonds"`
+	PacketType                 string `json:"packet_type"`
+	FollowPolicy               string `json:"follow_policy"`
 }
 
 // MonitoringSettings are safe, persisted throughput controls for the native
@@ -581,6 +591,26 @@ func (s *Store) load() error {
 			payload.ParticipationSettings.DrawResultMaxAttempts = 3
 		}
 		migrated = true
+	}
+	// Version 17 demotes historical soft-deny false successes (see
+	// demoteFalseSuccessfulJoins). Must run after records are loaded.
+	if payload.Version < 17 {
+		if demoteFalseSuccessfulJoins(s.participations) > 0 {
+			migrated = true
+		} else {
+			// Still bump version so we do not re-scan every launch.
+			migrated = true
+		}
+	}
+	// Version 18 drops noise participation rows (failed / network_error /
+	// pending) from the durable audit list so the UI only keeps meaningful
+	// outcomes. Idempotent account/event keys are freed for a later retry.
+	if payload.Version < 18 {
+		if purgeNoiseParticipationRecords(s.participations) > 0 {
+			migrated = true
+		} else {
+			migrated = true
+		}
 	}
 	s.settings = normalizeParticipationSettings(payload.ParticipationSettings)
 	s.monitoringSettings = normalizeMonitoringSettings(payload.MonitoringSettings)
@@ -925,6 +955,12 @@ func normalizeParticipationSettings(settings ParticipationSettings) Participatio
 	if settings.CooldownSeconds > 86400 {
 		settings.CooldownSeconds = 86400
 	}
+	if settings.RiskControlCooldownMinutes <= 0 {
+		settings.RiskControlCooldownMinutes = 60
+	}
+	if settings.RiskControlCooldownMinutes > 24*60 {
+		settings.RiskControlCooldownMinutes = 24 * 60
+	}
 	if settings.StopAfterWins < 0 {
 		settings.StopAfterWins = 0
 	}
@@ -1222,7 +1258,7 @@ func (s *Store) PendingDraws(accountID string) []Event {
 
 func participationDrawTerminal(status string) bool {
 	switch strings.TrimSpace(status) {
-	case "won", "not_won", "draw_error", "challenge_blocked":
+	case "won", "not_won", "draw_error", "challenge_blocked", "risk_control":
 		return true
 	default:
 		return false
@@ -1316,25 +1352,259 @@ func (s *Store) FinishParticipationTask(accountID, reason string) error {
 	return s.saveLocked()
 }
 
+// ParticipationAccountStats is a credential-free per-account rollup from the
+// durable participation record store. Used to repair account-row counters when
+// profile join/win totals drift or today_* fields were never backfilled.
+type ParticipationAccountStats struct {
+	AccountID        string  `json:"account_id"`
+	JoinCount        int     `json:"join_count"`
+	WinCount         int     `json:"win_count"`
+	TodayJoinCount   int     `json:"today_join_count"`
+	TodayWinCount    int     `json:"today_win_count"`
+	TodayWinDiamonds float64 `json:"today_win_diamonds"`
+	TodayStatDate    string  `json:"today_stat_date"`
+}
+
+// ParticipationAccountStats returns successful-join / win totals and local-day
+// counters for every account that has durable participation records.
+// Risk-control, failed, network-error and other non-accepted rows never count.
+func (s *Store) ParticipationAccountStats(now time.Time) []ParticipationAccountStats {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if now.IsZero() {
+		now = time.Now()
+	}
+	today := now.Format("2006-01-02")
+	byID := map[string]*ParticipationAccountStats{}
+	for _, record := range s.participations {
+		if record == nil || strings.TrimSpace(record.AccountID) == "" {
+			continue
+		}
+		stats := byID[record.AccountID]
+		if stats == nil {
+			stats = &ParticipationAccountStats{
+				AccountID:     record.AccountID,
+				TodayStatDate: today,
+			}
+			byID[record.AccountID] = stats
+		}
+		if participationIsSuccessfulJoin(record) {
+			stats.JoinCount++
+			if participationStampOnLocalDay(firstNonEmpty(record.JoinedAt, record.CreatedAt, record.UpdatedAt), now) {
+				stats.TodayJoinCount++
+			}
+		}
+		if participationIsConfirmedWin(record) {
+			stats.WinCount++
+			diamonds := participationWinDiamonds(record)
+			if participationStampOnLocalDay(firstNonEmpty(record.UpdatedAt, record.JoinedAt, record.CreatedAt), now) {
+				stats.TodayWinCount++
+				if diamonds > 0 {
+					stats.TodayWinDiamonds += diamonds
+				}
+			}
+		}
+	}
+	items := make([]ParticipationAccountStats, 0, len(byID))
+	for _, stats := range byID {
+		items = append(items, *stats)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].AccountID < items[j].AccountID })
+	return items
+}
+
 // ParticipationOverview returns persisted all-time totals across every
-// account and task. A joined account/event record contributes exactly once.
+// account and task. Only successful joins and confirmed wins count — never
+// risk_control / failed / network_error / login_expired / challenge rows.
 func (s *Store) ParticipationOverview() ParticipationOverview {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
 	result := ParticipationOverview{}
 	for _, record := range s.participations {
 		if record == nil {
 			continue
 		}
-		if record.Joined {
+		if participationIsSuccessfulJoin(record) {
 			result.JoinCount++
+			if participationStampOnLocalDay(firstNonEmpty(record.JoinedAt, record.CreatedAt, record.UpdatedAt), now) {
+				result.TodayJoinCount++
+			}
 		}
-		if record.Won {
+		if participationIsConfirmedWin(record) {
 			result.WinCount++
-			result.WinDiamonds += participationAwardDiamonds(record.Award)
+			diamonds := participationWinDiamonds(record)
+			result.WinDiamonds += diamonds
+			if participationStampOnLocalDay(firstNonEmpty(record.UpdatedAt, record.JoinedAt, record.CreatedAt), now) {
+				result.TodayWinCount++
+				if diamonds > 0 {
+					result.TodayWinDiamonds += diamonds
+				}
+			}
 		}
 	}
 	return result
+}
+
+// falseSuccessfulJoinCutover is when 0.1.42 stopped promoting soft-deny
+// (status_code=0 + succeed=false) to joined. Rows marked joined before this
+// without a confirmed win were produced by that classifier bug.
+var falseSuccessfulJoinCutover = time.Date(2026, 8, 6, 12, 0, 0, 0, time.Local)
+
+// demoteFalseSuccessfulJoins clears Joined on pre-cutover soft-deny false
+// accepts so overview / account 参与成功 no longer include them. Confirmed wins
+// and wallet-delta proof are kept. Returns the number of demoted rows.
+func demoteFalseSuccessfulJoins(records map[string]*ParticipationRecord) int {
+	if len(records) == 0 {
+		return 0
+	}
+	demoted := 0
+	for _, record := range records {
+		if record == nil || !record.Joined {
+			continue
+		}
+		// Confirmed personal wins prove the account was in the draw pool.
+		if participationIsConfirmedWin(record) {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(record.ResultSource), "wallet_delta") {
+			continue
+		}
+		if participationWinDiamonds(record) > 0 {
+			continue
+		}
+		stamp := firstNonEmpty(record.JoinedAt, record.CreatedAt, record.UpdatedAt)
+		if ts, ok := parseParticipationStamp(stamp); ok && !ts.Before(falseSuccessfulJoinCutover) {
+			// After the soft-deny fix, trust the joined flag.
+			continue
+		}
+		record.Joined = false
+		switch strings.ToLower(strings.TrimSpace(record.Status)) {
+		case "not_won", "draw_error", "joined", "already_joined", "pending":
+			record.Status = "failed"
+			msg := strings.TrimSpace(record.Message)
+			if msg == "" || msg == "未中奖" || strings.Contains(msg, "开奖") ||
+				msg == "红包参与请求已受理" || msg == "红包参与请求已受理，等待开奖" || msg == "红包已受理" {
+				record.Message = "历史误记：接口未真正受理（succeed=false 曾被记为成功）"
+			}
+		}
+		demoted++
+	}
+	return demoted
+}
+
+func parseParticipationStamp(stamp string) (time.Time, bool) {
+	stamp = strings.TrimSpace(stamp)
+	if stamp == "" {
+		return time.Time{}, false
+	}
+	if ts, err := time.Parse(time.RFC3339Nano, stamp); err == nil {
+		return ts, true
+	}
+	if ts, err := time.Parse(time.RFC3339, stamp); err == nil {
+		return ts, true
+	}
+	return time.Time{}, false
+}
+
+// participationIsSuccessfulJoin is true only when Douyin accepted the join.
+// Requires Joined=true (or a confirmed win). Status not_won/draw_error alone
+// never counts — historical soft-deny rows were rewritten to those statuses
+// after an empty receive while Joined was incorrectly true.
+func participationIsSuccessfulJoin(record *ParticipationRecord) bool {
+	if record == nil {
+		return false
+	}
+	// A confirmed win always implies a real accepted join.
+	if participationIsConfirmedWin(record) {
+		return true
+	}
+	if !record.Joined {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(record.Status)) {
+	case "risk_control", "failed", "network_error", "login_expired", "challenge_blocked",
+		"context_required", "expired", "pending":
+		return false
+	case "joined", "already_joined", "not_won", "won", "draw_error":
+		// draw_error means the join was accepted; only the personal result query failed.
+		return true
+	default:
+		return true
+	}
+}
+
+func participationIsConfirmedWin(record *ParticipationRecord) bool {
+	if record == nil {
+		return false
+	}
+	if record.Won {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(record.Status), "won")
+}
+
+func participationWinDiamonds(record *ParticipationRecord) float64 {
+	if record == nil {
+		return 0
+	}
+	if diamonds := participationAwardDiamonds(record.Award); diamonds > 0 {
+		return diamonds
+	}
+	return participationAwardDiamonds(record.Message)
+}
+
+// participationStampOnLocalDay reports whether stamp falls on the local
+// calendar day of now (RFC3339 / RFC3339Nano).
+func participationStampOnLocalDay(stamp string, now time.Time) bool {
+	stamp = strings.TrimSpace(stamp)
+	if stamp == "" {
+		return false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, stamp)
+	if err != nil {
+		parsed, err = time.Parse(time.RFC3339, stamp)
+	}
+	if err != nil {
+		return false
+	}
+	local := parsed.In(now.Location())
+	y1, m1, d1 := local.Date()
+	y2, m2, d2 := now.Date()
+	return y1 == y2 && m1 == m2 && d1 == d2
+}
+
+// formatParticipationWinSegment is the prize half of a completion line.
+// Zero wins render as 未中奖; otherwise e.g. 2钻/1次 (no “中奖” prefix).
+func formatParticipationWinSegment(wins int, diamonds float64) string {
+	if wins <= 0 {
+		return "未中奖"
+	}
+	return fmt.Sprintf("%s钻/%d次", formatParticipationDiamonds(diamonds), wins)
+}
+
+func formatParticipationCompletionLabel(name string, joins, wins int, diamonds float64) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = "参与账号"
+	}
+	// Compact copy: no spaces around numbers. Examples:
+	// jojo已完成:2钻/1次, 参与10次
+	// jojo已完成:未中奖, 参与10次
+	return fmt.Sprintf("%s已完成:%s, 参与%d次", name, formatParticipationWinSegment(wins, diamonds), joins)
+}
+
+func formatParticipationBatchCompletionLabel(title, state string, joins, wins int, diamonds float64) string {
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = "红包参与任务"
+	}
+	state = strings.TrimSpace(state)
+	if state == "" {
+		state = "已完成"
+	}
+	return fmt.Sprintf("“%s”%s:%s, 参与%d次",
+		title, state, formatParticipationWinSegment(wins, diamonds), joins)
 }
 
 func (s *Store) participationTaskSummaryLocked(accountID, taskID string) ActivityAccountSummary {
@@ -1385,8 +1655,7 @@ func (s *Store) finalizeParticipationTaskActivityLocked(task *ParticipationTask,
 	activity.TaskIDs = map[string]string{task.AccountID: task.ID}
 	activity.AccountSummaries = []ActivityAccountSummary{summary}
 	activity.Title = summary.AccountName
-	activity.Label = fmt.Sprintf("%s已完成：参与 %d 次，中奖 %d 次 / %s 钻",
-		summary.AccountName, summary.JoinCount, summary.WinCount, formatParticipationDiamonds(summary.WinDiamonds))
+	activity.Label = formatParticipationCompletionLabel(summary.AccountName, summary.JoinCount, summary.WinCount, summary.WinDiamonds)
 	activity.Active = false
 	activity.JoinCount = summary.JoinCount
 	activity.WinCount = summary.WinCount
@@ -1430,8 +1699,7 @@ func (s *Store) finalizeParticipationBatchActivityLocked(activityID string, stop
 		state = "已停止"
 		activity.StoppedAt = now.Format(time.RFC3339Nano)
 	}
-	activity.Label = fmt.Sprintf("“%s”%s：%d 个账号，参与 %d 次，中奖 %d 次 / %s 钻",
-		title, state, len(activity.AccountIDs), joins, wins, formatParticipationDiamonds(diamonds))
+	activity.Label = formatParticipationBatchCompletionLabel(title, state, joins, wins, diamonds)
 	activity.Active = false
 	activity.AccountSummaries = summaries
 	activity.JoinCount = joins
@@ -1608,6 +1876,44 @@ func (s *Store) ParticipationRecords() []ParticipationRecord {
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].UpdatedAt > items[j].UpdatedAt })
 	return items
+}
+
+// purgeNoiseParticipationRecords removes failed / network_error / pending rows
+// that clutter the participation log without representing a real accept or
+// risk-control outcome. Returns how many rows were deleted.
+func purgeNoiseParticipationRecords(records map[string]*ParticipationRecord) int {
+	if len(records) == 0 {
+		return 0
+	}
+	removed := 0
+	for id, record := range records {
+		if record == nil {
+			delete(records, id)
+			removed++
+			continue
+		}
+		switch strings.ToLower(strings.TrimSpace(record.Status)) {
+		case "failed", "network_error", "pending":
+			delete(records, id)
+			removed++
+		}
+	}
+	return removed
+}
+
+// PurgeNoiseParticipationRecords is the locked runtime entry for clearing
+// failed / network_error / pending participation audit rows and persisting.
+func (s *Store) PurgeNoiseParticipationRecords() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	removed := purgeNoiseParticipationRecords(s.participations)
+	if removed == 0 {
+		return 0, nil
+	}
+	if err := s.saveLocked(); err != nil {
+		return 0, err
+	}
+	return removed, nil
 }
 
 // RecordParticipationTrace persists only allowlisted request parameters and a
@@ -2930,6 +3236,34 @@ func (s *Store) streamerIDForRoomLocked(webRID, actualRoomID string) string {
 		}
 	}
 	return ""
+}
+
+// EnrichParticipationEvent fills native join identifiers that may arrive after
+// the event was first discovered (center rows without anchor, later enter
+// probe, etc.). Safe for concurrent use; never returns credentials.
+func (s *Store) EnrichParticipationEvent(event Event) Event {
+	if s == nil {
+		return event
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if stored := s.events[event.ID]; stored != nil {
+		event.ActualRoomID = firstNonEmpty(event.ActualRoomID, stored.ActualRoomID)
+		event.JoinBoxID = firstNonEmpty(event.JoinBoxID, stored.JoinBoxID)
+		event.AnchorID = firstNonEmpty(event.AnchorID, stored.AnchorID)
+		event.BoxType = firstNonEmpty(event.BoxType, stored.BoxType)
+		event.SendTime = firstNonEmpty(event.SendTime, stored.SendTime)
+		event.DelayTime = firstNonEmpty(event.DelayTime, stored.DelayTime)
+		event.WebRID = firstNonEmpty(event.WebRID, stored.WebRID)
+	}
+	if strings.TrimSpace(event.AnchorID) == "" {
+		event.AnchorID = s.streamerIDForRoomLocked(event.WebRID, event.ActualRoomID)
+		if stored := s.events[event.ID]; stored != nil && event.AnchorID != "" && stored.AnchorID == "" {
+			stored.AnchorID = event.AnchorID
+			s.scheduleSaveLocked()
+		}
+	}
+	return event
 }
 
 func (s *Store) acquireProbeSlot(ctx context.Context) (func(), bool) {

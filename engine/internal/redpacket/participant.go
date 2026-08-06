@@ -34,7 +34,9 @@ const (
 	// draw-result query must match that budget. A 3s cap abandons the native
 	// receive while the page is still switching rooms and surfaces
 	// “接口未返回” after a single attempt.
-	defaultPageParticipationTimeout = 25 * time.Second
+	// Includes native live-room navigation + page join script. Too short a
+	// budget made healthy joins look like "页面超时" when room switches were slow.
+	defaultPageParticipationTimeout = 45 * time.Second
 	defaultDrawResultRequestTimeout = defaultPageParticipationTimeout
 	defaultDrawResultRetryInterval  = time.Second
 )
@@ -112,6 +114,12 @@ type participationRetryStore interface {
 
 type participationCancellationStore interface {
 	CancelParticipation(eventID, accountID string) error
+}
+
+// participationEventEnricher re-resolves native-only join identifiers (for
+// example anchor_id from local room enter probes) right before a page join.
+type participationEventEnricher interface {
+	EnrichParticipationEvent(event Event) Event
 }
 
 // PageParticipationTask contains only the minimum native metadata needed to
@@ -637,6 +645,13 @@ func (p *Participant) run(event Event, credential accounts.RedPacketParticipatio
 	// later balance-delta fallback for this account/event pair.
 	p.captureWalletBaseline(event, credential.AccountID)
 
+	// Center-library rows often omit anchor_id. Re-resolve from local room
+	// monitor enter probes immediately before the page join so the live WebView
+	// does not soft-deny for a missing owner uid that we already know.
+	if enricher, ok := p.recordStore.(participationEventEnricher); ok {
+		event = enricher.EnrichParticipationEvent(event)
+	}
+
 	result := p.attempt(event, credential, decision)
 	if result.joined && result.cooldown <= 0 {
 		if policy, ok := p.recordStore.(participationPolicyStore); ok {
@@ -673,12 +688,15 @@ func (p *Participant) run(event Event, credential accounts.RedPacketParticipatio
 		// A challenge blocks the native account page indefinitely until the user
 		// handles it and explicitly starts a new task. It is not CK expiry and it
 		// must not become eligible again just because a timer elapsed.
-		if stopper, ok := p.pageExecutor.(participationAccountStopper); ok {
-			stopper.StopAccount(credential.AccountID)
-		}
-		if lifecycle, ok := p.recordStore.(participationTaskLifecycleStore); ok {
-			_ = lifecycle.FinishParticipationTask(credential.AccountID, "验证码/安全验证拦截")
-		}
+		p.finishTaskForTerminalBlock(credential.AccountID, "验证码/安全验证拦截")
+		return
+	}
+	if result.status == "risk_control" {
+		// Soft-deny / rush risk cools the account for a long window. The current
+		// participation task cannot accept further joins, so close it early once
+		// any already-accepted draws are gone. Batch activities finalize when
+		// every linked account task ends.
+		p.finishTaskForTerminalBlock(credential.AccountID, firstNonEmpty(result.message, "账号触发风控冷却"))
 		return
 	}
 	// Immediate prize on join/rush (for example diamond_count>0 with succeed:true)
@@ -792,7 +810,20 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 			return
 		}
 		if response.HTTPStatus == http.StatusTooManyRequests || response.HTTPStatus == 444 || containsAny(bodyLower, "风控", "操作频繁", "访问过于频繁") {
-			p.store.RecordRedPacketParticipation(accountID, "risk_control", "开奖结果查询触发风控，账号已进入冷却", false, false, defaultRiskCooldown, false)
+			cooldown := riskControlCooldown(settings)
+			message := fmt.Sprintf("开奖结果查询触发风控，账号已进入冷却（%d 分钟）", int(cooldown/time.Minute))
+			p.store.RecordRedPacketParticipation(
+				accountID,
+				"risk_control",
+				message,
+				false,
+				false,
+				cooldown,
+				false,
+			)
+			_, _ = drawStore.ResolveParticipationDraw(event.ID, accountID, "risk_control", message, "", attempts)
+			p.finishTaskForTerminalBlock(accountID, message)
+			return
 		}
 		if response.ContextMissing {
 			if attempts < maxAttempts {
@@ -968,19 +999,22 @@ func (p *Participant) finishTaskIfComplete(accountID string) {
 	if !state.Stopped {
 		return
 	}
+	p.finishTaskForTerminalBlock(accountID, state.StopReason)
+}
+
+// finishTaskForTerminalBlock ends the current explicit participation task after
+// challenge / risk control / stop-limit completion. Pending personal draws keep
+// the native context alive until they resolve; otherwise StopAccount runs first
+// so the UI never shows a finished task that is still accepting joins.
+func (p *Participant) finishTaskForTerminalBlock(accountID, reason string) {
 	if draws, ok := p.recordStore.(participationDrawRecordStore); ok && len(draws.PendingDraws(accountID)) > 0 {
 		return
 	}
-	reason := state.StopReason
-	// Stop the native account context before publishing the persisted inactive
-	// state. Otherwise observers can see Active=false in the small window between
-	// FinishParticipationTask returning and StopAccount running, while the page
-	// context is still accepting work.
 	if stopper, ok := p.pageExecutor.(participationAccountStopper); ok {
 		stopper.StopAccount(accountID)
 	}
-	if err := lifecycle.FinishParticipationTask(accountID, reason); err != nil {
-		return
+	if lifecycle, ok := p.recordStore.(participationTaskLifecycleStore); ok {
+		_ = lifecycle.FinishParticipationTask(accountID, reason)
 	}
 }
 
@@ -1223,12 +1257,13 @@ func (p *Participant) attempt(event Event, credential accounts.RedPacketParticip
 	// Join alone matches the verified live-page success path. A soft-deny
 	// followed by synthetic rush never recovered in production traces and only
 	// produced extra failed records.
-	return p.postWithNetworkRetry(
+	result := p.postWithNetworkRetry(
 		client,
 		redPacketJoinURL,
 		"join",
 		participationParamsFor(event, false, credential.UserID, credential.SecUID),
 	)
+	return applyRiskControlCooldown(result, p.settingsForAccount(credential.AccountID))
 }
 
 func (p *Participant) attemptInPage(event Event, credential accounts.RedPacketParticipationCredential, decision participationFollowDecision) participationResult {
@@ -1287,7 +1322,7 @@ func (p *Participant) attemptInPage(event Event, credential accounts.RedPacketPa
 	}, nil, response.Endpoint)
 	result.endpoint = firstNonEmpty(response.Endpoint, "page")
 	result.attempts = max(1, response.Attempts)
-	return result
+	return applyRiskControlCooldown(result, p.settingsForAccount(credential.AccountID))
 }
 
 func participationParams(event Event, rush bool) map[string]string {
@@ -1423,7 +1458,55 @@ func classifyParticipationResponse(response *http.Response, requestErr error, en
 		return participationResult{status: "joined", message: firstNonEmpty(message, "红包参与请求已受理"), joined: true, terminal: true}
 	}
 	_ = endpoints
+	// Soft-deny (status_code=0 with succeed=false / hit_bonus=false) is the most
+	// common non-joined shape. Prefer an explicit message so participation
+	// records do not look like a transport failure.
+	if statusCode(payload) == 0 && data != nil {
+		if hasAnyKey(data, "succeed", "hit_bonus", "can_rush_gem") &&
+			!flagOn(data, "succeed", "succeeded", "joined", "has_joined", "hasJoined", "success", "is_success", "isSuccess") {
+			// Real Chrome captures with valid msToken/a_bogus still return this
+			// shape under risk pressure. Treat it as risk control so the account
+			// enters a configurable cooldown and stops taking new joins.
+			return participationResult{
+				status:   "risk_control",
+				message:  firstNonEmpty(message, "触发风控，账号已进入冷却"),
+				terminal: true,
+			}
+		}
+	}
 	return participationResult{status: "failed", message: firstNonEmpty(message, "红包接口未确认参与结果")}
+}
+
+func riskControlCooldown(settings ParticipationSettings) time.Duration {
+	minutes := settings.RiskControlCooldownMinutes
+	if minutes <= 0 {
+		minutes = 60
+	}
+	if minutes > 24*60 {
+		minutes = 24 * 60
+	}
+	return time.Duration(minutes) * time.Minute
+}
+
+func applyRiskControlCooldown(result participationResult, settings ParticipationSettings) participationResult {
+	if result.status != "risk_control" {
+		return result
+	}
+	cooldown := riskControlCooldown(settings)
+	if result.cooldown < cooldown {
+		result.cooldown = cooldown
+	}
+	minutes := int(result.cooldown / time.Minute)
+	if minutes < 1 {
+		minutes = 1
+	}
+	if result.message == "" || result.message == "触发风控，账号已进入冷却" ||
+		strings.Contains(result.message, "succeed=false") ||
+		strings.Contains(result.message, "未确认参与") {
+		result.message = fmt.Sprintf("触发风控，账号已进入冷却（%d 分钟）", minutes)
+	}
+	result.terminal = true
+	return result
 }
 
 func containsChallengeFailure(value string) bool {

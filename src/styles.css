@@ -208,7 +208,9 @@ button {
   background: #dedbd4;
   color: #6c685f;
   font-size: 10px;
+  font-variant-numeric: tabular-nums;
   text-align: center;
+  white-space: nowrap;
 }
 
 .nav-task-running-dot {
@@ -334,9 +336,11 @@ button {
   gap: 5px;
 }
 
-.client-version-button,
-.update-available-badge {
+.client-version-button {
+  position: relative;
+  display: inline-flex;
   height: 16px;
+  align-items: center;
   padding: 0;
   border: 0;
   background: transparent;
@@ -357,19 +361,16 @@ button {
   opacity: .65;
 }
 
-.update-available-badge {
-  padding: 0 5px;
-  border-radius: 5px;
-  background: #f7ead3;
-  color: #a56813;
-  font-size: 8.5px;
-  font-weight: 650;
-}
-
-.update-available-badge:hover,
-.update-available-badge:focus-visible {
-  background: #f0dcb9;
-  color: #82500c;
+.client-version-button .update-available-dot {
+  position: absolute;
+  top: 0;
+  right: -5px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #e25555;
+  box-shadow: 0 0 0 1.5px #f4f1eb;
+  pointer-events: none;
 }
 
 .edition-badge {
@@ -430,6 +431,12 @@ button {
   min-width: max-content;
   margin-left: auto;
   text-align: right;
+}
+
+/* Only the “今日新增” / “中奖次数” digit turns green when positive. */
+.sidebar-data-overview .quick-value-win {
+  font-style: normal;
+  color: #4b9a77;
 }
 
 .sidebar-recent-activity-shell {
@@ -619,9 +626,24 @@ button {
   gap: 1px;
 }
 
-.recent-activity-copy > span:first-child {
+.recent-activity-copy > span:first-child,
+.recent-activity-label {
   font-size: 11px;
   line-height: 15px;
+}
+
+.recent-activity-num {
+  color: #514d46;
+  font-family: "DIN Alternate", "Arial Narrow", "Roboto Condensed", sans-serif;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+/* Match the participation activity icon green (.quick-status.live). */
+.recent-activity-win,
+.recent-activity-win .recent-activity-num {
+  color: #4b9a77;
 }
 
 .recent-activity-meta {
@@ -4961,6 +4983,54 @@ label.browser-column-control[data-tooltip]:focus-within {
   margin: 13px 2px 9px;
   color: #8b867e;
   font-size: 10px;
+}
+
+.room-recycle-intro-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 13px 2px 9px;
+}
+
+.room-recycle-intro-row .participation-settings-intro,
+.room-recycle-intro-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+}
+
+.room-recycle-intro-actions {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 2px;
+  margin-top: -2px;
+}
+
+.room-recycle-restore-all,
+.room-recycle-clear-all {
+  width: 24px;
+  height: 24px;
+}
+
+.room-recycle-restore-all {
+  color: #5a8f74;
+}
+
+.room-recycle-restore-all:hover,
+.room-recycle-restore-all:focus-visible {
+  background: #e8f4ee;
+  color: #2f7a58;
+}
+
+.room-recycle-clear-all {
+  color: #b07a72;
+}
+
+.room-recycle-clear-all:hover,
+.room-recycle-clear-all:focus-visible {
+  background: #f8ebe8;
+  color: #c24b3d;
 }
 
 .room-auto-recycle-setting {

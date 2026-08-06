@@ -187,8 +187,8 @@ func TestParticipantUsesJoinOnlyWithoutRushFallback(t *testing.T) {
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if len(store.records) != 1 || store.records[0].status != "failed" || store.records[0].joined {
-		t.Fatalf("soft-deny join must stay failed without rush recovery: %+v", store.records)
+	if len(store.records) != 1 || store.records[0].status != "risk_control" || store.records[0].joined || store.records[0].cooldown < 60*time.Minute {
+		t.Fatalf("soft-deny join must become risk_control with settings cooldown: %+v", store.records)
 	}
 }
 
@@ -767,6 +767,64 @@ func TestPageParticipantChallengeStopsNativeContextAndTask(t *testing.T) {
 	}
 }
 
+func TestPageParticipantRiskControlStopsNativeContextAndTask(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{RiskControlCooldownMinutes: 30}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationStarted("account-risk", "风控账号"); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeParticipationStore{
+		credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-risk", AccountName: "风控账号"}},
+		notify:      make(chan struct{}, 1),
+	}
+	executor := &fakePageParticipationExecutor{
+		ready: true,
+		response: PageParticipationResponse{
+			Endpoint: "join", HTTPStatus: 200,
+			Body: `{"status_code":0,"data":{"succeed":false,"hit_bonus":false,"can_rush_gem":false}}`, Attempts: 1,
+		},
+	}
+	participant := NewPageParticipant(store, executor, recordStore)
+	participant.HandleEvent(Event{
+		ID: "monitor:risk-event", WebRID: "7654321", ActualRoomID: "700001",
+		JoinBoxID: "7669047909329177395", Title: "钻石红包",
+	})
+	select {
+	case <-store.notify:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for risk-control classification")
+	}
+
+	store.mu.Lock()
+	if len(store.records) != 1 || store.records[0].status != "risk_control" || store.records[0].joined || store.records[0].cooldown < 30*time.Minute {
+		t.Fatalf("soft-deny must cool the account: %+v", store.records)
+	}
+	store.mu.Unlock()
+	executor.mu.Lock()
+	stopped := append([]string(nil), executor.stopped...)
+	executor.mu.Unlock()
+	if len(stopped) != 1 || stopped[0] != "account-risk" {
+		t.Fatalf("risk control must stop native account context: %+v", stopped)
+	}
+	deadline := time.Now().Add(time.Second)
+	for recordStore.GetParticipationState("account-risk", time.Now()).Active && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	state := recordStore.GetParticipationState("account-risk", time.Now())
+	if state.Active {
+		t.Fatalf("risk-control task must finish early: %+v", state)
+	}
+	task := recordStore.participationTasks["account-risk"]
+	if task == nil || !strings.Contains(task.EndReason, "风控") {
+		t.Fatalf("task end reason should mention risk control: %+v", task)
+	}
+}
+
 func TestPageParticipantStoppedBeforeRequestReleasesReservation(t *testing.T) {
 	recordStore, err := NewStore(t.TempDir())
 	if err != nil {
@@ -947,8 +1005,8 @@ func TestParticipantResponseClassification(t *testing.T) {
 	}{
 		{name: "success", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":true}}`), status: "joined", joined: true},
 		{name: "immediate diamond win", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":true,"diamond_count":1,"hit_bonus":false}}`), status: "won", joined: true},
-		{name: "soft deny is not joined", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":false,"hit_bonus":false,"can_rush_gem":false}}`), status: "failed"},
-		{name: "rush zero flags are not risk", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":false,"rush_spam":0,"rush_too_much":0,"rush_too_often":0,"expired":false}}`), status: "failed"},
+		{name: "soft deny is risk control", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":false,"hit_bonus":false,"can_rush_gem":false}}`), status: "risk_control"},
+		{name: "rush zero flags still soft deny", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":false,"rush_spam":0,"rush_too_much":0,"rush_too_often":0,"expired":false}}`), status: "risk_control"},
 		{name: "already joined", response: jsonResponse(200, `{"status_code":0,"data":{"rush_too_much":1}}`), status: "already_joined", joined: true},
 		{name: "expired overrides already", response: jsonResponse(200, `{"status_code":0,"data":{"rush_too_much":1,"expired":true}}`), status: "expired"},
 		{name: "risk", response: jsonResponse(200, `{"status_code":0,"data":{"rush_spam":true},"status_msg":"操作频繁"}`), status: "risk_control", cooldown: true},

@@ -43,6 +43,22 @@
     return action || "原生请求";
   }
 
+  function endpointLabel(endpoint?: string, httpStatus?: number) {
+    // endpoint=page is the native page-script channel result when no Douyin
+    // join/receive HTTP exchange completed (timeout / not in room / context).
+    const name =
+      endpoint === "join"
+        ? "join"
+        : endpoint === "receive"
+          ? "receive"
+          : endpoint === "rush"
+            ? "rush"
+            : endpoint === "page" || !endpoint
+              ? "页面上下文"
+              : endpoint;
+    return httpStatus ? `${name} · HTTP ${httpStatus}` : name;
+  }
+
   function exactTime(value: string) {
     const parsed = Date.parse(value);
     return Number.isFinite(parsed) ? new Date(parsed).toLocaleString("zh-CN", { hour12: false }) : value;
@@ -107,7 +123,7 @@
             <time>{exactTime(log.created_at)}</time>
             <strong>{log.account_name || log.account_id.slice(0, 8)}</strong>
             <span>{actionLabel(log.action)}</span>
-            <em>{log.endpoint || "page"}{log.http_status ? ` · HTTP ${log.http_status}` : ""}</em>
+            <em>{endpointLabel(log.endpoint, log.http_status)}</em>
           </summary>
           <div class="participation-log-detail">
             {#if followLabel(log)}<section><h2>关注策略</h2><pre>{followLabel(log)}</pre></section>{/if}

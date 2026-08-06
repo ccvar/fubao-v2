@@ -186,7 +186,8 @@ func TestParticipationTaskCapturesSettingsSnapshot(t *testing.T) {
 	want := ParticipationSettings{
 		StopAfterJoins: 2, CooldownSeconds: 30, StopAfterWins: 1,
 		DrawResultDelaySeconds: 2, DrawResultMaxAttempts: 5, MinimumDiamonds: 3,
-		PacketType: ParticipationPacketTypeGift, FollowPolicy: ParticipationFollowPolicyOnly,
+		RiskControlCooldownMinutes: 60,
+		PacketType:                 ParticipationPacketTypeGift, FollowPolicy: ParticipationFollowPolicyOnly,
 	}
 	want.DrawResultTimeoutSeconds = 10 // legacy compatibility field is normalized on write
 	if _, err := store.SetParticipationSettings(want); err != nil {
@@ -246,6 +247,9 @@ func TestParticipationSettingsDefaultDrawQueryAndSafeTrace(t *testing.T) {
 	}
 	if got := store.GetParticipationSettings().FollowPolicy; got != ParticipationFollowPolicyPriority {
 		t.Fatalf("default follow policy=%q, want %q", got, ParticipationFollowPolicyPriority)
+	}
+	if got := store.GetParticipationSettings().RiskControlCooldownMinutes; got != 60 {
+		t.Fatalf("default risk-control cooldown=%d, want 60", got)
 	}
 	if err := store.RecordParticipationStarted("account-log", "日志账号"); err != nil {
 		t.Fatal(err)
@@ -555,24 +559,194 @@ func TestParticipationTaskCompletionActivityAndOverviewPersist(t *testing.T) {
 		t.Fatal(err)
 	}
 	activities := store.Activities()
-	if len(activities) != 1 || activities[0].Kind != "participation_task_completed" || activities[0].Label != "账号甲已完成：参与 2 次，中奖 1 次 / 8 钻" {
+	wantLabel := "账号甲已完成:8钻/1次, 参与2次"
+	if len(activities) != 1 || activities[0].Kind != "participation_task_completed" || activities[0].Label != wantLabel {
 		t.Fatalf("unexpected completion activity: %+v", activities)
 	}
 	if activities[0].JoinCount != 2 || activities[0].WinCount != 1 || activities[0].WinDiamonds != 8 || len(activities[0].AccountSummaries) != 1 {
 		t.Fatalf("unexpected completion summary: %+v", activities[0])
 	}
-	if overview := store.ParticipationOverview(); overview.JoinCount != 2 || overview.WinCount != 1 || overview.WinDiamonds != 8 {
+	if overview := store.ParticipationOverview(); overview.JoinCount != 2 || overview.WinCount != 1 || overview.WinDiamonds != 8 ||
+		overview.TodayJoinCount != 2 || overview.TodayWinCount != 1 || overview.TodayWinDiamonds != 8 {
 		t.Fatalf("unexpected participation overview: %+v", overview)
 	}
 	reloaded, err := NewStore(dataDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if overview := reloaded.ParticipationOverview(); overview.JoinCount != 2 || overview.WinCount != 1 || overview.WinDiamonds != 8 {
+	if overview := reloaded.ParticipationOverview(); overview.JoinCount != 2 || overview.WinCount != 1 || overview.WinDiamonds != 8 ||
+		overview.TodayJoinCount != 2 || overview.TodayWinCount != 1 || overview.TodayWinDiamonds != 8 {
 		t.Fatalf("overview did not persist: %+v", overview)
 	}
-	if activities := reloaded.Activities(); len(activities) != 1 || activities[0].Label != "账号甲已完成：参与 2 次，中奖 1 次 / 8 钻" {
+	if activities := reloaded.Activities(); len(activities) != 1 || activities[0].Label != wantLabel {
 		t.Fatalf("completion activity did not persist: %+v", activities)
+	}
+}
+
+func TestParticipationOverviewAndAccountStatsExcludeNonSuccess(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordParticipationStarted("acc-stats", "统计账号"); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	// One accepted join → not_won, plus failure shapes that must never count.
+	cases := []struct {
+		eventID, status string
+		joined, won     bool
+	}{
+		{"evt-ok", "not_won", true, false},
+		{"evt-win", "won", true, true},
+		{"evt-risk", "risk_control", false, false},
+		{"evt-fail", "failed", false, false},
+		{"evt-net", "network_error", false, false},
+		{"evt-login", "login_expired", false, false},
+		{"evt-pending", "pending", false, false},
+		// Mis-flagged Joined must still be rejected by status.
+		{"evt-risk-joined-flag", "risk_control", true, false},
+		// Soft-deny false success: not_won without Joined must not count.
+		{"evt-fake-not-won", "not_won", false, false},
+	}
+	for _, item := range cases {
+		event := Event{ID: item.eventID, RoomID: "room-x", WebRID: "123456789", JoinBoxID: item.eventID, Title: "钻石红包"}
+		reserved, reserveErr := store.ReserveParticipation(event, "acc-stats", "统计账号")
+		if reserveErr != nil || !reserved {
+			t.Fatalf("reserve %s: reserved=%v err=%v", item.eventID, reserved, reserveErr)
+		}
+		if err := store.CompleteParticipation(event.ID, "acc-stats", "join", item.status, item.status, 1, item.joined, item.won, "", 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	overview := store.ParticipationOverview()
+	if overview.JoinCount != 2 || overview.WinCount != 1 {
+		t.Fatalf("overview must count only successful joins/wins: %+v", overview)
+	}
+	if overview.TodayJoinCount != 2 || overview.TodayWinCount != 1 {
+		t.Fatalf("today overview must exclude failures: %+v", overview)
+	}
+	stats := store.ParticipationAccountStats(now)
+	if len(stats) != 1 || stats[0].JoinCount != 2 || stats[0].WinCount != 1 || stats[0].TodayJoinCount != 2 || stats[0].TodayWinCount != 1 {
+		t.Fatalf("account stats must exclude failures: %+v", stats)
+	}
+	// Helper itself rejects failure statuses even when Joined is true.
+	bad := &ParticipationRecord{Status: "risk_control", Joined: true}
+	if participationIsSuccessfulJoin(bad) {
+		t.Fatal("risk_control must never count as successful join")
+	}
+	if participationIsSuccessfulJoin(&ParticipationRecord{Status: "not_won", Joined: false}) {
+		t.Fatal("not_won without Joined must never count as successful join")
+	}
+}
+
+func TestPurgeNoiseParticipationRecords(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordParticipationStarted("acc-purge", "清理账号"); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		eventID, status string
+		joined          bool
+	}{
+		{"keep-won", "won", true},
+		{"keep-not-won", "not_won", true},
+		{"keep-risk", "risk_control", false},
+		{"drop-failed", "failed", false},
+		{"drop-net", "network_error", false},
+		{"drop-pending", "pending", false},
+	}
+	for _, item := range cases {
+		event := Event{ID: item.eventID, RoomID: "room-p", WebRID: "1234567890", JoinBoxID: item.eventID, Title: "钻石红包"}
+		reserved, reserveErr := store.ReserveParticipation(event, "acc-purge", "清理账号")
+		if reserveErr != nil || !reserved {
+			t.Fatalf("reserve %s: %v %v", item.eventID, reserved, reserveErr)
+		}
+		if item.status == "pending" {
+			continue
+		}
+		if err := store.CompleteParticipation(event.ID, "acc-purge", "join", item.status, item.status, 1, item.joined, item.status == "won", "", 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	removed, err := store.PurgeNoiseParticipationRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed != 3 {
+		t.Fatalf("removed=%d, want 3", removed)
+	}
+	left := store.ParticipationRecords()
+	if len(left) != 3 {
+		t.Fatalf("left=%d records: %+v", len(left), left)
+	}
+	for _, record := range left {
+		switch record.Status {
+		case "won", "not_won", "risk_control":
+		default:
+			t.Fatalf("noise status still present: %+v", record)
+		}
+	}
+}
+
+func TestDemoteFalseSuccessfulJoinsClearsSoftDenyHistory(t *testing.T) {
+	records := map[string]*ParticipationRecord{
+		"fake": {
+			ID: "fake", Status: "not_won", Message: "未中奖", Joined: true,
+			JoinedAt: "2026-08-05T12:00:00+08:00", ResultSource: "wallet_snapshot",
+		},
+		"draw": {
+			ID: "draw", Status: "draw_error", Message: "开奖查询失败：已尝试 3 次，接口未返回", Joined: true,
+			JoinedAt: "2026-08-05T13:00:00+08:00",
+		},
+		"win": {
+			ID: "win", Status: "won", Message: "已中1钻", Award: "1钻", Joined: true, Won: true,
+			JoinedAt: "2026-08-05T14:00:00+08:00",
+		},
+		"wallet": {
+			ID: "wallet", Status: "won", Message: "已中2钻（钱包增量确认）", Award: "2钻", Joined: true, Won: true,
+			JoinedAt: "2026-08-05T15:00:00+08:00", ResultSource: "wallet_delta", WalletDiamondDelta: 2,
+		},
+		"post": {
+			ID: "post", Status: "not_won", Message: "未中奖", Joined: true,
+			JoinedAt: "2026-08-06T16:30:00+08:00", ResultSource: "wallet_snapshot",
+		},
+	}
+	got := demoteFalseSuccessfulJoins(records)
+	if got != 2 {
+		t.Fatalf("demoted=%d, want 2 (fake+draw)", got)
+	}
+	if records["fake"].Joined || records["fake"].Status != "failed" {
+		t.Fatalf("fake soft-deny not demoted: %+v", records["fake"])
+	}
+	if records["draw"].Joined || records["draw"].Status != "failed" {
+		t.Fatalf("draw_error soft-deny not demoted: %+v", records["draw"])
+	}
+	if !records["win"].Joined || records["win"].Status != "won" {
+		t.Fatalf("real win must stay: %+v", records["win"])
+	}
+	if !records["wallet"].Joined {
+		t.Fatalf("wallet-delta win must stay: %+v", records["wallet"])
+	}
+	if !records["post"].Joined || records["post"].Status != "not_won" {
+		t.Fatalf("post-cutover real join must stay: %+v", records["post"])
+	}
+	// Overview after demotion only counts real accepts.
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	for id, record := range records {
+		store.participations[id] = record
+	}
+	store.mu.Unlock()
+	overview := store.ParticipationOverview()
+	if overview.JoinCount != 3 || overview.WinCount != 2 {
+		t.Fatalf("overview after demote: %+v want joins=3 wins=2", overview)
 	}
 }
 
@@ -616,7 +790,7 @@ func TestParticipationBatchCompletesAsOneAggregatedActivity(t *testing.T) {
 		t.Fatal(err)
 	}
 	activities = store.Activities()
-	if len(activities) != 1 || activities[0].Active || activities[0].Label != "“立即执行”已完成：2 个账号，参与 2 次，中奖 2 次 / 8 钻" {
+	if len(activities) != 1 || activities[0].Active || activities[0].Label != "“立即执行”已完成:8钻/2次, 参与2次" {
 		t.Fatalf("unexpected aggregated completion activity: %+v", activities)
 	}
 	if len(activities[0].AccountSummaries) != 2 || activities[0].JoinCount != 2 || activities[0].WinCount != 2 || activities[0].WinDiamonds != 8 {
