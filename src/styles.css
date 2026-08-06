@@ -2339,7 +2339,8 @@ label.browser-column-control[data-tooltip]:focus-within {
 
 .browser-account-row .browser-open-button,
 .browser-account-row .browser-close-button,
-.browser-account-row .browser-red-packet-button {
+.browser-account-row .browser-red-packet-button,
+.browser-account-row .browser-chrome-repair-button {
   position: relative;
   width: 24px;
   height: 24px;
@@ -2358,9 +2359,21 @@ label.browser-column-control[data-tooltip]:focus-within {
 .browser-account-row .browser-close-button:hover:not(:disabled),
 .browser-account-row .browser-close-button:focus-visible,
 .browser-account-row .browser-red-packet-button:hover:not(:disabled),
-.browser-account-row .browser-red-packet-button:focus-visible {
+.browser-account-row .browser-red-packet-button:focus-visible,
+.browser-account-row .browser-chrome-repair-button:hover:not(:disabled),
+.browser-account-row .browser-chrome-repair-button:focus-visible {
   background: #efede9;
   color: #302e2a;
+}
+
+.browser-account-row .browser-chrome-repair-button {
+  color: #5b7c9a;
+}
+
+.browser-account-row .browser-chrome-repair-button:hover:not(:disabled),
+.browser-account-row .browser-chrome-repair-button:focus-visible {
+  background: #eaf1f7;
+  color: #3d5f7a;
 }
 
 .browser-account-row .browser-red-packet-button.enabled {
@@ -2393,7 +2406,8 @@ label.browser-column-control[data-tooltip]:focus-within {
 
 .browser-account-row .browser-open-button:disabled,
 .browser-account-row .browser-close-button:disabled,
-.browser-account-row .browser-red-packet-button:disabled {
+.browser-account-row .browser-red-packet-button:disabled,
+.browser-account-row .browser-chrome-repair-button:disabled {
   cursor: default;
   opacity: .48;
 }

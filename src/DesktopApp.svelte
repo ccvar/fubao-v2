@@ -29,6 +29,7 @@
     FunnelSimpleIcon as FunnelSimple,
     GearSixIcon as GearSix,
     GiftIcon as Gift,
+    GoogleChromeLogoIcon as GoogleChromeLogo,
     MagnifyingGlassIcon as MagnifyingGlass,
     MonitorIcon as Monitor,
     PauseIcon as Pause,
@@ -2873,6 +2874,7 @@
   async function mountEmbeddedBrowser(instance: BrowserInstance, element: HTMLElement) {
     if (
       isExternalChromeInstance(instance) ||
+      isChromeRepairRunning(instance) ||
       browserIndependentWindowIds.includes(instance.id) ||
       browserWebviewMountingIds.includes(instance.id) ||
       browserWebviewMountingIds.length >= browserWebviewMountConcurrency ||
@@ -2990,9 +2992,9 @@
     await Promise.all(
       browserInstances.map(async (instance) => {
         if (browserLayoutChanging || expectedRevision !== browserLayoutRevision) return;
-        // Imported accounts host Douyin in external Chromium; never attach a
-        // Tauri WebView to those cards.
-        if (isExternalChromeInstance(instance)) {
+        // Default dual-path external surface is disabled. While an on-demand
+        // Chrome repair session is running, keep the card WebView unmounted.
+        if (isExternalChromeInstance(instance) || isChromeRepairRunning(instance)) {
           if (
             browserWebviewMountedIds.includes(instance.id) ||
             browserWebviewMountingIds.includes(instance.id)
@@ -3256,9 +3258,26 @@
   }
 
   function isExternalChromeInstance(_instance: BrowserInstance) {
-    // Import→system Chrome dual path is disabled. Always use embedded instance
-    // windows (stable load + login) until external Chrome is reworked.
+    // Import→system Chrome dual path is disabled as the default host. Cards
+    // always use embedded WebViews; Chrome is only opened for repair-login.
     return false;
+  }
+
+  /** Cookie-import accounts can open on-demand Chrome to re-establish a live session. */
+  function isImportAccountInstance(instance: BrowserInstance) {
+    const source = (accounts.find((account) => account.id === instance.account_id)?.source || "")
+      .trim()
+      .toLowerCase();
+    return source === "manual-import" || source === "manual" || source === "imported" || source === "dy-kiro" || source === "legacy";
+  }
+
+  /** Chrome CDP repair session is active (status online from browser.repair_login). */
+  function isChromeRepairRunning(instance: BrowserInstance) {
+    return (
+      isImportAccountInstance(instance) &&
+      instance.status === "online" &&
+      !browserIndependentWindowIds.includes(instance.id)
+    );
   }
 
   function browserCookieStatus(instance: BrowserInstance) {
@@ -5055,6 +5074,40 @@
     }
   }
 
+  /** On-demand Chrome CDP repair for import accounts (Option B). */
+  async function repairBrowserLogin(instance: BrowserInstance) {
+    if (browserOpeningId || browserClosingId === instance.id) return;
+    if (!isImportAccountInstance(instance)) {
+      showToast("仅导入 Cookie 的账号可使用 Chrome 修复登录");
+      return;
+    }
+    if (!isTauriDesktop()) {
+      showToast("Chrome 修复登录仅支持桌面客户端");
+      return;
+    }
+    browserOpeningId = instance.id;
+    browserError = "";
+    try {
+      // Free the card WebView so Chrome owns the repair session; after the
+      // extension writes CK back, pollBrowserInstanceStatuses remounts with the
+      // refreshed credential while the card surface stays embedded.
+      await releaseEmbeddedBrowser(instance);
+      await invoke("open_browser_instance_window", {
+        instanceId: instance.id,
+        surface: "external_chrome",
+      });
+      showToast(`已打开「${instance.account_name}」的 Chrome 登录修复；登录成功后会自动同步回卡片`);
+      await loadBrowserInstances();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      browserError = message;
+      await loadBrowserInstances();
+      showToast(message);
+    } finally {
+      browserOpeningId = "";
+    }
+  }
+
   function browserRedPacketLiveTarget(instance: BrowserInstance) {
     const followed = followingLiveSnapshot(instance)?.items.find((item) => /^\d{6,20}$/.test(item.web_rid));
     if (followed) return { webRID: followed.web_rid, label: followed.nickname || followed.title || followed.web_rid };
@@ -6111,7 +6164,13 @@
                     data-browser-instance={item.id}
                     use:observeBrowserMount
                   >
-                    {#if isExternalChromeInstance(item)}
+                    {#if isChromeRepairRunning(item)}
+                      <span class="browser-preview-loading external">
+                        <GoogleChromeLogo size={18} />
+                        <strong>Chrome 修复登录中</strong>
+                        <small>在 Chrome 完成登录后会自动同步 CK 并回到卡片内嵌</small>
+                      </span>
+                    {:else if isExternalChromeInstance(item)}
                       {#if item.status === "online"}
                         <span class="browser-preview-loading external">
                           <ArrowSquareOut size={18} />
@@ -6219,7 +6278,7 @@
                         {#if followedLive}<span>{followedLive.total}</span>{/if}
                       </button>
                     {/if}
-                    {#if !cookieExpired && !isExternalChromeInstance(item)}
+                    {#if !cookieExpired && !isExternalChromeInstance(item) && !isChromeRepairRunning(item)}
                       <button
                         class="secondary-button browser-red-packet-button"
                         class:enabled={participationEnabled}
@@ -6237,6 +6296,24 @@
                         {/if}
                       </button>
                     {/if}
+                    {#if isImportAccountInstance(item)}
+                      <button
+                        class="secondary-button browser-chrome-repair-button"
+                        aria-label={isChromeRepairRunning(item) ? "显示 Chrome 修复窗口" : "用 Chrome 修复登录"}
+                        data-tooltip={isChromeRepairRunning(item)
+                          ? "显示 Chrome 修复窗口（登录成功后自动同步 CK）"
+                          : "用系统 Chrome 修复登录（导入 Cookie 注入失败时）"}
+                        data-tooltip-placement="left"
+                        disabled={browserOpeningId === item.id || browserClosingId === item.id}
+                        onclick={() => repairBrowserLogin(item)}
+                      >
+                        {#if browserOpeningId === item.id}
+                          <ArrowClockwise class="spinning" size={13} />
+                        {:else}
+                          <GoogleChromeLogo size={13} />
+                        {/if}
+                      </button>
+                    {/if}
                     <button
                       class="secondary-button browser-close-button"
                       aria-label="关闭实例"
@@ -6250,22 +6327,14 @@
                     </button>
                     <button
                       class="secondary-button browser-open-button"
-                      aria-label={isExternalChromeInstance(item)
-                        ? item.status === "online"
-                          ? "重新打开 Chrome 实例"
-                          : "打开 Chrome 实例"
-                        : item.status === "online"
-                          ? "重新打开实例"
-                          : "打开实例"}
-                      data-tooltip={isExternalChromeInstance(item)
-                        ? item.status === "online"
-                          ? "重新打开 Chrome 外窗"
-                          : "用系统 Chrome 打开（导入账号）"
-                        : item.status === "online"
-                          ? "重新打开实例"
-                          : "打开实例"}
+                      aria-label={item.status === "online" && browserIndependentWindowIds.includes(item.id)
+                        ? "重新打开实例"
+                        : "打开实例"}
+                      data-tooltip={item.status === "online" && browserIndependentWindowIds.includes(item.id)
+                        ? "重新打开实例"
+                        : "打开实例"}
                       data-tooltip-placement="left"
-                      disabled={browserOpeningId === item.id || browserClosingId === item.id}
+                      disabled={browserOpeningId === item.id || browserClosingId === item.id || isChromeRepairRunning(item)}
                       onclick={() => openBrowserInstance(item)}
                     >
                       {#if browserOpeningId === item.id}

@@ -26,7 +26,7 @@
 
   let metadata: InstanceMetadata | null = null;
   let status: "starting" | "online" | "stopped" | "error" = "starting";
-  let message = "正在打开 Chrome 并恢复登录…";
+  let message = "正在打开 Chrome 修复登录…";
   let error = "";
   let launching = false;
 
@@ -37,7 +37,7 @@
     // does not flash “无法打开 Chrome” over a healthy companion window.
     if (!focusOnly || status !== "online") {
       status = "starting";
-      message = focusOnly ? "正在显示 Chrome 窗口…" : "正在打开 Chrome 并恢复登录…";
+      message = focusOnly ? "正在显示 Chrome 窗口…" : "正在打开 Chrome 修复登录…";
       error = "";
     }
     try {
@@ -45,7 +45,7 @@
         instanceId,
       });
       status = "online";
-      message = "抖音已在配套 Chrome 窗口中运行。关闭本壳不会退出 Chrome。";
+      message = "Chrome 修复窗口已打开。完成登录后 CK 会自动同步回卡片内嵌实例；关闭本壳不会退出 Chrome。";
       error = "";
     } catch (reason) {
       const text = reason instanceof Error ? reason.message : String(reason);
@@ -57,7 +57,7 @@
             instanceId,
           });
           status = "online";
-          message = "抖音已在配套 Chrome 窗口中运行。关闭本壳不会退出 Chrome。";
+          message = "Chrome 修复窗口已打开。完成登录后 CK 会自动同步回卡片内嵌实例；关闭本壳不会退出 Chrome。";
           error = "";
           return;
         } catch (retryReason) {
@@ -65,7 +65,7 @@
           // Engine timeout while Chrome may already be open — do not look like a hard failure.
           if (/超时|timeout/i.test(text) || /超时|timeout/i.test(retryText)) {
             status = "online";
-            message = "Chrome 可能已打开；若未见窗口请点下方「显示 Chrome 窗口」。关闭本壳不会退出 Chrome。";
+            message = "Chrome 可能已打开；若未见窗口请点下方「显示 Chrome 窗口」。登录成功后会同步回卡片。";
             error = "";
             return;
           }
@@ -134,7 +134,7 @@
             显示 Chrome 窗口
           </button>
         </div>
-        <small>导入 Cookie 使用系统 Chrome 保持登录；扫码/重绑账号仍为卡片内嵌。</small>
+        <small>导入 Cookie 可用 Chrome 修复登录；默认仍使用卡片内嵌 WebView，扫码/重绑同理。</small>
       </div>
     {/if}
   </section>

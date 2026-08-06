@@ -31,8 +31,8 @@ type Status string
 type RuntimeState string
 
 // Surface selects how the desktop client hosts a participation browser.
-// Imported Cookie accounts use external Chromium; QR/native logins keep the
-// embedded Tauri WebView card surface.
+// Default host is always the embedded Tauri WebView. External Chromium remains
+// available only as an on-demand login-repair tool for import accounts.
 type Surface string
 
 const (
@@ -65,10 +65,9 @@ type Instance struct {
 }
 
 // SurfaceForAccountSource maps account provenance to the browser host mode.
-// External Chromium for imports was rolled back: it raced CDP/extension
-// navigation, froze the desktop client, and opened full Chrome chrome.
-// All participation instances use the embedded Tauri WebView path again
-// (same as QR login / rebind). External Chrome helpers remain in-tree unused.
+// All participation instances use the embedded Tauri WebView path (QR login,
+// rebind, and Cookie import). External Chrome is only launched on demand via
+// browser.repair_login for import accounts whose WebView inject failed.
 func SurfaceForAccountSource(source string) Surface {
 	_ = source
 	return SurfaceEmbedded
@@ -974,11 +973,11 @@ func findChrome() (string, error) {
 	}
 	switch runtime.GOOS {
 	case "darwin":
-		return "", errors.New("未找到 Google Chrome。请先安装 https://www.google.com/chrome/ （安装到“应用程序”），然后重试「打开实例」")
+		return "", errors.New("未找到 Google Chrome。请先安装 https://www.google.com/chrome/ （安装到“应用程序”），然后重试「Chrome 修复登录」")
 	case "windows":
-		return "", errors.New("未找到 Google Chrome。请先安装 https://www.google.com/chrome/ ，安装完成后重试「打开实例」")
+		return "", errors.New("未找到 Google Chrome。请先安装 https://www.google.com/chrome/ ，安装完成后重试「Chrome 修复登录」")
 	default:
-		return "", errors.New("未找到 Chrome 或 Chromium。请先安装 google-chrome 或 chromium，然后重试「打开实例」")
+		return "", errors.New("未找到 Chrome 或 Chromium。请先安装 google-chrome 或 chromium，然后重试「Chrome 修复登录」")
 	}
 }
 

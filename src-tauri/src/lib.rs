@@ -3773,9 +3773,11 @@ async fn launch_external_chrome_instance(
     if instance_id.is_empty() {
         return Err("浏览器实例标识无效".into());
     }
+    // Rescue path for import accounts: bypass the embedded-only browser.open
+    // gate while leaving the card surface on embedded WebView after sync.
     native_engine_request(
         runtime.inner().clone(),
-        "browser.open",
+        "browser.repair_login",
         json!({ "instance_id": instance_id }),
     )
     .await
@@ -3808,14 +3810,16 @@ async fn open_browser_instance_window(
     .await?;
     let credential: NativeBrowserCredential = serde_json::from_value(credential_result)
         .map_err(|error| format!("解析浏览器实例信息失败：{error}"))?;
-    if credential.cookie_status == "expired" {
-        return Err("参与账号 CK 已失效，请先重新绑定".into());
-    }
     // Frontend surface is authoritative when the card already classified the
     // account (import vs QR). Fall back to the engine credential for re-open.
     let requested = surface.unwrap_or_default();
     let external_chrome =
         requested.trim() == "external_chrome" || credential.surface.trim() == "external_chrome";
+    // Chrome repair is allowed even when the stored CK is marked expired so
+    // import accounts can re-establish a live session and sync cookies back.
+    if credential.cookie_status == "expired" && !external_chrome {
+        return Err("参与账号 CK 已失效，请先重新绑定".into());
+    }
 
     // Separate labels so an earlier embedded open cannot reuse a window that
     // still mounts a child Douyin WebView for an import account.

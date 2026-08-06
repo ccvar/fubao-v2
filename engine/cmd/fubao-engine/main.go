@@ -959,6 +959,48 @@ func main() {
 				OK:      true,
 				Result:  instance,
 			})
+		case "browser.repair_login":
+			// Rescue-only Chrome CDP path for import accounts whose WKWebView
+			// inject failed. Does not flip the card surface away from embedded;
+			// extension cookie sync + credential_updated_at remounts the card.
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			if browserStoreErr != nil {
+				writeError(encoder, req.ID, "browser_store_unavailable", browserStoreErr.Error())
+				continue
+			}
+			var params struct {
+				InstanceID string `json:"instance_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "Chrome 登录修复参数无效")
+				continue
+			}
+			accountID, err := browserStore.AccountID(params.InstanceID)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_repair_failed", err.Error())
+				continue
+			}
+			credential, err := accountStore.ParticipationCredential(accountID)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_account_invalid", err.Error())
+				continue
+			}
+			// Keep embedded as the default host surface; repair only opens Chrome.
+			browserStore.ApplyAccountSources(map[string]string{credential.AccountID: credential.Source})
+			instance, err := browserStore.Open(params.InstanceID, credential.Cookie)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_repair_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result:  instance,
+			})
 		case "browser.close":
 			if browserStoreErr != nil {
 				writeError(encoder, req.ID, "browser_store_unavailable", browserStoreErr.Error())
