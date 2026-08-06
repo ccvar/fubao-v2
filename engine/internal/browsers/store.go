@@ -472,9 +472,7 @@ func (s *Store) Open(instanceID, cookie string) (Instance, error) {
 			s.mu.Unlock()
 			return Instance{}, errors.New("浏览器实例不存在")
 		}
-		if process, err := os.FindProcess(instance.PID); err == nil {
-			_ = process.Kill()
-		}
+		killBrowserProcessTree(instance.PID)
 		instance.Status = StatusStopped
 		instance.PID = 0
 		s.releaseExternalLocked(instanceID)
@@ -594,6 +592,31 @@ func (s *Store) Open(instanceID, cookie string) (Instance, error) {
 	return s.decorateInstanceLocked(instance), nil
 }
 
+// StopRepair ends an on-demand Chrome login-repair process without deleting the
+// instance registration or the account-keyed profile directory. The card host
+// remains embedded; only the temporary system Chrome session is torn down.
+func (s *Store) StopRepair(instanceID string) (Instance, error) {
+	s.mu.Lock()
+	instance := s.instances[instanceID]
+	if instance == nil {
+		s.mu.Unlock()
+		return Instance{}, errors.New("浏览器实例不存在")
+	}
+	pid := instance.PID
+	accountID := instance.AccountID
+	instance.Status = StatusStopped
+	instance.PID = 0
+	s.releaseExternalLocked(instanceID)
+	instance.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+	_ = s.saveLocked()
+	result := s.decorateInstanceLocked(instance)
+	s.mu.Unlock()
+
+	killBrowserProcessTree(pid)
+	_ = stopProfileBrowserProcesses(s.profileDir(accountID))
+	return result, nil
+}
+
 // Close removes the instance registration and stops any running browser while
 // deliberately preserving the account-keyed profile directory. Recreating an
 // instance for the same account therefore resumes the same isolated session.
@@ -629,14 +652,28 @@ func (s *Store) Close(instanceID string) (Instance, error) {
 	s.mu.Unlock()
 
 	if closed.PID > 0 {
-		if process, err := os.FindProcess(closed.PID); err == nil {
-			_ = process.Kill()
-		}
+		killBrowserProcessTree(closed.PID)
 	}
 	if endpoint != nil && endpoint.server != nil {
 		_ = endpoint.server.Close()
 	}
+	// Best-effort: stop any leftover Chrome that still holds this account profile.
+	_ = stopProfileBrowserProcesses(s.profileDir(closed.AccountID))
 	return closed, nil
+}
+
+func killBrowserProcessTree(pid int) {
+	if pid <= 0 {
+		return
+	}
+	if runtime.GOOS == "windows" {
+		// /T terminates the Chrome process tree started for this instance.
+		_ = exec.Command("taskkill", "/F", "/T", "/PID", strconv.Itoa(pid)).Run()
+		return
+	}
+	if process, err := os.FindProcess(pid); err == nil {
+		_ = process.Kill()
+	}
 }
 
 func (s *Store) ensureCookieSyncEndpointLocked(instance *Instance) (*cookieSyncEndpoint, error) {
@@ -1006,12 +1043,12 @@ func processUsesProfile(command, profileDir string) bool {
 }
 
 func profileBrowserPIDs(profileDir string) ([]int, error) {
-	if runtime.GOOS == "windows" {
-		return nil, nil
-	}
 	absProfile, err := filepath.Abs(profileDir)
 	if err != nil || strings.TrimSpace(absProfile) == "" {
 		return nil, errors.New("浏览器实例配置目录无效")
+	}
+	if runtime.GOOS == "windows" {
+		return windowsProfileBrowserPIDs(absProfile)
 	}
 	output, err := exec.Command("ps", "-axo", "pid=,command=").Output()
 	if err != nil {
@@ -1036,18 +1073,50 @@ func profileBrowserPIDs(profileDir string) ([]int, error) {
 	return pids, nil
 }
 
-func stopProfileBrowserProcesses(profileDir string) error {
-	if runtime.GOOS == "windows" {
-		return nil
+// windowsProfileBrowserPIDs finds Chrome/Edge processes that still hold this
+// account's --user-data-dir so repair reopen and Close can free the profile.
+func windowsProfileBrowserPIDs(absProfile string) ([]int, error) {
+	// WMIC CommandLine matching is case-insensitive and accepts forward slashes.
+	needle := strings.ReplaceAll(absProfile, `/`, `\`)
+	needle = strings.ReplaceAll(needle, `'`, `''`)
+	if needle == "" {
+		return nil, nil
 	}
+	query := fmt.Sprintf("CommandLine like '%%--user-data-dir=%s%%'", needle)
+	output, err := exec.Command("wmic", "process", "where", query, "get", "ProcessId", "/value").Output()
+	if err != nil {
+		// Older images may lack wmic; repair still kills the tracked launcher PID.
+		return nil, nil
+	}
+	currentPID := os.Getpid()
+	pids := make([]int, 0)
+	seen := map[int]struct{}{}
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 || !strings.EqualFold(strings.TrimSpace(parts[0]), "ProcessId") {
+			continue
+		}
+		pid, parseErr := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if parseErr != nil || pid <= 1 || pid == currentPID {
+			continue
+		}
+		if _, ok := seen[pid]; ok {
+			continue
+		}
+		seen[pid] = struct{}{}
+		pids = append(pids, pid)
+	}
+	return pids, nil
+}
+
+func stopProfileBrowserProcesses(profileDir string) error {
 	pids, err := profileBrowserPIDs(profileDir)
 	if err != nil {
 		return err
 	}
 	for _, pid := range pids {
-		if process, findErr := os.FindProcess(pid); findErr == nil {
-			_ = process.Kill()
-		}
+		killBrowserProcessTree(pid)
 	}
 	if len(pids) == 0 {
 		return nil

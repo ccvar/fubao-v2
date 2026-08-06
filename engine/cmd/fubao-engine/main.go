@@ -1001,6 +1001,31 @@ func main() {
 				OK:      true,
 				Result:  instance,
 			})
+		case "browser.repair_stop":
+			// Close the temporary Chrome repair session when the shell is
+			// dismissed so the card does not stay stuck on “修复登录中”.
+			if browserStoreErr != nil {
+				writeError(encoder, req.ID, "browser_store_unavailable", browserStoreErr.Error())
+				continue
+			}
+			var params struct {
+				InstanceID string `json:"instance_id"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "结束 Chrome 登录修复参数无效")
+				continue
+			}
+			instance, err := browserStore.StopRepair(params.InstanceID)
+			if err != nil {
+				writeError(encoder, req.ID, "browser_repair_stop_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result:  instance,
+			})
 		case "browser.close":
 			if browserStoreErr != nil {
 				writeError(encoder, req.ID, "browser_store_unavailable", browserStoreErr.Error())

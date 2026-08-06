@@ -748,8 +748,10 @@ fn inject_douyin_cookie(webview: &tauri::Webview, raw_cookie: &str) -> Result<()
     // WebView2 CookieManager treats a leading-dot domain as "include subdomains"
     // and is far more reliable after a first-party context exists. macOS WKWebView
     // accepts both forms; always write the parent domain with a leading dot.
+    // On Windows also mirror host-scoped rows so SPA navigations to www/live
+    // still see login tokens when the parent jar lags.
     #[cfg(target_os = "windows")]
-    const DOMAINS: [&str; 1] = [".douyin.com"];
+    const DOMAINS: [&str; 3] = [".douyin.com", "www.douyin.com", "live.douyin.com"];
     #[cfg(not(target_os = "windows"))]
     const DOMAINS: [&str; 3] = [".douyin.com", "www.douyin.com", "live.douyin.com"];
     let max_age = cookie::time::Duration::days(180);
@@ -768,15 +770,26 @@ fn inject_douyin_cookie(webview: &tauri::Webview, raw_cookie: &str) -> Result<()
         }
         let is_login = DOUYIN_LOGIN_COOKIE_NAMES.contains(&name);
         for domain in DOMAINS {
-            // Order matters on WebView2: non-HttpOnly Lax writes succeed most
-            // often; then HttpOnly; then SameSite=None for cross-site assets.
+            // Match Chrome CDP for login cookies first: Secure + SameSite=None
+            // + HttpOnly on .douyin.com. Earlier Lax-first writes left a non-
+            // HttpOnly row that WebView2 accepted while Douyin still treated
+            // the session as anonymous.
             let attempts: &[(cookie::SameSite, bool)] = if cfg!(target_os = "windows") {
-                &[
-                    (cookie::SameSite::Lax, false),
-                    (cookie::SameSite::None, false),
-                    (cookie::SameSite::Lax, is_login),
-                    (cookie::SameSite::None, is_login),
-                ]
+                if is_login {
+                    &[
+                        (cookie::SameSite::None, true),
+                        (cookie::SameSite::None, false),
+                        (cookie::SameSite::Lax, true),
+                        (cookie::SameSite::Lax, false),
+                    ]
+                } else {
+                    &[
+                        (cookie::SameSite::None, false),
+                        (cookie::SameSite::Lax, false),
+                        (cookie::SameSite::None, true),
+                        (cookie::SameSite::Lax, true),
+                    ]
+                }
             } else {
                 &[
                     (cookie::SameSite::Lax, is_login),
@@ -784,6 +797,7 @@ fn inject_douyin_cookie(webview: &tauri::Webview, raw_cookie: &str) -> Result<()
                     (cookie::SameSite::None, false),
                 ]
             };
+            let mut domain_wrote = false;
             for (same_site, http_only) in attempts.iter().copied() {
                 let mut builder = Cookie::build((name.to_string(), value.to_string()))
                     .domain(domain)
@@ -797,10 +811,15 @@ fn inject_douyin_cookie(webview: &tauri::Webview, raw_cookie: &str) -> Result<()
                 match webview.set_cookie(builder.build()) {
                     Ok(()) => {
                         wrote_any = true;
+                        domain_wrote = true;
                         break;
                     }
                     Err(error) => last_error = error.to_string(),
                 }
+            }
+            // Parent domain success is enough for non-Windows hosts.
+            if domain_wrote && domain == ".douyin.com" && !cfg!(target_os = "windows") {
+                break;
             }
         }
     }
@@ -812,6 +831,31 @@ fn inject_douyin_cookie(webview: &tauri::Webview, raw_cookie: &str) -> Result<()
         });
     }
     Ok(())
+}
+
+/// Drop existing Douyin jar rows so a previously anonymous SPA session cannot
+/// keep winning over a freshly injected import Cookie (common on WebView2).
+async fn clear_douyin_session_cookies(webview: &tauri::Webview) {
+    let cookies = match webview.cookies() {
+        Ok(cookies) => cookies,
+        Err(error) => {
+            if cfg!(debug_assertions) {
+                eprintln!("[embedded-browser] clear cookies failed: {error}");
+            }
+            return;
+        }
+    };
+    for cookie in cookies {
+        let Some(domain) = cookie.domain() else {
+            continue;
+        };
+        let domain = domain.trim_start_matches('.').to_ascii_lowercase();
+        if domain != "douyin.com" && !domain.ends_with(".douyin.com") {
+            continue;
+        }
+        let _ = webview.delete_cookie(cookie);
+    }
+    tokio::time::sleep(Duration::from_millis(220)).await;
 }
 
 /// Seed the account WebView so Douyin's SPA boots with the store Cookie.
@@ -837,8 +881,10 @@ async fn bootstrap_browser_account_session(
         webview
             .navigate(target_url.clone())
             .map_err(|error| format!("加载抖音页面失败：{error}"))?;
-        tokio::time::sleep(Duration::from_millis(1_100)).await;
-        // 2) Write cookies into that first-party jar and confirm when possible.
+        tokio::time::sleep(Duration::from_millis(1_600)).await;
+        // 2) Drop the anonymous SPA session that the first navigation created.
+        clear_douyin_session_cookies(webview).await;
+        // 3) Write store cookies (CDP-like attributes) and confirm when possible.
         if let Err(error) = inject_douyin_cookie_and_confirm(webview, raw_cookie).await {
             if cfg!(debug_assertions) {
                 eprintln!(
@@ -846,19 +892,19 @@ async fn bootstrap_browser_account_session(
                 );
             }
             let _ = inject_douyin_cookie(webview, raw_cookie);
-            tokio::time::sleep(Duration::from_millis(350)).await;
+            tokio::time::sleep(Duration::from_millis(450)).await;
         }
         if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
             injected.insert(instance_id.to_string(), Instant::now());
         }
-        // 3) Reload so the SPA boots with the injected session (critical on WebView2).
+        // 4) Reload so the SPA boots with the injected session (critical on WebView2).
         webview
-            .navigate(target_url)
+            .navigate(target_url.clone())
             .map_err(|error| format!("重新加载已注入登录态的抖音页面失败：{error}"))?;
-        tokio::time::sleep(Duration::from_millis(700)).await;
-        // 4) One more soft write covers cookies the SPA may have cleared.
+        tokio::time::sleep(Duration::from_millis(1_000)).await;
+        // 5) Re-assert store cookies after SPA init without wiping the jar first.
         let _ = inject_douyin_cookie(webview, raw_cookie);
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(280)).await;
         if inject_douyin_cookie_and_confirm(webview, raw_cookie)
             .await
             .is_ok()
@@ -866,7 +912,14 @@ async fn bootstrap_browser_account_session(
             if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
                 injected.insert(instance_id.to_string(), Instant::now());
             }
+        } else if cfg!(debug_assertions) {
+            eprintln!(
+                "[embedded-browser] windows final cookie confirm failed instance={instance_id}"
+            );
         }
+        // 6) Soft re-write after confirm so late SPA cookies cannot shadow login.
+        let _ = inject_douyin_cookie(webview, raw_cookie);
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -3271,12 +3324,131 @@ async fn stop_browser_red_packet_context(
     Ok(())
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+fn embedded_browser_data_dir(
+    app: &tauri::AppHandle,
+    account_id: &str,
+) -> Result<std::path::PathBuf, String> {
+    Ok(webview_data_root(app)?
+        .join("embedded-browser")
+        .join(account_id.trim()))
+}
+
+/// Close account WebViews and wipe the Windows WebView2 user-data folder so the
+/// next mount cannot resume an anonymous jar that rejected the imported CK.
+async fn rebuild_browser_account_session_inner(
+    app: &tauri::AppHandle,
+    runtime: Arc<EngineRuntime>,
+    instance_id: &str,
+) -> Result<(), String> {
+    let instance_id = instance_id.trim();
+    if instance_id.is_empty() {
+        return Err("浏览器实例标识无效".into());
+    }
+    let result = native_engine_request(
+        runtime.clone(),
+        "browser.native_credential",
+        json!({
+            "instance_id": instance_id,
+            "secret": runtime.native_secret,
+        }),
+    )
+    .await?;
+    let credential: NativeBrowserCredential =
+        serde_json::from_value(result).map_err(|error| format!("解析浏览器凭据失败：{error}"))?;
+
+    for webview in browser_webviews_for_instance(app, runtime.as_ref(), instance_id) {
+        let label = webview.label().to_string();
+        let _ = begin_browser_webview_close(runtime.as_ref(), &label);
+        let _ = webview.close();
+    }
+    if let Ok(mut contexts) = runtime.browser_red_packet_contexts.lock() {
+        contexts.remove(instance_id);
+    }
+    if let Ok(mut locations) = runtime.browser_locations.lock() {
+        locations.remove(instance_id);
+    }
+    if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
+        injected.remove(instance_id);
+    }
+    if let Ok(mut synced) = runtime.browser_cookie_synced_at.lock() {
+        synced.remove(instance_id);
+    }
+
+    // Give WebView2 time to release profile file locks before deleting.
+    tokio::time::sleep(Duration::from_millis(450)).await;
+
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    {
+        let data_dir = embedded_browser_data_dir(app, &credential.account_id)?;
+        if data_dir.exists() {
+            let mut last_error = String::new();
+            for attempt in 0..14 {
+                match std::fs::remove_dir_all(&data_dir) {
+                    Ok(()) => {
+                        last_error.clear();
+                        break;
+                    }
+                    Err(error) => {
+                        last_error = error.to_string();
+                        if attempt + 1 < 14 {
+                            tokio::time::sleep(Duration::from_millis(220)).await;
+                        }
+                    }
+                }
+            }
+            if data_dir.exists() {
+                return Err(format!(
+                    "清理内嵌浏览器数据目录失败：{}",
+                    if last_error.is_empty() {
+                        "目录仍被占用".to_string()
+                    } else {
+                        last_error
+                    }
+                ));
+            }
+        }
+        std::fs::create_dir_all(&data_dir)
+            .map_err(|error| format!("重建内嵌浏览器数据目录失败：{error}"))?;
+    }
+
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "[embedded-browser] profile rebuilt instance={instance_id} account={}",
+            credential.account_id
+        );
+    }
+    let _ = credential.account_name;
+    Ok(())
+}
+
+#[tauri::command]
+async fn rebuild_browser_account_session(
+    app: tauri::AppHandle,
+    runtime: tauri::State<'_, Arc<EngineRuntime>>,
+    instance_id: String,
+) -> Result<(), String> {
+    rebuild_browser_account_session_inner(&app, runtime.inner().clone(), instance_id.trim()).await
+}
+
 #[tauri::command]
 async fn refresh_browser_account_cookie(
     app: tauri::AppHandle,
     runtime: tauri::State<'_, Arc<EngineRuntime>>,
     instance_id: String,
+    force_profile_reset: Option<bool>,
 ) -> Result<(), String> {
+    let instance_id = instance_id.trim().to_string();
+    if force_profile_reset.unwrap_or(false) {
+        // Destroy anonymous WebView2 state first; the next mount re-injects
+        // the canonical store Cookie into a clean profile.
+        return rebuild_browser_account_session_inner(
+            &app,
+            runtime.inner().clone(),
+            &instance_id,
+        )
+        .await;
+    }
     let webviews = browser_webviews_for_instance(&app, runtime.inner().as_ref(), &instance_id);
     if webviews.is_empty() {
         // An unmounted instance receives the latest canonical Cookie during
@@ -3299,6 +3471,8 @@ async fn refresh_browser_account_cookie(
         .parse()
         .map_err(|error| format!("解析抖音地址失败：{error}"))?;
     for webview in webviews {
+        // Clear residual anonymous rows before re-applying the store Cookie.
+        clear_douyin_session_cookies(&webview).await;
         bootstrap_browser_account_session(
             &webview,
             runtime.as_ref(),
@@ -3925,9 +4099,33 @@ async fn open_browser_instance_window(
     }
 
     // Embedded instance windows own a runtime lease that must be released when
-    // the shell is destroyed. External Chrome keeps its own process lease via
-    // browser.open / browser.close and must not drop that lease with the shell.
+    // the shell is destroyed. Chrome repair shells stop the temporary Chrome
+    // process and notify the main UI so cards do not stay on “修复登录中”.
     if external_chrome {
+        let close_app = app.clone();
+        let close_runtime = runtime.inner().clone();
+        let close_instance_id = instance_id.clone();
+        let released = Arc::new(AtomicBool::new(false));
+        window.on_window_event(move |event| {
+            if !matches!(event, WindowEvent::Destroyed) || released.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let runtime = close_runtime.clone();
+            let instance_id = close_instance_id.clone();
+            let app = close_app.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = native_engine_request(
+                    runtime.clone(),
+                    "browser.repair_stop",
+                    json!({ "instance_id": instance_id }),
+                )
+                .await;
+                let _ = app.emit(
+                    "chrome-repair://closed",
+                    json!({ "instance_id": instance_id }),
+                );
+            });
+        });
         return Ok(());
     }
 
@@ -4077,6 +4275,7 @@ pub fn run() {
             open_browser_instance_window,
             browser_instance_window_metadata,
             launch_external_chrome_instance,
+            rebuild_browser_account_session,
             open_page_window,
             open_live_room,
             close_monitor_log,

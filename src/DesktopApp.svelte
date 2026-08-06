@@ -720,6 +720,8 @@
   // WebView is still destroyed off-screen to release its runtime lease.
   let browserWebviewReadyIds: string[] = [];
   let browserIndependentWindowIds: string[] = [];
+  /** On-demand Chrome repair sessions (not driven by engine status alone). */
+  let browserChromeRepairIds: string[] = [];
   let browserWebviewMountedIds: string[] = [];
   let browserWebviewReleasingIds: string[] = [];
   const browserWebviewMountConcurrency = 2;
@@ -3271,13 +3273,42 @@
     return source === "manual-import" || source === "manual" || source === "imported" || source === "dy-kiro" || source === "legacy";
   }
 
-  /** Chrome CDP repair session is active (status online from browser.repair_login). */
+  /** Chrome CDP repair session is active (explicit shell lifecycle, not status alone). */
   function isChromeRepairRunning(instance: BrowserInstance) {
-    return (
-      isImportAccountInstance(instance) &&
-      instance.status === "online" &&
-      !browserIndependentWindowIds.includes(instance.id)
-    );
+    return browserChromeRepairIds.includes(instance.id);
+  }
+
+  function clearBrowserMountTracking(instanceId: string) {
+    browserWebviewMountedIds = browserWebviewMountedIds.filter((id) => id !== instanceId);
+    browserWebviewMountingIds = browserWebviewMountingIds.filter((id) => id !== instanceId);
+    browserWebviewLoadingIds = browserWebviewLoadingIds.filter((id) => id !== instanceId);
+    browserWebviewReadyIds = browserWebviewReadyIds.filter((id) => id !== instanceId);
+    browserCookieCheckingIds = browserCookieCheckingIds.filter((id) => id !== instanceId);
+    browserCookieCheckedAt.delete(instanceId);
+    browserRedPacketContextIds = browserRedPacketContextIds.filter((id) => id !== instanceId);
+    const nextErrors = { ...browserWebviewErrors };
+    delete nextErrors[instanceId];
+    browserWebviewErrors = nextErrors;
+  }
+
+  /** After Chrome repair / CK sync: wipe WebView2 profile and remount cleanly. */
+  async function remountBrowserAfterCredentialSync(instanceId: string, forceProfileReset = true) {
+    clearBrowserMountTracking(instanceId);
+    if (!isTauriDesktop()) return;
+    try {
+      if (forceProfileReset) {
+        await invoke("rebuild_browser_account_session", { instanceId });
+      } else {
+        await invoke("refresh_browser_account_cookie", {
+          instanceId,
+          forceProfileReset: false,
+        });
+      }
+    } catch {
+      // Canonical CK is already in Go; the next mount still re-injects it.
+    }
+    browserLayoutRevision += 1;
+    scheduleEmbeddedBrowserSync();
   }
 
   function browserCookieStatus(instance: BrowserInstance) {
@@ -4645,9 +4676,7 @@
         accountRebinding = null;
         const accountInstances = browserInstances.filter((instance) => instance.account_id === account.id);
         await Promise.all(
-          accountInstances.map((instance) =>
-            invoke("refresh_browser_account_cookie", { instanceId: instance.id }),
-          ),
+          accountInstances.map((instance) => remountBrowserAfterCredentialSync(instance.id, true)),
         );
         await loadBrowserInstances();
         showToast(`已重新绑定「${account.nickname || account.name}」并更新 CK`);
@@ -4830,14 +4859,9 @@
       browserInstances = items;
       browserCapacity = capacity;
       if (syncedInstance) {
-        if (isTauriDesktop()) {
-          try {
-            await invoke("refresh_browser_account_cookie", { instanceId: syncedInstance.id });
-          } catch {
-            // The canonical account is already updated. An unmounted card
-            // receives the latest CK on its next native WebView mount.
-          }
-        }
+        // Chrome repair (and other native CK writes) must rebuild the Windows
+        // WebView2 profile; soft refresh alone leaves the anonymous jar.
+        await remountBrowserAfterCredentialSync(syncedInstance.id, true);
         accounts = await engineRequest<AccountItem[]>("account.list");
         showToast(`已同步「${syncedInstance.account_name}」的新登录状态和 CK`);
       }
@@ -5087,6 +5111,9 @@
     }
     browserOpeningId = instance.id;
     browserError = "";
+    if (!browserChromeRepairIds.includes(instance.id)) {
+      browserChromeRepairIds = [...browserChromeRepairIds, instance.id];
+    }
     try {
       // Free the card WebView so Chrome owns the repair session; after the
       // extension writes CK back, pollBrowserInstanceStatuses remounts with the
@@ -5096,9 +5123,10 @@
         instanceId: instance.id,
         surface: "external_chrome",
       });
-      showToast(`已打开「${instance.account_name}」的 Chrome 登录修复；登录成功后会自动同步回卡片`);
+      showToast(`已打开「${instance.account_name}」的 Chrome 登录修复；登录成功后关闭修复窗口会重建卡片会话`);
       await loadBrowserInstances();
     } catch (error) {
+      browserChromeRepairIds = browserChromeRepairIds.filter((id) => id !== instance.id);
       const message = error instanceof Error ? error.message : String(error);
       browserError = message;
       await loadBrowserInstances();
@@ -5106,6 +5134,16 @@
     } finally {
       browserOpeningId = "";
     }
+  }
+
+  async function finishChromeRepairSession(instanceId: string) {
+    browserChromeRepairIds = browserChromeRepairIds.filter((id) => id !== instanceId);
+    // Shell destroy already requested browser.repair_stop; rebuild the card
+    // profile so the imported/synced CK is injected into a clean WebView2 jar.
+    await remountBrowserAfterCredentialSync(instanceId, true);
+    await loadBrowserInstances();
+    const name = browserInstances.find((item) => item.id === instanceId)?.account_name || "账号";
+    showToast(`已结束「${name}」的 Chrome 修复并重建卡片登录会话`);
   }
 
   function browserRedPacketLiveTarget(instance: BrowserInstance) {
@@ -5567,6 +5605,11 @@
         void loadBrowserInstances().finally(() => scheduleEmbeddedBrowserSync());
       }).then((unlisten) => {
         unlistenBrowserInstanceWindowClosed = unlisten;
+      });
+      void listen<BrowserInstanceWindowEvent>("chrome-repair://closed", (event) => {
+        const instanceId = event.payload.instance_id?.trim();
+        if (!instanceId) return;
+        void finishChromeRepairSession(instanceId);
       });
     }
 
