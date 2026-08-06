@@ -160,30 +160,35 @@ func (p *fakePoster) PostSigned(_ context.Context, endpoint string, _ map[string
 	return response, err
 }
 
-func TestParticipantFallsBackToRushWhenJoinIsNotAccepted(t *testing.T) {
+func TestParticipantUsesJoinOnlyWithoutRushFallback(t *testing.T) {
 	store := &fakeParticipationStore{
 		credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-1", Cookie: "sessionid_ss=ok"}},
 		notify:      make(chan struct{}, 1),
 	}
 	poster := &fakePoster{responses: []*http.Response{
-		jsonResponse(200, `{"status_code":1,"status_msg":"Request params error","data":{}}`),
+		jsonResponse(200, `{"status_code":0,"data":{"succeed":false,"hit_bonus":false,"can_rush_gem":false}}`),
 		jsonResponse(200, `{"status_code":0,"data":{"rush_too_much":1}}`),
 	}}
 	participant := newParticipant(store, 1, func(Event, accounts.RedPacketParticipationCredential) signedPoster { return poster })
 	participant.retryDelay = 0
 	participant.HandleEvent(Event{
-		ID: "monitor:event-rush", PacketID: "box-rush", JoinBoxID: "box-rush", ActualRoomID: "7002",
+		ID: "monitor:event-join-only", PacketID: "box-join", JoinBoxID: "box-join", ActualRoomID: "7002",
 		BoxType: "1", SendTime: "100", DelayTime: "30",
 	})
 	select {
 	case <-store.notify:
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for rush fallback")
+		t.Fatal("timed out waiting for join attempt")
 	}
 	poster.mu.Lock()
 	defer poster.mu.Unlock()
-	if poster.calls != 2 || poster.endpoints[0] != redPacketJoinURL || poster.endpoints[1] != redPacketRushURL {
-		t.Fatalf("expected join then rush fallback, got calls=%d endpoints=%v", poster.calls, poster.endpoints)
+	if poster.calls != 1 || poster.endpoints[0] != redPacketJoinURL {
+		t.Fatalf("expected a single join without rush fallback, got calls=%d endpoints=%v", poster.calls, poster.endpoints)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.records) != 1 || store.records[0].status != "failed" || store.records[0].joined {
+		t.Fatalf("soft-deny join must stay failed without rush recovery: %+v", store.records)
 	}
 }
 
@@ -941,7 +946,9 @@ func TestParticipantResponseClassification(t *testing.T) {
 		cookieExpired bool
 	}{
 		{name: "success", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":true}}`), status: "joined", joined: true},
-		{name: "join accepted without success flag", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":false,"hit_bonus":false,"can_rush_gem":false}}`), status: "joined", joined: true},
+		{name: "immediate diamond win", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":true,"diamond_count":1,"hit_bonus":false}}`), status: "won", joined: true},
+		{name: "soft deny is not joined", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":false,"hit_bonus":false,"can_rush_gem":false}}`), status: "failed"},
+		{name: "rush zero flags are not risk", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":false,"rush_spam":0,"rush_too_much":0,"rush_too_often":0,"expired":false}}`), status: "failed"},
 		{name: "already joined", response: jsonResponse(200, `{"status_code":0,"data":{"rush_too_much":1}}`), status: "already_joined", joined: true},
 		{name: "expired overrides already", response: jsonResponse(200, `{"status_code":0,"data":{"rush_too_much":1,"expired":true}}`), status: "expired"},
 		{name: "risk", response: jsonResponse(200, `{"status_code":0,"data":{"rush_spam":true},"status_msg":"操作频繁"}`), status: "risk_control", cooldown: true},
@@ -952,13 +959,14 @@ func TestParticipantResponseClassification(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			endpoint := "rush"
-			if tt.name == "join accepted without success flag" {
-				endpoint = "join"
-			}
-			result := classifyParticipationResponse(tt.response, tt.err, endpoint)
+			result := classifyParticipationResponse(tt.response, tt.err, "join")
 			if result.status != tt.status || result.joined != tt.joined || result.cookieExpired != tt.cookieExpired || (result.cooldown > 0) != tt.cooldown {
 				t.Fatalf("unexpected classification: %+v", result)
+			}
+			if tt.name == "immediate diamond win" {
+				if !result.won || result.award != "1钻" || result.message != "已中1钻" {
+					t.Fatalf("immediate prize was not promoted to won: %+v", result)
+				}
 			}
 		})
 	}
@@ -1049,7 +1057,7 @@ func TestDrawResultTimeoutWithoutServiceResponseMarksError(t *testing.T) {
 	if reserved, err := recordStore.ReserveParticipation(event, "account-timeout", "超时账号"); err != nil || !reserved {
 		t.Fatalf("reserve timeout draw: %v %v", reserved, err)
 	}
-	if err := recordStore.CompleteParticipation(event.ID, "account-timeout", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
+	if err := recordStore.CompleteParticipation(event.ID, "account-timeout", "join", "joined", "等待开奖", 1, true, false, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	store := &fakeParticipationStore{credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-timeout"}}}
@@ -1090,7 +1098,7 @@ func TestDrawResultServiceFallbackMarksNoWin(t *testing.T) {
 	if reserved, err := recordStore.ReserveParticipation(event, "account-service-fallback", "服务应答账号"); err != nil || !reserved {
 		t.Fatalf("reserve service fallback draw: %v %v", reserved, err)
 	}
-	if err := recordStore.CompleteParticipation(event.ID, "account-service-fallback", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
+	if err := recordStore.CompleteParticipation(event.ID, "account-service-fallback", "join", "joined", "等待开奖", 1, true, false, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	store := &fakeParticipationStore{credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-service-fallback"}}}
@@ -1124,7 +1132,7 @@ func TestDrawResultStatusZeroPayloadCanStillResolveAsNoWin(t *testing.T) {
 	if reserved, err := recordStore.ReserveParticipation(event, "account-status-zero", "状态零账号"); err != nil || !reserved {
 		t.Fatalf("reserve status-zero draw: %v %v", reserved, err)
 	}
-	if err := recordStore.CompleteParticipation(event.ID, "account-status-zero", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
+	if err := recordStore.CompleteParticipation(event.ID, "account-status-zero", "join", "joined", "等待开奖", 1, true, false, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	store := &fakeParticipationStore{credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-status-zero"}}}
@@ -1158,7 +1166,7 @@ func TestEmptyReceiveInfoRecordsNoWinInsteadOfDrawError(t *testing.T) {
 	if reserved, err := recordStore.ReserveParticipation(event, "account-empty-receive", "空结果账号"); err != nil || !reserved {
 		t.Fatalf("reserve empty receive draw: %v %v", reserved, err)
 	}
-	if err := recordStore.CompleteParticipation(event.ID, "account-empty-receive", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
+	if err := recordStore.CompleteParticipation(event.ID, "account-empty-receive", "join", "joined", "等待开奖", 1, true, false, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	store := &fakeParticipationStore{credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-empty-receive"}}}
@@ -1193,7 +1201,7 @@ func TestDrawQueryDoesNotWaitForPacketExpiry(t *testing.T) {
 	if reserved, err := recordStore.ReserveParticipation(event, "account-query-now", "查询账号"); err != nil || !reserved {
 		t.Fatalf("reserve: %v %v", reserved, err)
 	}
-	if err := recordStore.CompleteParticipation(event.ID, "account-query-now", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
+	if err := recordStore.CompleteParticipation(event.ID, "account-query-now", "join", "joined", "等待开奖", 1, true, false, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	store := &fakeParticipationStore{credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-query-now"}}}
@@ -1226,7 +1234,7 @@ func TestDrawQueryFallsBackToWalletAfterAttempts(t *testing.T) {
 	if reserved, err := recordStore.ReserveParticipation(event, "account-query-wallet", "增量账号"); err != nil || !reserved {
 		t.Fatalf("reserve: %v %v", reserved, err)
 	}
-	if err := recordStore.CompleteParticipation(event.ID, "account-query-wallet", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
+	if err := recordStore.CompleteParticipation(event.ID, "account-query-wallet", "join", "joined", "等待开奖", 1, true, false, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	if err := recordStore.RecordParticipationWalletBaseline(event.ID, "account-query-wallet", 10); err != nil {
@@ -1295,15 +1303,44 @@ func TestWalletDeltaConfirmsWinWhenReceiveInfoIsEmpty(t *testing.T) {
 
 func TestParticipationParamsKeepRushFieldsNative(t *testing.T) {
 	event := Event{PacketID: "box", JoinBoxID: "box", ActualRoomID: "room", AnchorID: "anchor", BoxType: "1", SendTime: "100", DelayTime: "30"}
-	join := participationParams(event, false)
-	rush := participationParams(event, true)
+	join := participationParamsFor(event, false, "59557349249", "MS4wLjABAAAAtest")
+	rush := participationParamsFor(event, true, "59557349249", "MS4wLjABAAAAtest")
 	if join["room_id"] != "room" || join["box_id"] != "box" || join["anchor_id"] != "anchor" {
 		t.Fatalf("join params missing required values: %+v", join)
+	}
+	if join["user_id"] != "59557349249" || join["sec_user_id"] != "MS4wLjABAAAAtest" {
+		t.Fatalf("join params missing account identity: %+v", join)
 	}
 	if _, exists := join["box_type"]; exists {
 		t.Fatalf("join params unexpectedly contain rush-only fields: %+v", join)
 	}
 	if rush["box_type"] != "1" || rush["send_time"] != "100" || rush["delay_time"] != "30" {
 		t.Fatalf("rush params missing required values: %+v", rush)
+	}
+}
+
+func TestEventDeadlinePrefersNativeSendDelayOverStaleCenterExpiry(t *testing.T) {
+	// send_time is 2026-08-04 22:27:43 +0800 in ms; delay 300s → real end ~22:32:43.
+	// Center re-published expires_at a day later; admission must use the earlier
+	// native rush window or day-old packets are always soft-denied.
+	sendMS := int64(1785853663000)
+	nativeEnd := time.UnixMilli(sendMS).Add(300 * time.Second)
+	event := Event{
+		SendTime:  "1785853663000",
+		DelayTime: "300",
+		ExpiresAt: nativeEnd.Add(25 * time.Hour).Format(time.RFC3339Nano),
+	}
+	deadline, ok := eventDeadline(event)
+	if !ok {
+		t.Fatal("expected deadline from send_time+delay_time")
+	}
+	if !deadline.Equal(nativeEnd) && deadline.Sub(nativeEnd).Abs() > time.Second {
+		t.Fatalf("deadline=%s want native end %s", deadline, nativeEnd)
+	}
+	if eventOpenAt(event, nativeEnd.Add(time.Minute)) {
+		t.Fatal("stale center expiry must not keep a packet open after send+delay")
+	}
+	if !eventOpenAt(event, nativeEnd.Add(-30*time.Second)) {
+		t.Fatal("packet should still be open inside the native window")
 	}
 }

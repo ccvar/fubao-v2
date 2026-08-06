@@ -24,7 +24,6 @@ var (
 
 const (
 	redPacketJoinURL          = "https://live.douyin.com/webcast/luckybox/join/"
-	redPacketRushURL          = "https://live.douyin.com/webcast/luckybox/rush/"
 	defaultJoinConcurrency    = 4
 	defaultRiskCooldown       = 5 * time.Minute
 	defaultNetworkCooldown    = 30 * time.Second
@@ -49,7 +48,7 @@ type ParticipationStore interface {
 
 type ParticipationRecordStore interface {
 	ReserveParticipation(event Event, accountID, accountName string) (bool, error)
-	CompleteParticipation(eventID, accountID, endpoint, status, message string, attempts int, joined, won bool, cooldown time.Duration) error
+	CompleteParticipation(eventID, accountID, endpoint, status, message string, attempts int, joined, won bool, award string, cooldown time.Duration) error
 }
 
 type participationPolicyStore interface {
@@ -131,7 +130,11 @@ type PageParticipationTask struct {
 	// the request must use the numeric box_id from the original box row.
 	// Keeping both native-only aliases prevents a valid personal result from
 	// being discarded when those two server-side identifiers differ.
-	PacketID         string
+	PacketID string
+	// UserID / SecUID are the account's Douyin identity used by the real
+	// live-page luckybox join/rush query (user_id + sec_user_id).
+	UserID           string
+	SecUID           string
 	AnchorID         string
 	BoxType          string
 	SendTime         string
@@ -194,6 +197,7 @@ type participationResult struct {
 	message       string
 	joined        bool
 	won           bool
+	award         string
 	cooldown      time.Duration
 	cookieExpired bool
 	terminal      bool
@@ -394,14 +398,77 @@ func eventParticipationOpenAt(event Event, settings ParticipationSettings, now t
 }
 
 func eventDeadline(event Event) (time.Time, bool) {
+	// Rush/join authenticity follows send_time + delay_time. Center-library
+	// expires_at is sometimes republished or refreshed long after the real
+	// draw window closed, which previously admitted day-old packets and made
+	// every native rush return succeed=false.
+	var candidates []time.Time
+	if native, ok := deadlineFromSendDelay(event.SendTime, event.DelayTime); ok {
+		candidates = append(candidates, native)
+	}
 	for _, value := range []string{event.ExpiresAt, event.DrawAt} {
-		parsed, err := time.Parse(time.RFC3339Nano, strings.TrimSpace(value))
-		if err != nil {
-			continue
+		if parsed, ok := parseEventTimestamp(value); ok {
+			candidates = append(candidates, parsed)
 		}
+	}
+	if len(candidates) == 0 {
+		return time.Time{}, false
+	}
+	// Use the earliest authoritative deadline so a stale center expiry cannot
+	// keep a packet open after the native draw window has ended.
+	earliest := candidates[0]
+	for _, item := range candidates[1:] {
+		if item.Before(earliest) {
+			earliest = item
+		}
+	}
+	return earliest, true
+}
+
+func parseEventTimestamp(value string) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return parsed, true
+	}
+	if parsed, err := time.Parse(time.RFC3339, value); err == nil {
 		return parsed, true
 	}
 	return time.Time{}, false
+}
+
+// deadlineFromSendDelay reconstructs the native luckybox draw deadline from
+// the same fields the rush API validates (millisecond or second send_time plus
+// delay_time seconds).
+func deadlineFromSendDelay(sendTime, delayTime string) (time.Time, bool) {
+	sendTime = strings.TrimSpace(sendTime)
+	delayTime = strings.TrimSpace(delayTime)
+	if sendTime == "" || delayTime == "" {
+		return time.Time{}, false
+	}
+	sendNumeric, sendErr := strconv.ParseFloat(sendTime, 64)
+	delaySeconds, delayErr := strconv.ParseFloat(delayTime, 64)
+	if sendErr != nil || delayErr != nil || sendNumeric <= 0 || delaySeconds < 0 {
+		return time.Time{}, false
+	}
+	for sendNumeric > 1e12 {
+		sendNumeric /= 1000
+	}
+	// Millisecond timestamps are ~1e12; second timestamps are ~1e9.
+	if sendNumeric > 1e11 {
+		sendNumeric /= 1000
+	}
+	seconds := int64(sendNumeric)
+	nanos := int64((sendNumeric - float64(seconds)) * float64(time.Second))
+	base := time.Unix(seconds, nanos)
+	// Placeholder / corrupt send_time values (for example "100" in tests or
+	// truncated fields) must not collapse the participation window to 1970.
+	if base.Year() < 2020 {
+		return time.Time{}, false
+	}
+	return base.Add(time.Duration(delaySeconds * float64(time.Second))), true
 }
 
 func (p *Participant) matchesPacketType(event Event, accountID string) bool {
@@ -590,7 +657,7 @@ func (p *Participant) run(event Event, credential accounts.RedPacketParticipatio
 	if p.recordStore != nil {
 		_ = p.recordStore.CompleteParticipation(
 			event.ID, credential.AccountID, result.endpoint, result.status, result.message,
-			result.attempts, result.joined, result.won, result.cooldown,
+			result.attempts, result.joined, result.won, result.award, result.cooldown,
 		)
 	}
 	p.store.RecordRedPacketParticipation(
@@ -614,8 +681,16 @@ func (p *Participant) run(event Event, credential accounts.RedPacketParticipatio
 		}
 		return
 	}
-	if result.joined && !result.won && p.pageExecutor != nil {
+	// Immediate prize on join/rush (for example diamond_count>0 with succeed:true)
+	// is already terminal. Only schedule luckybox/receive when the account is in
+	// the draw pool without a personal prize yet.
+	if result.joined && !result.won && result.status != "won" && p.pageExecutor != nil {
 		p.scheduleDraw(event, credential.AccountID, credential.AccountName)
+	}
+	// When the join/rush response already confirmed a win, still sample the
+	// wallet once so the participation row keeps after/delta snapshots.
+	if result.won {
+		p.captureWalletResult(event, credential.AccountID)
 	}
 	p.finishTaskIfComplete(credential.AccountID)
 }
@@ -716,7 +791,7 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 			}
 			return
 		}
-		if response.HTTPStatus == http.StatusTooManyRequests || response.HTTPStatus == 444 || containsAny(bodyLower, "风控", "操作频繁", "rush_spam", "rush_too_often") {
+		if response.HTTPStatus == http.StatusTooManyRequests || response.HTTPStatus == 444 || containsAny(bodyLower, "风控", "操作频繁", "访问过于频繁") {
 			p.store.RecordRedPacketParticipation(accountID, "risk_control", "开奖结果查询触发风控，账号已进入冷却", false, false, defaultRiskCooldown, false)
 		}
 		if response.ContextMissing {
@@ -744,6 +819,14 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 				award:   fmt.Sprintf("%d钻", walletDelta),
 			}
 		}
+		// Empty receive_info is often returned before wallet credit lands (1–3s
+		// lag observed in production). Do not lock 未中奖 until delayed wallet
+		// retries also show no positive delta.
+		if outcome.status == "not_won" && walletFallbackAllowed {
+			if win, ok := p.confirmWalletWinWithRetries(event, accountID, 4, 1500*time.Millisecond); ok {
+				outcome = win
+			}
+		}
 		if outcome.status == "" {
 			if attempts < maxAttempts {
 				time.Sleep(defaultDrawResultRetryInterval)
@@ -761,15 +844,13 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 		return
 	}
 	// Result polling is bounded by attempts rather than a wall-clock timeout.
-	// Always perform the native wallet read after the final failed query so an
-	// empty/missing receive response can still be reconciled by a positive
-	// diamond increment before an abnormal record is written.
+	// Always perform delayed wallet reads after the final failed query so a
+	// missing receive response can still be reconciled by diamond credit lag.
 	if walletFallbackAllowed {
-		if walletDelta, walletOK := p.captureWalletResult(event, accountID); walletOK && walletDelta > 0 {
-			message := fmt.Sprintf("已中%d钻（钱包增量确认）", walletDelta)
-			if _, err := drawStore.ResolveParticipationDraw(event.ID, accountID, "won", message, fmt.Sprintf("%d钻", walletDelta), attempts); err == nil {
+		if win, ok := p.confirmWalletWinWithRetries(event, accountID, 4, 1500*time.Millisecond); ok {
+			if _, err := drawStore.ResolveParticipationDraw(event.ID, accountID, win.status, win.message, win.award, attempts); err == nil {
 				if accountStore, ok := p.store.(participationDrawAccountStore); ok {
-					accountStore.RecordRedPacketDrawResult(accountID, message, true)
+					accountStore.RecordRedPacketDrawResult(accountID, win.message, true)
 				}
 				p.retryCurrentEventsForAccount(accountID)
 				p.finishTaskIfComplete(accountID)
@@ -836,6 +917,39 @@ func (p *Participant) captureWalletResult(event Event, accountID string) (int64,
 	}
 	_ = records.RecordParticipationWalletResult(event.ID, accountID, balance.Diamond, delta, source)
 	return delta, true
+}
+
+// confirmWalletWinWithRetries re-reads the wallet after empty/not-won receive
+// results. Douyin often credits diamonds 1–3s after receive_info:[] is already
+// returned; a single immediate snapshot then false-negatives a real win.
+func (p *Participant) confirmWalletWinWithRetries(event Event, accountID string, tries int, gap time.Duration) (drawOutcome, bool) {
+	if _, ok := p.store.(participationWalletStore); !ok {
+		return drawOutcome{}, false
+	}
+	if _, ok := p.recordStore.(participationWalletRecordStore); !ok {
+		return drawOutcome{}, false
+	}
+	if tries <= 0 {
+		tries = 4
+	}
+	if gap <= 0 {
+		gap = 1500 * time.Millisecond
+	}
+	for attempt := 0; attempt < tries; attempt++ {
+		if attempt > 0 {
+			time.Sleep(gap)
+		}
+		delta, ok := p.captureWalletResult(event, accountID)
+		if !ok || delta <= 0 {
+			continue
+		}
+		return drawOutcome{
+			status:  "won",
+			message: fmt.Sprintf("已中%d钻（钱包增量确认）", delta),
+			award:   fmt.Sprintf("%d钻", delta),
+		}, true
+	}
+	return drawOutcome{}, false
 }
 
 func minDuration(first, second time.Duration) time.Duration {
@@ -1106,17 +1220,15 @@ func (p *Participant) attempt(event Event, credential accounts.RedPacketParticip
 		return p.attemptInPage(event, credential, decision)
 	}
 	client := p.clientFactory(event, credential)
-	params := participationParams(event, false)
-	result := p.postWithNetworkRetry(client, redPacketJoinURL, "join", params)
-	if result.terminal {
-		return result
-	}
-	if event.BoxType == "" || event.SendTime == "" || event.DelayTime == "" {
-		return result
-	}
-	rush := p.postWithNetworkRetry(client, redPacketRushURL, "rush", participationParams(event, true))
-	rush.attempts += result.attempts
-	return rush
+	// Join alone matches the verified live-page success path. A soft-deny
+	// followed by synthetic rush never recovered in production traces and only
+	// produced extra failed records.
+	return p.postWithNetworkRetry(
+		client,
+		redPacketJoinURL,
+		"join",
+		participationParamsFor(event, false, credential.UserID, credential.SecUID),
+	)
 }
 
 func (p *Participant) attemptInPage(event Event, credential accounts.RedPacketParticipationCredential, decision participationFollowDecision) participationResult {
@@ -1131,6 +1243,8 @@ func (p *Participant) attemptInPage(event Event, credential accounts.RedPacketPa
 		ActualRoomID:     strings.TrimSpace(event.ActualRoomID),
 		BoxID:            strings.TrimSpace(event.JoinBoxID),
 		PacketID:         strings.TrimSpace(event.PacketID),
+		UserID:           strings.TrimSpace(credential.UserID),
+		SecUID:           strings.TrimSpace(credential.SecUID),
 		AnchorID:         strings.TrimSpace(event.AnchorID),
 		BoxType:          strings.TrimSpace(event.BoxType),
 		SendTime:         strings.TrimSpace(event.SendTime),
@@ -1177,6 +1291,10 @@ func (p *Participant) attemptInPage(event Event, credential accounts.RedPacketPa
 }
 
 func participationParams(event Event, rush bool) map[string]string {
+	return participationParamsFor(event, rush, "", "")
+}
+
+func participationParamsFor(event Event, rush bool, userID, secUID string) map[string]string {
 	params := map[string]string{
 		"aid":             "6383",
 		"app_name":        "douyin_web",
@@ -1187,6 +1305,12 @@ func participationParams(event Event, rush bool) map[string]string {
 	}
 	if event.AnchorID != "" {
 		params["anchor_id"] = strings.TrimSpace(event.AnchorID)
+	}
+	if strings.TrimSpace(userID) != "" {
+		params["user_id"] = strings.TrimSpace(userID)
+	}
+	if strings.TrimSpace(secUID) != "" {
+		params["sec_user_id"] = strings.TrimSpace(secUID)
 	}
 	if rush {
 		params["box_type"] = strings.TrimSpace(event.BoxType)
@@ -1259,8 +1383,13 @@ func classifyParticipationResponse(response *http.Response, requestErr error, en
 		containsChallengeFailure(combined) || containsChallengeFlagJSON(text) {
 		return participationResult{status: "challenge_blocked", message: firstNonEmpty(message, "验证码/安全验证拦截，已暂停接收新任务"), terminal: true}
 	}
+	// Only treat risk flags that are actually on. Real rush responses always
+	// include the keys rush_spam/rush_too_often with value 0; scanning the raw
+	// JSON text for those key names falsely cooled every account for 5 minutes
+	// and starved new participation records.
 	if flagOn(data, "rush_spam", "rush_too_often", "risk", "risky") ||
-		containsAny(combined, "风控", "访问过于频繁", "操作频繁", "rush_spam", "rush_too_often") {
+		containsAny(message, "风控", "访问过于频繁", "操作频繁") ||
+		containsAny(combined, "访问过于频繁", "操作频繁") {
 		return participationResult{status: "risk_control", message: firstNonEmpty(message, "红包接口触发风控，账号已进入冷却"), cooldown: defaultRiskCooldown, terminal: true}
 	}
 	if flagOn(data, "expired", "is_expired", "isExpired") || containsAny(combined, "已结束", "已过期", "来晚", "已错过") {
@@ -1269,24 +1398,31 @@ func classifyParticipationResponse(response *http.Response, requestErr error, en
 	if flagOn(data, "rush_too_much") || containsAny(combined, "已参与", "已经参与", "already joined", "already_joined") {
 		return participationResult{status: "already_joined", message: firstNonEmpty(message, "红包已受理"), joined: true, terminal: true}
 	}
-	won := flagOn(data, "hit_bonus", "hitBonus", "won", "is_winner", "isWinner") || positiveNumber(data, "diamond_count", "diamondCount", "amount")
+	// Real successful join/rush responses set data.succeed=true (or an explicit
+	// joined/already-rushed signal). status_code=0 with succeed=false is the
+	// common soft-deny shape when the page only opened the panel or params did
+	// not admit the account — DY-KIRO treats that as failure unless a real page
+	// click already entered the draw pool. Never promote bare soft-deny to joined.
 	if statusCode(payload) == 0 && (flagOn(data, "succeed", "succeeded", "joined", "has_joined", "hasJoined", "success", "is_success", "isSuccess") ||
 		containsAny(combined, "参与成功", "成功参与", "等待开奖")) {
-		return participationResult{status: "joined", message: firstNonEmpty(message, "红包参与请求已受理"), joined: true, won: won, terminal: true}
+		// Some packets settle immediately on join/rush and already include the
+		// personal prize (for example diamond_count=1). Promote those to a
+		// terminal won row so UI/history do not stay stuck on “已受理” while the
+		// account wallet has already increased.
+		award := receiveAward(data)
+		immediateWin := award != "" || flagOn(data, "hit_bonus", "hitBonus", "won", "is_winner", "isWinner")
+		if immediateWin {
+			message = firstNonEmpty(message, "已中奖")
+			if award != "" {
+				message = "已中" + award
+			}
+			return participationResult{
+				status: "won", message: message, joined: true, won: true, award: award, terminal: true,
+			}
+		}
+		return participationResult{status: "joined", message: firstNonEmpty(message, "红包参与请求已受理"), joined: true, terminal: true}
 	}
-	endpoint := ""
-	if len(endpoints) > 0 {
-		endpoint = strings.ToLower(strings.TrimSpace(endpoints[0]))
-	}
-	if endpoint == "join" && statusCode(payload) == 0 && hasAnyKey(data,
-		"succeed", "succeeded", "hit_bonus", "hitBonus", "can_rush_gem", "canRushGem", "joined", "has_joined", "hasJoined") && !containsAny(combined,
-		"未达到", "未达成", "未完成", "请先", "需要先", "未登录", "请登录", "风控", "验证码",
-		"验证失败", "过期", "已结束", "已错过", "来晚", "频繁", "太快", "失败", "不能", "无法",
-		"不可", "没有资格", "钻石不足", "余额不足", "支付失败", "充值", "电脑端暂未支持") {
-		// Real luckybox/join responses often carry succeed=false and
-		// hit_bonus=false while the page has already entered the draw pool.
-		return participationResult{status: "joined", message: firstNonEmpty(message, "红包参与请求已受理，等待开奖"), joined: true, won: won, terminal: true}
-	}
+	_ = endpoints
 	return participationResult{status: "failed", message: firstNonEmpty(message, "红包接口未确认参与结果")}
 }
 

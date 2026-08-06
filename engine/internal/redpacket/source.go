@@ -27,7 +27,10 @@ type LiveProbe struct {
 	ActualRoomID string
 	Title        string
 	StreamerName string
-	Source       string
+	// StreamerID is the numeric Douyin owner uid when the enter probe exposes
+	// it. Used as a native-only fallback for luckybox join anchor_id.
+	StreamerID string
+	Source     string
 }
 
 type monitorSource interface {
@@ -44,6 +47,9 @@ type source struct {
 	client       *httpclient.Client
 	webRID       string
 	actualRoomID string
+	// streamerID is filled by ProbeLive from room.owner and reused when
+	// luckybox/box/list rows omit anchor_id (common). Join needs this id.
+	streamerID string
 }
 
 func newSource(client *httpclient.Client, webRID, actualRoomID string) monitorSource {
@@ -106,6 +112,10 @@ func (s *source) ProbeLive(ctx context.Context) (LiveProbe, error) {
 	}
 	if owner, ok := room["owner"].(map[string]any); ok {
 		probe.StreamerName = firstString(owner["nickname"])
+		if id := firstString(owner["id_str"], owner["id"], owner["uid"], owner["user_id"]); validAnchorUserID(id) {
+			probe.StreamerID = id
+			s.streamerID = id
+		}
 	}
 	if probe.StreamerName == "" {
 		if user, ok := data["user"].(map[string]any); ok {
@@ -201,6 +211,13 @@ func (s *source) fetchLuckybox(ctx context.Context) ([]poller.Snapshot, error) {
 		item["activity_kind"] = "red_packet"
 		item["activity_type"] = "红包"
 		item["source"] = "luckybox_api"
+		// box/list often omits owner/anchor. Reuse the enter-probe owner uid so
+		// participation join can send the same anchor_id real web clients use.
+		if s.streamerID != "" {
+			if firstDirectString(item, "anchor_id", "anchorId", "owner_user_id", "ownerUserId") == "" {
+				item["anchor_id"] = s.streamerID
+			}
+		}
 		snapshots = append(snapshots, poller.Snapshot{
 			Source:       "luckybox_api",
 			RoomID:       s.webRID,

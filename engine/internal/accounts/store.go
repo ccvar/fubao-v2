@@ -79,6 +79,11 @@ type RedPacketParticipationCredential struct {
 	AccountID   string
 	AccountName string
 	Cookie      string
+	// UserID / SecUID are safe Douyin identity fields required by the real
+	// live-page luckybox/join and rush query. They are never cookies or
+	// signatures and stay native-only.
+	UserID string
+	SecUID string
 }
 
 type Account struct {
@@ -506,6 +511,8 @@ func (s *Store) RedPacketParticipationCredentials(now time.Time) []RedPacketPart
 			AccountID:   account.ID,
 			AccountName: firstNonEmpty(account.Nickname, account.Name, account.UserID, "抖音账号"),
 			Cookie:      account.Cookie,
+			UserID:      strings.TrimSpace(account.UserID),
+			SecUID:      strings.TrimSpace(account.SecUID),
 		})
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].AccountName < items[j].AccountName })

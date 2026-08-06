@@ -2933,9 +2933,9 @@
       if (!browserWebviewMountedIds.includes(instance.id)) {
         browserWebviewMountedIds = [...browserWebviewMountedIds, instance.id];
       }
-      // A persistent account profile can already contain a fresh login from
-      // the prior session. Synchronize immediately on mount instead of
-      // leaving the stale CK badge visible until the polling interval fires.
+      // Synchronize login health after mount. On Windows a just-injected but
+      // rejected session often still has jar cookies; a delayed re-check after
+      // the bootstrap grace lets CK 已失效 appear on the card.
       browserCookieCheckedAt.set(instance.id, Date.now());
       const loginStateUpdated = await invoke<boolean>("sync_browser_account_cookie", {
         instanceId: instance.id,
@@ -2943,6 +2943,10 @@
       if (loginStateUpdated) {
         accounts = await engineRequest<AccountItem[]>("account.list");
       }
+      window.setTimeout(() => {
+        browserCookieCheckedAt.delete(instance.id);
+        void syncEmbeddedBrowserCookies();
+      }, 22_000);
     } catch (error) {
       browserWebviewLoadingIds = browserWebviewLoadingIds.filter((id) => id !== instance.id);
       browserWebviewErrors = {

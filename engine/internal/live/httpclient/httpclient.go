@@ -7,6 +7,7 @@ package httpclient
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/url"
@@ -275,28 +276,70 @@ func splitURL(u string) (base string, query string, hasQuery bool) {
 func (c *Client) NewSignedRequest(ctx context.Context, method, baseURL string, params map[string]string) (*http.Request, error) {
 	finalURL, _ := c.BuildSignedURLForMethod(method, baseURL, params)
 	var body io.Reader
+	contentType := ""
 	if strings.EqualFold(method, http.MethodPost) {
-		body = strings.NewReader("")
+		if jsonBody, ok := luckyboxJSONBody(baseURL, params); ok {
+			body = strings.NewReader(jsonBody)
+			contentType = "application/json"
+		} else {
+			body = strings.NewReader("")
+			contentType = "application/x-www-form-urlencoded; charset=UTF-8"
+		}
 	}
 	req, err := http.NewRequestWithContext(ctx, method, finalURL, body)
 	if err != nil {
 		return nil, err
 	}
 	req.Header = c.SignedAPIHeaders()
-	if strings.EqualFold(method, http.MethodPost) {
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	return req, nil
 }
 
-// PostSigned executes a signed same-origin POST action with an empty form body,
-// matching the verified 福宝 luckybox join/rush request.
+// PostSigned executes a signed same-origin POST. Luckybox join/rush use the
+// verified live-page JSON body {{box_id, room_id, anchor_id}}; other endpoints
+// keep an empty form body.
 func (c *Client) PostSigned(ctx context.Context, baseURL string, params map[string]string) (*http.Response, error) {
 	req, err := c.NewSignedRequest(ctx, http.MethodPost, baseURL, params)
 	if err != nil {
 		return nil, err
 	}
 	return c.http.Do(req)
+}
+
+// luckyboxJSONBody matches the real live.douyin.com XHR captured by DY-KIRO:
+// POST Content-Type: application/json with
+// {{"box_id":"...","room_id":"...","anchor_id":"..."}} (succeed:true).
+func luckyboxJSONBody(baseURL string, params map[string]string) (string, bool) {
+	lower := strings.ToLower(baseURL)
+	if !strings.Contains(lower, "/webcast/luckybox/join") && !strings.Contains(lower, "/webcast/luckybox/rush") {
+		return "", false
+	}
+	boxID := strings.TrimSpace(params["box_id"])
+	roomID := strings.TrimSpace(params["room_id"])
+	if boxID == "" || roomID == "" {
+		return "", false
+	}
+	payload := map[string]string{
+		"box_id":  boxID,
+		"room_id": roomID,
+	}
+	if anchor := strings.TrimSpace(params["anchor_id"]); anchor != "" {
+		payload["anchor_id"] = anchor
+	}
+	if strings.Contains(lower, "/webcast/luckybox/rush") {
+		for _, key := range []string{"box_type", "send_time", "delay_time"} {
+			if value := strings.TrimSpace(params[key]); value != "" {
+				payload[key] = value
+			}
+		}
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", false
+	}
+	return string(encoded), true
 }
 
 // GetSigned builds a signed GET request for the base URL + params and executes

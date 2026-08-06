@@ -436,6 +436,8 @@ struct NativePageParticipationTask {
     actual_room_id: String,
     box_id: String,
     packet_id: Option<String>,
+    user_id: Option<String>,
+    sec_uid: Option<String>,
     anchor_id: Option<String>,
     box_type: Option<String>,
     send_time: Option<String>,
@@ -502,17 +504,25 @@ impl NativePageParticipationResult {
 
 const DOUYIN_CHROME_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-// A personal luckybox result is emitted by the live page's signed
-// `luckybox/receive` request. An unsigned native retry commonly returns HTTP
-// 200 with `receive_info: []`, which is only an intermediate result. Keep a
-// small allow-listed capture queue in the native account WebView so Go can
-// consume the page result without exposing cookies, signatures, headers, or
-// raw response bodies to the frontend.
+// Capture real page-signed luckybox traffic (join/rush/receive). DY-KIRO's
+// verified succeed:true path came from the page's own XHR after a DOM click,
+// not from a synthetic empty-form fetch. Receive remains the personal draw
+// result path; join/rush capture lets native participation reuse the page's
+// real response when the user-visible red-packet control is clicked.
 const RED_PACKET_RECEIVE_CAPTURE_SCRIPT: &str = r#"(() => {
   if (window.__fubaoRedPacketReceiveCaptureInstalled) return;
   window.__fubaoRedPacketReceiveCaptureInstalled = true;
-  const queue = [];
+  const receiveQueue = [];
+  const actionQueue = [];
   const scalar = (value) => value === undefined || value === null ? '' : String(value);
+  const idsFromURL = (url) => {
+    try {
+      const parsed = new URL(String(url || ''), location.href);
+      return [parsed.searchParams.get('box_id'), parsed.searchParams.get('activity_id'),
+        parsed.searchParams.get('luckybox_id'), parsed.searchParams.get('red_packet_id')]
+        .map(scalar).map((value) => value.trim()).filter(Boolean);
+    } catch (_) { return []; }
+  };
   const idsFor = (item) => {
     if (!item || typeof item !== 'object') return [];
     return [item.box_id_str, item.boxIdStr, item.box_id, item.boxId,
@@ -527,12 +537,13 @@ const RED_PACKET_RECEIVE_CAPTURE_SCRIPT: &str = r#"(() => {
       'activity_id', 'activityId', 'red_packet_id', 'redPacketId', 'lottery_id', 'lotteryId',
       'box_type', 'boxType', 'diamond_count', 'cash_count', 'diamond', 'amount',
       'gift_name', 'giftName', 'gift_count', 'giftCount', 'gift_num', 'giftNum', 'count',
-      'prize_name', 'prizeName', 'reward_name', 'rewardName']) {
+      'prize_name', 'prizeName', 'reward_name', 'rewardName', 'hit_bonus', 'hitBonus',
+      'can_rush_gem', 'canRushGem', 'rush_too_much', 'rush_spam']) {
       if (Object.prototype.hasOwnProperty.call(item, key)) result[key] = item[key];
     }
     return result;
   };
-  const remember = (url, status, text) => {
+  const rememberReceive = (url, status, text) => {
     try {
       if (!/\/webcast\/luckybox\/receive(?:\/|$|\?)/.test(String(url || ''))) return;
       const parsed = JSON.parse(String(text || ''));
@@ -540,20 +551,50 @@ const RED_PACKET_RECEIVE_CAPTURE_SCRIPT: &str = r#"(() => {
       if (!Array.isArray(infos) || !infos.length) return;
       const reduced = infos.map(safeInfo).filter(Boolean);
       if (!reduced.length) return;
-      queue.push({status: Number(status || 200), ids: reduced.flatMap(idsFor), count: reduced.length,
+      receiveQueue.push({status: Number(status || 200), ids: reduced.flatMap(idsFor), count: reduced.length,
         body: JSON.stringify({status_code: parsed.status_code, status_msg: parsed.status_msg,
           data: {receive_info: reduced}})});
-      while (queue.length > 24) queue.shift();
+      while (receiveQueue.length > 24) receiveQueue.shift();
+    } catch (_) {}
+  };
+  const rememberAction = (url, status, text) => {
+    try {
+      const path = String(url || '');
+      let endpoint = '';
+      if (/\/webcast\/luckybox\/join(?:\/|$|\?)/.test(path)) endpoint = 'join';
+      else if (/\/webcast\/luckybox\/rush(?:\/|$|\?)/.test(path)) endpoint = 'rush';
+      else return;
+      const parsed = JSON.parse(String(text || ''));
+      const data = parsed && parsed.data && typeof parsed.data === 'object' ? parsed.data : {};
+      const reduced = safeInfo(data) || {};
+      const ids = idsFromURL(path).concat(idsFor(data));
+      actionQueue.push({
+        endpoint, status: Number(status || 200), ids: Array.from(new Set(ids.filter(Boolean))),
+        body: JSON.stringify({status_code: parsed.status_code, status_msg: parsed.status_msg, data: reduced}),
+        saved_at: Date.now()
+      });
+      while (actionQueue.length > 24) actionQueue.shift();
     } catch (_) {}
   };
   window.__fubaoTakeRedPacketReceiveResult = (boxId, packetId) => {
     const wanted = new Set([scalar(boxId).trim(), scalar(packetId).trim()].filter(Boolean));
     let index = -1;
-    for (let i = queue.length - 1; i >= 0; i -= 1) {
-      if (queue[i].ids.some((id) => wanted.has(id))) { index = i; break; }
+    for (let i = receiveQueue.length - 1; i >= 0; i -= 1) {
+      if (receiveQueue[i].ids.some((id) => wanted.has(id))) { index = i; break; }
     }
-    if (index < 0 && queue.length === 1) index = 0;
-    return index < 0 ? null : queue.splice(index, 1)[0] || null;
+    if (index < 0 && receiveQueue.length === 1) index = 0;
+    return index < 0 ? null : receiveQueue.splice(index, 1)[0] || null;
+  };
+  window.__fubaoTakeRedPacketJoinResult = (boxId, packetId, maxAgeMs) => {
+    const wanted = new Set([scalar(boxId).trim(), scalar(packetId).trim()].filter(Boolean));
+    const cutoff = Date.now() - Math.max(500, Number(maxAgeMs || 3500));
+    let index = -1;
+    for (let i = actionQueue.length - 1; i >= 0; i -= 1) {
+      const item = actionQueue[i];
+      if (!item || Number(item.saved_at || 0) < cutoff) continue;
+      if (wanted.size === 0 || item.ids.some((id) => wanted.has(id))) { index = i; break; }
+    }
+    return index < 0 ? null : actionQueue.splice(index, 1)[0] || null;
   };
   try {
     const originalFetch = window.fetch;
@@ -562,8 +603,13 @@ const RED_PACKET_RECEIVE_CAPTURE_SCRIPT: &str = r#"(() => {
         const request = input && typeof input === 'object' ? input : null;
         const url = scalar(request && request.url || input);
         return originalFetch.call(this, input, init).then((response) => {
-          if (/\/webcast\/luckybox\/receive(?:\/|$|\?)/.test(url)) {
-            try { response.clone().text().then((text) => remember(url, response.status, text)); } catch (_) {}
+          if (/\/webcast\/luckybox\/(?:receive|join|rush)(?:\/|$|\?)/.test(url)) {
+            try {
+              response.clone().text().then((text) => {
+                rememberReceive(url, response.status, text);
+                rememberAction(url, response.status, text);
+              });
+            } catch (_) {}
           }
           return response;
         });
@@ -576,16 +622,17 @@ const RED_PACKET_RECEIVE_CAPTURE_SCRIPT: &str = r#"(() => {
       const open = XHR.prototype.open;
       const send = XHR.prototype.send;
       XHR.prototype.open = function(method, url) {
-        this.__fubaoReceiveURL = scalar(url);
+        this.__fubaoLuckyboxURL = scalar(url);
         return open.apply(this, arguments);
       };
       XHR.prototype.send = function() {
         this.addEventListener('load', () => {
-          const url = scalar(this.__fubaoReceiveURL);
-          if (/\/webcast\/luckybox\/receive(?:\/|$|\?)/.test(url)) {
+          const url = scalar(this.__fubaoLuckyboxURL);
+          if (/\/webcast\/luckybox\/(?:receive|join|rush)(?:\/|$|\?)/.test(url)) {
             let body = '';
             try { body = this.responseText || ''; } catch (_) {}
-            remember(url, this.status, body);
+            rememberReceive(url, this.status, body);
+            rememberAction(url, this.status, body);
           }
         });
         return send.apply(this, arguments);
@@ -698,10 +745,13 @@ fn rebind_data_store_identifier(account_id: &str) -> [u8; 16] {
 }
 
 fn inject_douyin_cookie(webview: &tauri::Webview, raw_cookie: &str) -> Result<(), String> {
-    // Prefer parent domain first. WebView2 is picky about host-only scopes and
-    // rejecting one cookie must not abort the whole jar write — otherwise new
-    // Windows instance cards stick on “真实浏览器暂不可用”.
-    const DOMAINS: [&str; 3] = ["douyin.com", "www.douyin.com", "live.douyin.com"];
+    // WebView2 CookieManager treats a leading-dot domain as "include subdomains"
+    // and is far more reliable after a first-party context exists. macOS WKWebView
+    // accepts both forms; always write the parent domain with a leading dot.
+    #[cfg(target_os = "windows")]
+    const DOMAINS: [&str; 1] = [".douyin.com"];
+    #[cfg(not(target_os = "windows"))]
+    const DOMAINS: [&str; 3] = [".douyin.com", "www.douyin.com", "live.douyin.com"];
     let max_age = cookie::time::Duration::days(180);
     let mut wrote_any = false;
     let mut last_error = String::new();
@@ -710,22 +760,31 @@ fn inject_douyin_cookie(webview: &tauri::Webview, raw_cookie: &str) -> Result<()
             continue;
         };
         let name = name.trim();
+        // Keep values as exported; only trim surrounding whitespace. Percent
+        // decoding can corrupt signed Douyin login tokens on WebView2.
         let value = value.trim();
         if name.is_empty() {
             continue;
         }
         let is_login = DOUYIN_LOGIN_COOKIE_NAMES.contains(&name);
         for domain in DOMAINS {
-            // Try a conservative profile first (Lax + optional HttpOnly), then
-            // fall back without HttpOnly — WebView2 rejects some HttpOnly writes
-            // before the first first-party navigation.
-            let attempts = [
-                (cookie::SameSite::Lax, is_login),
-                (cookie::SameSite::Lax, false),
-                (cookie::SameSite::None, false),
-            ];
-            let mut domain_ok = false;
-            for (same_site, http_only) in attempts {
+            // Order matters on WebView2: non-HttpOnly Lax writes succeed most
+            // often; then HttpOnly; then SameSite=None for cross-site assets.
+            let attempts: &[(cookie::SameSite, bool)] = if cfg!(target_os = "windows") {
+                &[
+                    (cookie::SameSite::Lax, false),
+                    (cookie::SameSite::None, false),
+                    (cookie::SameSite::Lax, is_login),
+                    (cookie::SameSite::None, is_login),
+                ]
+            } else {
+                &[
+                    (cookie::SameSite::Lax, is_login),
+                    (cookie::SameSite::Lax, false),
+                    (cookie::SameSite::None, false),
+                ]
+            };
+            for (same_site, http_only) in attempts.iter().copied() {
                 let mut builder = Cookie::build((name.to_string(), value.to_string()))
                     .domain(domain)
                     .path("/")
@@ -738,15 +797,10 @@ fn inject_douyin_cookie(webview: &tauri::Webview, raw_cookie: &str) -> Result<()
                 match webview.set_cookie(builder.build()) {
                     Ok(()) => {
                         wrote_any = true;
-                        domain_ok = true;
                         break;
                     }
                     Err(error) => last_error = error.to_string(),
                 }
-            }
-            // Parent domain is enough for most sessions; keep trying siblings.
-            if domain == "douyin.com" && domain_ok {
-                break;
             }
         }
     }
@@ -761,9 +815,11 @@ fn inject_douyin_cookie(webview: &tauri::Webview, raw_cookie: &str) -> Result<()
 }
 
 /// Seed the account WebView so Douyin's SPA boots with the store Cookie.
-/// On Windows WebView2, cookie-manager confirmation is asynchronous and often
-/// incomplete before the first navigation — never fail the whole mount only
-/// because confirmation lagged. Navigate first-class, re-inject after load.
+///
+/// macOS WKWebView accepts cookie writes before the first navigation.
+/// Windows WebView2 usually needs a first-party document context first, then
+/// cookie write + reload — otherwise the same imported Cookie logs in on Mac
+/// but stays anonymous on Windows.
 async fn bootstrap_browser_account_session(
     webview: &tauri::Webview,
     runtime: &EngineRuntime,
@@ -774,51 +830,91 @@ async fn bootstrap_browser_account_session(
     if login_cookie_values(raw_cookie).is_empty() {
         return Err("账号 Cookie 缺少登录凭据，请重新扫码登录".into());
     }
-    // Best-effort pre-nav write. Confirmation may fail on a fresh WebView2
-    // profile; still open Douyin so the card is not stuck unavailable.
-    if let Err(error) = inject_douyin_cookie_and_confirm(webview, raw_cookie).await {
-        if cfg!(debug_assertions) {
-            eprintln!(
-                "[embedded-browser] pre-nav cookie confirm soft-failed instance={instance_id}: {error}"
-            );
-        }
-        let _ = inject_douyin_cookie(webview, raw_cookie);
-    }
-    if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
-        injected.insert(instance_id.to_string(), Instant::now());
-    }
-    webview
-        .navigate(target_url.clone())
-        .map_err(|error| format!("加载抖音页面失败：{error}"))?;
-    // WebView2 needs longer for CookieManager propagation after first paint.
-    let settle_ms = if cfg!(target_os = "windows") { 900 } else { 500 };
-    tokio::time::sleep(Duration::from_millis(settle_ms)).await;
-    match inject_douyin_cookie_and_confirm(webview, raw_cookie).await {
-        Ok(()) => {
-            if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
-                injected.insert(instance_id.to_string(), Instant::now());
-            }
-        }
-        Err(error) => {
+
+    #[cfg(target_os = "windows")]
+    {
+        // 1) Open first-party origin so CookieManager has a real site context.
+        webview
+            .navigate(target_url.clone())
+            .map_err(|error| format!("加载抖音页面失败：{error}"))?;
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        // 2) Write cookies into that first-party jar and confirm when possible.
+        if let Err(error) = inject_douyin_cookie_and_confirm(webview, raw_cookie).await {
             if cfg!(debug_assertions) {
                 eprintln!(
-                    "[embedded-browser] post-nav cookie confirm retry instance={instance_id}: {error}"
+                    "[embedded-browser] windows post-context cookie confirm soft-failed instance={instance_id}: {error}"
                 );
             }
             let _ = inject_douyin_cookie(webview, raw_cookie);
-            tokio::time::sleep(Duration::from_millis(200)).await;
-            if inject_douyin_cookie_and_confirm(webview, raw_cookie)
-                .await
-                .is_ok()
-            {
-                let _ = webview.navigate(target_url);
-                tokio::time::sleep(Duration::from_millis(350)).await;
-            }
+            tokio::time::sleep(Duration::from_millis(350)).await;
+        }
+        if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
+            injected.insert(instance_id.to_string(), Instant::now());
+        }
+        // 3) Reload so the SPA boots with the injected session (critical on WebView2).
+        webview
+            .navigate(target_url)
+            .map_err(|error| format!("重新加载已注入登录态的抖音页面失败：{error}"))?;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        // 4) One more soft write covers cookies the SPA may have cleared.
+        let _ = inject_douyin_cookie(webview, raw_cookie);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        if inject_douyin_cookie_and_confirm(webview, raw_cookie)
+            .await
+            .is_ok()
+        {
             if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
                 injected.insert(instance_id.to_string(), Instant::now());
             }
         }
     }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // Best-effort pre-nav write, then open Douyin and re-confirm.
+        if let Err(error) = inject_douyin_cookie_and_confirm(webview, raw_cookie).await {
+            if cfg!(debug_assertions) {
+                eprintln!(
+                    "[embedded-browser] pre-nav cookie confirm soft-failed instance={instance_id}: {error}"
+                );
+            }
+            let _ = inject_douyin_cookie(webview, raw_cookie);
+        }
+        if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
+            injected.insert(instance_id.to_string(), Instant::now());
+        }
+        webview
+            .navigate(target_url.clone())
+            .map_err(|error| format!("加载抖音页面失败：{error}"))?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        match inject_douyin_cookie_and_confirm(webview, raw_cookie).await {
+            Ok(()) => {
+                if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
+                    injected.insert(instance_id.to_string(), Instant::now());
+                }
+            }
+            Err(error) => {
+                if cfg!(debug_assertions) {
+                    eprintln!(
+                        "[embedded-browser] post-nav cookie confirm retry instance={instance_id}: {error}"
+                    );
+                }
+                let _ = inject_douyin_cookie(webview, raw_cookie);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                if inject_douyin_cookie_and_confirm(webview, raw_cookie)
+                    .await
+                    .is_ok()
+                {
+                    let _ = webview.navigate(target_url);
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                }
+                if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
+                    injected.insert(instance_id.to_string(), Instant::now());
+                }
+            }
+        }
+    }
+
     if cfg!(debug_assertions) {
         let login_state = inspect_douyin_login(webview)
             .await
@@ -904,9 +1000,12 @@ fn read_douyin_cookie(webview: &tauri::Webview) -> Result<String, String> {
             continue;
         };
         let domain = domain.trim_start_matches('.').to_ascii_lowercase();
+        // Include live.douyin.com so Windows reads still see login cookies that
+        // WebView2 only exposes under the live host after a room navigation.
         let priority = match domain.as_str() {
-            "douyin.com" => 2,
-            "www.douyin.com" => 1,
+            "douyin.com" => 3,
+            "www.douyin.com" => 2,
+            "live.douyin.com" => 1,
             _ => continue,
         };
         if cookie.name() == "fubao_login_probe"
@@ -1131,7 +1230,12 @@ async fn inspect_douyin_login(webview: &tauri::Webview) -> Result<BrowserLoginSn
                 (text.includes('扫码登录') || text.includes('验证码登录'));
               const loginWall = explicitDialog ||
                 (text.includes('扫码登录') && text.includes('验证码登录') &&
-                  (text.includes('登录后免费畅享') || text.includes('手机号登录')));
+                  (text.includes('登录后免费畅享') || text.includes('手机号登录'))) ||
+                // Windows Douyin often shows a compact login gate without the
+                // full “登录后免费畅享高清视频” copy.
+                ((text.includes('扫码登录') || text.includes('验证码登录')) &&
+                  (text.includes('登录后即可') || text.includes('登录后观看') ||
+                    text.includes('立即登录') || text.includes('短信登录')));
               const ready = document.readyState !== 'loading' && Boolean(document.body);
               const state = loginWall ? 'out' : ready ? 'ready' : 'unknown';
               document.cookie = `fubao_login_probe=${state}; Path=/; Secure; SameSite=None; Max-Age=5`;
@@ -1150,13 +1254,13 @@ async fn inspect_douyin_login(webview: &tauri::Webview) -> Result<BrowserLoginSn
     let raw_cookie = read_douyin_cookie(webview).ok();
     let _ = webview
         .eval("document.cookie='fubao_login_probe=; Path=/; Secure; SameSite=None; Max-Age=0'");
-    // If the page shell still looks logged-out but native login cookies are
-    // already present (fresh inject / SPA restore), keep the state unknown so
-    // a transient frame cannot expire the canonical account.
+    // Login wall is LoggedOut even when injected cookies remain in the jar.
+    // Windows WebView2 often keeps store tokens after a rejected session; that
+    // must still surface as CK expiry outside the bootstrap grace window.
     let state = match probe.as_deref() {
-        Some("out") if raw_cookie.is_none() => BrowserLoginState::LoggedOut,
-        Some("out") => BrowserLoginState::Unknown,
+        Some("out") => BrowserLoginState::LoggedOut,
         Some("ready") if raw_cookie.is_some() => BrowserLoginState::LoggedIn,
+        Some("ready") => BrowserLoginState::Unknown,
         _ => BrowserLoginState::Unknown,
     };
     Ok(BrowserLoginSnapshot { raw_cookie, state })
@@ -1466,6 +1570,8 @@ async fn execute_page_participation(
         "actual_room_id": task.actual_room_id,
         "box_id": task.box_id,
         "packet_id": task.packet_id.as_deref().unwrap_or_default(),
+        "user_id": task.user_id.as_deref().unwrap_or_default(),
+        "sec_uid": task.sec_uid.as_deref().unwrap_or_default(),
         "anchor_id": task.anchor_id.as_deref().unwrap_or_default(),
         "box_type": task.box_type.as_deref().unwrap_or_default(),
         "send_time": task.send_time.as_deref().unwrap_or_default(),
@@ -1482,11 +1588,6 @@ async fn execute_page_participation(
               const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
               document.cookie = `${{cookieName}}=${{hex}}; Path=/; Secure; SameSite=None; Max-Age=15`;
             }} catch (error) {{}}
-          }};
-          const stripSignatures = (url) => {{
-            for (const key of ['msToken', 'a_bogus', 'X-Bogus', '__ac_signature', '__ac_nonce']) {{
-              url.searchParams.delete(key);
-            }}
           }};
           const challengeCopy = /请完成(?:安全)?验证|请拖动滑块|拖动滑块|滑块验证|验证码拦截|安全验证拦截/;
           const visibleElement = (element) => {{
@@ -1533,41 +1634,200 @@ async fn execute_page_participation(
               return inspect(parsed);
             }} catch (error) {{ return false; }}
           }};
-          const commonRequestURL = () => {{
+          // Real live-page join/rush traffic (captured in DY-KIRO) carries the
+          // current webcast identity (user_id/sec_user_id/msToken base) plus a
+          // full browser fingerprint. A minimal room_id+box_id URL is accepted
+          // with status_code=0 but almost always soft-denies succeed=false.
+          // Reuse the latest same-origin webcast resource for session fields,
+          // strip list/signature params, then set the action-specific fields so
+          // bdms.js can re-sign on fetch.
+          const looksNumericID = (value) => /^\\d{{5,}}$/.test(String(value || '').trim());
+          const pickNumeric = (value) => {{
+            const text = String(value || '').trim();
+            return looksNumericID(text) ? text : '';
+          }};
+          const walkAnchorID = (node, depth) => {{
+            if (!node || depth > 6) return '';
+            if (Array.isArray(node)) {{
+              for (const item of node) {{
+                const found = walkAnchorID(item, depth + 1);
+                if (found) return found;
+              }}
+              return '';
+            }}
+            if (typeof node !== 'object') return '';
+            for (const key of ['anchor_id', 'anchorId', 'anchor_user_id', 'anchorUserId', 'owner_user_id', 'ownerUserId']) {{
+              const value = pickNumeric(node[key]);
+              if (value) return value;
+            }}
+            for (const nestKey of ['owner', 'anchor', 'author', 'user', 'room_owner', 'roomOwner']) {{
+              const nest = node[nestKey];
+              if (!nest || typeof nest !== 'object') continue;
+              const value = pickNumeric(nest.id_str || nest.idStr || nest.uid || nest.user_id || nest.userId || nest.id);
+              if (value) return value;
+            }}
+            for (const child of Object.values(node)) {{
+              if (child && typeof child === 'object') {{
+                const found = walkAnchorID(child, depth + 1);
+                if (found) return found;
+              }}
+            }}
+            return '';
+          }};
+          const pageIdentity = () => {{
+            const found = {{}};
+            try {{
+              const entries = performance.getEntriesByType('resource').slice().reverse();
+              for (const entry of entries) {{
+                const candidate = new URL(String(entry.name || ''), location.href);
+                if (!/douyin\\.com$/i.test(candidate.hostname)) continue;
+                for (const key of ['user_id', 'sec_user_id', 'user_unique_id', 'sec_anchor_id', 'anchor_id', 'anchor_id_str', 'verifyFp', 'fp', 's_v_web_id', 'device_id']) {{
+                  const value = String(candidate.searchParams.get(key) || '').trim();
+                  if (value && !found[key]) found[key] = value;
+                }}
+                if (found.user_id && found.sec_user_id && found.anchor_id) break;
+              }}
+            }} catch (_) {{}}
+            try {{
+              const cookieText = String(document.cookie || '');
+              for (const part of cookieText.split(';')) {{
+                const index = part.indexOf('=');
+                if (index < 0) continue;
+                const key = part.slice(0, index).trim();
+                const value = part.slice(index + 1).trim();
+                if (!value) continue;
+                if ((key === 'uid_tt' || key === 'uid_tt_ss') && !found.user_id && looksNumericID(value)) found.user_id = value;
+                if (key === 'sessionid' && !found.session_hint) found.session_hint = '1';
+              }}
+            }} catch (_) {{}}
+            // Live room SPA often keeps the streamer id in RENDER_DATA / page state
+            // even when the task metadata from center-library rows omits anchor_id.
+            if (!found.anchor_id) {{
+              try {{
+                const el = document.getElementById('RENDER_DATA');
+                if (el && el.textContent) {{
+                  const parsed = JSON.parse(decodeURIComponent(el.textContent));
+                  const anchor = walkAnchorID(parsed, 0);
+                  if (anchor) found.anchor_id = anchor;
+                }}
+              }} catch (_) {{}}
+            }}
+            if (!found.anchor_id) {{
+              try {{
+                for (const key of Object.keys(window)) {{
+                  if (!/ROOM|ROOM_INFO|INIT|STATE|STORE/i.test(key)) continue;
+                  const anchor = walkAnchorID(window[key], 0);
+                  if (anchor) {{ found.anchor_id = anchor; break; }}
+                }}
+              }} catch (_) {{}}
+            }}
+            return found;
+          }};
+          const requestURL = (endpoint) => {{
+            let url = new URL('https://live.douyin.com/webcast/luckybox/join/');
             try {{
               const entries = performance.getEntriesByType('resource').slice().reverse();
               for (const entry of entries) {{
                 const candidate = new URL(String(entry.name || ''), location.href);
                 if (candidate.hostname === 'live.douyin.com' && candidate.pathname.startsWith('/webcast/')) {{
-                  return candidate;
+                  url = candidate;
+                  break;
                 }}
               }}
-            }} catch (error) {{}}
-            return new URL('https://live.douyin.com/webcast/luckybox/join/');
-          }};
-          const requestURL = (endpoint) => {{
-            const url = commonRequestURL();
+            }} catch (_) {{}}
             url.protocol = 'https:';
             url.hostname = 'live.douyin.com';
             url.pathname = `/webcast/luckybox/${{endpoint}}/`;
-            stripSignatures(url);
-            for (const key of ['cursor', 'count', 'offset', 'fetch_time', 'last_id', 'room_ids']) {{
+            for (const key of [
+              'msToken', 'a_bogus', 'X-Bogus', '__ac_signature', '__ac_nonce',
+              'cursor', 'count', 'offset', 'fetch_time', 'last_id', 'room_ids',
+              'box_list_type', 'is_draw', 'identity', 'Rangelist'
+            ]) {{
               url.searchParams.delete(key);
             }}
+            const identity = pageIdentity();
+            // Real live-page captures always include the account identity.
+            // Prefer the native account store values (task.user_id/sec_uid);
+            // fall back to page/session sniffing only when missing.
+            const userId = String(task.user_id || identity.user_id || '').trim();
+            const secUserId = String(task.sec_uid || identity.sec_user_id || '').trim();
+            // Match a verified DY-KIRO join_action_trace that returned
+            // data.succeed:true: enter_from=link_share, action_type=click,
+            // full browser fingerprint, and account/anchor identity in query.
             const values = {{
-              aid: '6383', app_name: 'douyin_web', live_id: '1', device_platform: 'web',
-              room_id: task.actual_room_id, web_rid: task.web_rid, box_id: task.box_id, anchor_id: task.anchor_id
+              aid: '6383',
+              app_name: 'douyin_web',
+              live_id: '1',
+              device_platform: 'web',
+              language: 'zh-CN',
+              enter_from: 'link_share',
+              enter_from_merge: 'link_share',
+              enter_method: 'direct_open',
+              cookie_enabled: String(navigator.cookieEnabled !== false),
+              screen_width: String(window.screen && window.screen.width || 1920),
+              screen_height: String(window.screen && window.screen.height || 1080),
+              browser_language: navigator.language || 'zh-CN',
+              browser_platform: navigator.platform || 'MacIntel',
+              browser_name: 'Chrome',
+              browser_version: '124.0.0.0',
+              browser_online: String(navigator.onLine !== false),
+              os_name: 'Mac OS',
+              os_version: '10.15.7',
+              platform: 'PC',
+              pc_client_type: '1',
+              version_code: '170400',
+              update_version_code: '170400',
+              version_name: '17.4.0',
+              action_type: 'click',
+              is_ad: '0',
+              room_id: task.actual_room_id,
+              box_id: task.box_id,
+              user_id: userId,
+              sec_user_id: secUserId,
+              user_unique_id: identity.user_unique_id || '',
+              user_agent: navigator.userAgent || '',
+              verifyFp: identity.verifyFp || '',
+              fp: identity.fp || '',
+              s_v_web_id: identity.s_v_web_id || '',
+              device_id: identity.device_id || ''
             }};
+            const anchor = String(task.anchor_id || identity.anchor_id || '').trim();
+            if (anchor) {{
+              values.anchor_id = anchor;
+              values.anchor_id_str = anchor;
+            }}
+            if (identity.sec_anchor_id) values.sec_anchor_id = identity.sec_anchor_id;
             for (const [key, value] of Object.entries(values)) {{
               if (String(value || '').trim()) url.searchParams.set(key, String(value));
             }}
-            if (!url.searchParams.has('browser_language')) url.searchParams.set('browser_language', navigator.language || 'zh-CN');
-            if (!url.searchParams.has('browser_platform')) url.searchParams.set('browser_platform', navigator.platform || 'MacIntel');
-            if (!url.searchParams.has('browser_name')) url.searchParams.set('browser_name', 'Chrome');
-            if (!url.searchParams.has('browser_version')) url.searchParams.set('browser_version', '124.0.0.0');
-            if (!url.searchParams.has('browser_online')) url.searchParams.set('browser_online', String(navigator.onLine));
-            if (!url.searchParams.has('cookie_enabled')) url.searchParams.set('cookie_enabled', String(navigator.cookieEnabled));
             return url;
+          }};
+          // Real page join POSTs JSON (not an empty form body). Captured success:
+          // Content-Type: application/json
+          // body: {{"box_id":"...","room_id":"...","anchor_id":"..."}}
+          const requestBody = (endpoint) => {{
+            if (endpoint === 'receive') return '';
+            const body = {{
+              box_id: String(task.box_id || ''),
+              room_id: String(task.actual_room_id || '')
+            }};
+            const anchor = String(task.anchor_id || pageIdentity().anchor_id || '').trim();
+            if (anchor) body.anchor_id = anchor;
+            return JSON.stringify(body);
+          }};
+          const parseLuckyboxBody = (text) => {{
+            try {{ return JSON.parse(String(text || '')); }} catch (_) {{ return null; }}
+          }};
+          const luckyboxLooksJoined = (text) => {{
+            const parsed = parseLuckyboxBody(text);
+            if (!parsed || Number(parsed.status_code ?? -1) !== 0) return false;
+            const data = parsed.data && typeof parsed.data === 'object' ? parsed.data : {{}};
+            if (data.succeed === true || data.succeeded === true || data.joined === true ||
+              data.has_joined === true || data.hasJoined === true || data.success === true ||
+              data.is_success === true || data.isSuccess === true) return true;
+            if (data.rush_too_much || data.rush_too_often) return true;
+            const message = String(parsed.status_msg || data.message || data.prompts || data.toast || '');
+            return /参与成功|成功参与|已参与|等待开奖|已抢|领取成功/.test(message);
           }};
           const takeCapturedReceive = () => {{
             try {{
@@ -1576,6 +1836,27 @@ async fn execute_page_participation(
               if (!item || !item.body) return null;
               return {{endpoint: 'receive', status: Number(item.status || 200), text: String(item.body)}};
             }} catch (_) {{ return null; }}
+          }};
+          const takeCapturedJoin = (maxAgeMs) => {{
+            try {{
+              if (typeof window.__fubaoTakeRedPacketJoinResult !== 'function') return null;
+              const item = window.__fubaoTakeRedPacketJoinResult(task.box_id, task.packet_id, maxAgeMs);
+              if (!item || !item.body) return null;
+              return {{
+                endpoint: String(item.endpoint || 'join'),
+                status: Number(item.status || 200),
+                text: String(item.body)
+              }};
+            }} catch (_) {{ return null; }}
+          }};
+          const waitCapturedJoin = async (timeoutMs) => {{
+            const deadline = Date.now() + Math.max(400, Number(timeoutMs || 2200));
+            while (Date.now() < deadline) {{
+              const captured = takeCapturedJoin(timeoutMs + 500);
+              if (captured) return captured;
+              await new Promise((resolve) => setTimeout(resolve, 120));
+            }}
+            return null;
           }};
           const clickResultSurface = () => {{
             try {{
@@ -1671,13 +1952,41 @@ async fn execute_page_participation(
             }} catch (_) {{ return false; }}
           }};
           const send = async (endpoint) => {{
-            const response = await fetch(requestURL(endpoint).toString(), {{
-              method: 'POST', credentials: 'include', cache: 'no-store',
-              headers: {{'accept': 'application/json, text/plain, */*', 'content-type': 'application/x-www-form-urlencoded'}},
-              body: '', referrer: `https://live.douyin.com/${{task.web_rid}}`,
-              referrerPolicy: 'strict-origin-when-cross-origin'
-            }});
-            let text = await response.text();
+            // Verified success path (DY-KIRO join_action_trace):
+            // XHR POST application/json body {{box_id, room_id, anchor_id}}.
+            const bodyText = requestBody(endpoint);
+            const urlText = requestURL(endpoint).toString();
+            const contentType = endpoint === 'receive'
+              ? 'application/x-www-form-urlencoded'
+              : 'application/json';
+            let status = 0;
+            let text = '';
+            if (endpoint !== 'receive' && typeof XMLHttpRequest === 'function') {{
+              // Prefer XHR: real live-page join used XHR and bdms hooks it.
+              await new Promise((resolve) => {{
+                try {{
+                  const xhr = new XMLHttpRequest();
+                  xhr.open('POST', urlText, true);
+                  xhr.withCredentials = true;
+                  xhr.setRequestHeader('Accept', 'application/json, text/plain, */*');
+                  xhr.setRequestHeader('Content-Type', contentType);
+                  xhr.onload = () => {{ status = xhr.status; text = String(xhr.responseText || ''); resolve(); }};
+                  xhr.onerror = () => {{ status = 0; text = ''; resolve(); }};
+                  xhr.send(bodyText);
+                }} catch (_) {{ resolve(); }}
+              }});
+            }}
+            if (!text) {{
+              const response = await fetch(urlText, {{
+                method: 'POST', credentials: 'include', cache: 'no-store',
+                headers: {{'accept': 'application/json, text/plain, */*', 'content-type': contentType}},
+                body: bodyText,
+                referrer: `https://live.douyin.com/${{task.web_rid}}`,
+                referrerPolicy: 'strict-origin-when-cross-origin'
+              }});
+              status = response.status;
+              text = await response.text();
+            }}
             if (endpoint === 'receive') {{
               try {{
                 const parsed = JSON.parse(text);
@@ -1692,16 +2001,12 @@ async fn execute_page_participation(
                   const onlyDefinitive = infos.length === 1 && infos[0] &&
                     (Object.prototype.hasOwnProperty.call(infos[0], 'succeed') || Object.prototype.hasOwnProperty.call(infos[0], 'success'));
                   const onlyIdless = infos.length === 1 && !String(infos[0] && (infos[0].box_id_str || infos[0].boxIdStr || infos[0].box_id || infos[0].boxId || infos[0].activity_id || infos[0].activityId || infos[0].red_packet_id || infos[0].redPacketId || infos[0].lottery_id || infos[0].lotteryId) || '');
-                  // receive-side box_id can legitimately drift from the
-                  // request-side box row. Preserve one explicit personal
-                  // result for Go's account/event-scoped fallback; never
-                  // relax matching when multiple accounts/results are present.
                   reduced = matched ? [matched] : onlyIdless || onlyDefinitive ? [infos[0]] : infos.length === 0 ? [] : undefined;
                 }}
                 text = JSON.stringify({{status_code: parsed.status_code, status_msg: parsed.status_msg, data: {{receive_info: reduced}}}});
               }} catch (error) {{}}
             }}
-            return {{endpoint, status: response.status, text}};
+            return {{endpoint, status, text}};
           }};
           (async () => {{
             try {{
@@ -1720,33 +2025,22 @@ async fn execute_page_participation(
                   return;
                 }}
               }}
+              // Pure API join is the primary path (other clients succeed without
+              // DOM). Wait briefly if the SPA is still "entering" the room so we
+              // do not soft-deny mid-navigation; then POST JSON join immediately.
               if (task.action !== 'receive') {{
-                const packetOpened = clickPacketSurface();
-                if (packetOpened) await new Promise((resolve) => setTimeout(resolve, 350));
-                if (!clickJoinSurface()) {{
-                  // Fall through to the signed page-context API fallback when
-                  // the live page does not expose a safe, targetable packet
-                  // control (for example while a different overlay is open).
-                }} else {{
-                // A real page click keeps the pending-red-packet panel open;
-                // Douyin then emits the signed receive request at draw time.
-                // Never click the packet entry again after this point because
-                // it toggles the panel closed and suppresses that request.
-                await new Promise((resolve) => setTimeout(resolve, 650));
-                const pageText = String(document.body && document.body.innerText || '');
-                if (/已参与|等待开奖|参与成功|成功参与/.test(pageText)) {{
-                  finish({{endpoint: 'page', http_status: 200, body: JSON.stringify({{status_code: 0, data: {{succeed: true, joined: true, page_join: true}}}}), error: '', attempts: 1, context_missing: false, login_expired: false, challenge_blocked: false}});
-                  return;
+                const readyDeadline = Date.now() + 1200;
+                while (Date.now() < readyDeadline) {{
+                  const head = String(document.body && document.body.innerText || '').slice(0, 400);
+                  if (!/正在进入直播间|加载中|连接中/.test(head)) break;
+                  await new Promise((resolve) => setTimeout(resolve, 100));
                 }}
+                // Opportunistic page click in parallel is skipped here: a long
+                // DOM wait burned the countdown window and raised failure rate.
               }}
-              }}
-              // A synthetic join -> rush fallback doubles account traffic and
-              // Douyin reports the second request as rush_spam. One detected
-              // packet therefore issues exactly one page-context join. A rush
-              // is only safe when it originates from a real page interaction
-              // whose complete request template was captured by the page.
               const action = task.action === 'receive' ? 'receive' : 'join';
               const response = await send(action);
+              const attempts = 1;
               if (action === 'receive' && /"receive_info"\s*:\s*\[\s*\]/.test(response.text || '')) {{
                 // Keep the page-native path alive: if the result panel is
                 // already present, opening it causes Douyin to issue its own
@@ -1766,7 +2060,7 @@ async fn execute_page_participation(
                 http_status: response.status,
                 body: String(response.text || '').slice(0, 1200),
                 error: challengeBlocked ? '验证码/安全验证拦截，已暂停接收新任务' : '',
-                attempts: 1,
+                attempts,
                 context_missing: false,
                 login_expired: false,
                 challenge_blocked: challengeBlocked
@@ -3056,15 +3350,20 @@ async fn sync_browser_account_cookie(
     let credential: NativeBrowserCredential =
         serde_json::from_value(result).map_err(|error| format!("解析浏览器凭据失败：{error}"))?;
     // Fresh mounts inject the store Cookie then navigate. Douyin SPA can paint
-    // a login shell for several seconds even while the injected session is
-    // valid. Keep a longer grace so periodic cookie sync cannot expire a just-
-    // created instance.
+    // a login shell briefly while the session is still restoring. Only during
+    // this grace may a login wall be ignored — afterwards Windows often keeps
+    // rejected inject cookies in the jar and must show CK 已失效.
+    let grace = if cfg!(target_os = "windows") {
+        Duration::from_secs(20)
+    } else {
+        Duration::from_secs(30)
+    };
     let within_injection_grace = runtime
         .browser_cookie_injected_at
         .lock()
         .ok()
         .and_then(|injected| injected.get(&instance_id).copied())
-        .is_some_and(|injected_at| injected_at.elapsed() < Duration::from_secs(45));
+        .is_some_and(|injected_at| injected_at.elapsed() < grace);
     if snapshot.state == BrowserLoginState::LoggedOut && within_injection_grace {
         if !require_logged_in {
             if cfg!(debug_assertions) {
@@ -3085,9 +3384,11 @@ async fn sync_browser_account_cookie(
             }
         }
     }
-    // Re-check native cookies after UI probe. A logout wall without cleared
-    // login cookies is usually a transient SPA frame, not a real CK expiry.
-    if snapshot.state == BrowserLoginState::LoggedOut {
+    // During bootstrap only: a login wall while store cookies are still present
+    // may be a transient SPA frame. After the grace window, login wall means
+    // the session did not take — keep LoggedOut so the UI can show CK 已失效
+    // even though inject left tokens in the WebView2 jar.
+    if snapshot.state == BrowserLoginState::LoggedOut && within_injection_grace {
         if let Ok(current) = read_douyin_cookie(&webview) {
             if login_cookie_snapshot_matches(&credential.cookie, &current)
                 || browser_login_cookie_is_safe_to_persist(&credential.cookie, &current)

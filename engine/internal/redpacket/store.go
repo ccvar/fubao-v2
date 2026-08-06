@@ -60,6 +60,9 @@ type Monitor struct {
 	ActualRoomID           string `json:"actual_room_id,omitempty"`
 	Name                   string `json:"name,omitempty"`
 	StreamerName           string `json:"streamer_name,omitempty"`
+	// StreamerID is native-only (owner uid from live enter probe) and used to
+	// fill missing red-packet join anchor_id. Never returned to the frontend.
+	StreamerID             string `json:"-"`
 	Source                 string `json:"source,omitempty"`
 	AccountID              string `json:"account_id,omitempty"`
 	AccountName            string `json:"account_name,omitempty"`
@@ -540,6 +543,7 @@ func (s *Store) load() error {
 	}
 	for _, record := range payload.ParticipationRecords {
 		if record != nil && record.ID != "" && record.EventID != "" && record.AccountID != "" {
+			repairImmediateWinRecord(record)
 			s.participations[record.ID] = record
 		}
 	}
@@ -794,7 +798,7 @@ func (s *Store) ReserveParticipation(event Event, accountID, accountName string)
 }
 
 // CompleteParticipation updates a reserved record with safe result metadata.
-func (s *Store) CompleteParticipation(eventID, accountID, endpoint, status, message string, attempts int, joined, won bool, cooldown time.Duration) error {
+func (s *Store) CompleteParticipation(eventID, accountID, endpoint, status, message string, attempts int, joined, won bool, award string, cooldown time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	record := s.participations[participationRecordID(accountID, eventID)]
@@ -807,7 +811,22 @@ func (s *Store) CompleteParticipation(eventID, accountID, endpoint, status, mess
 	record.Message = strings.TrimSpace(message)
 	record.AttemptCount = attempts
 	record.Joined = joined
-	record.Won = won
+	record.Won = won || status == "won"
+	if award = strings.TrimSpace(award); award != "" {
+		record.Award = award
+	}
+	// Immediate join/rush prizes must not remain status=joined with only a Won
+	// flag — the participation UI and history read status/message/award.
+	if record.Won && (record.Status == "" || record.Status == "joined" || record.Status == "already_joined") {
+		record.Status = "won"
+		if record.Message == "" || record.Message == "红包参与请求已受理" || record.Message == "红包已受理" {
+			if record.Award != "" {
+				record.Message = "已中" + record.Award
+			} else {
+				record.Message = "已中奖"
+			}
+		}
+	}
 	if joined && record.JoinedAt == "" {
 		record.JoinedAt = now.Format(time.RFC3339Nano)
 	}
@@ -1210,6 +1229,28 @@ func participationDrawTerminal(status string) bool {
 	}
 }
 
+// repairImmediateWinRecord fixes rows where join/rush already set Won=true but
+// left status=joined (UI never showed a win). Award text is preserved when
+// present; otherwise a generic 已中奖 label is used.
+func repairImmediateWinRecord(record *ParticipationRecord) {
+	if record == nil || !record.Won {
+		return
+	}
+	status := strings.TrimSpace(record.Status)
+	if status != "" && status != "joined" && status != "already_joined" {
+		return
+	}
+	record.Status = "won"
+	message := strings.TrimSpace(record.Message)
+	if message == "" || message == "红包参与请求已受理" || message == "红包已受理" {
+		if award := strings.TrimSpace(record.Award); award != "" {
+			record.Message = "已中" + award
+		} else {
+			record.Message = "已中奖"
+		}
+	}
+}
+
 // ResolveParticipationDraw persists one definitive personal result. It returns
 // true only when the record newly transitions into a confirmed win.
 func (s *Store) ResolveParticipationDraw(eventID, accountID, status, message, award string, attempts int) (bool, error) {
@@ -1582,6 +1623,12 @@ func (s *Store) RecordParticipationTrace(task PageParticipationTask, response Pa
 	if strings.TrimSpace(task.PacketID) != "" {
 		params["packet_id"] = strings.TrimSpace(task.PacketID)
 	}
+	if strings.TrimSpace(task.UserID) != "" {
+		params["user_id"] = strings.TrimSpace(task.UserID)
+	}
+	if strings.TrimSpace(task.SecUID) != "" {
+		params["sec_user_id"] = strings.TrimSpace(task.SecUID)
+	}
 	for key, value := range map[string]string{
 		"anchor_id": task.AnchorID, "box_type": task.BoxType, "send_time": task.SendTime, "delay_time": task.DelayTime,
 	} {
@@ -1944,7 +1991,7 @@ func (s *Store) MergeCenter(items []CenterEvent) (int, error) {
 		if validLuckyboxID(item.JoinBoxID) {
 			existing.JoinBoxID = firstNonEmpty(existing.JoinBoxID, item.JoinBoxID)
 		}
-		existing.AnchorID = firstNonEmpty(existing.AnchorID, item.AnchorID)
+		existing.AnchorID = firstNonEmpty(existing.AnchorID, item.AnchorID, s.streamerIDForRoomLocked(webRID, item.ActualRoomID))
 		existing.BoxType = firstNonEmpty(existing.BoxType, item.BoxType)
 		existing.SendTime = firstNonEmpty(existing.SendTime, item.SendTime)
 		existing.DelayTime = firstNonEmpty(existing.DelayTime, item.DelayTime)
@@ -2693,6 +2740,9 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 	if probe.StreamerName != "" {
 		monitor.StreamerName = probe.StreamerName
 	}
+	if probe.StreamerID != "" {
+		monitor.StreamerID = probe.StreamerID
+	}
 	liveResultHandler := s.liveResultHandler
 	roomID := monitor.RoomID
 	if monitor.LiveStatus != "live" {
@@ -2785,7 +2835,7 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 			// business identifier (for example AC2025...). Participation must
 			// use the row's real numeric box_id_str instead.
 			existing.JoinBoxID = firstNonEmpty(packet.boxID, existing.JoinBoxID)
-			existing.AnchorID = firstNonEmpty(packet.anchorID, existing.AnchorID)
+			existing.AnchorID = firstNonEmpty(packet.anchorID, existing.AnchorID, monitor.StreamerID)
 			existing.BoxType = firstNonEmpty(packet.boxType, existing.BoxType)
 			existing.SendTime = firstNonEmpty(packet.sendTime, existing.SendTime)
 			existing.DelayTime = firstNonEmpty(packet.delayTime, existing.DelayTime)
@@ -2821,7 +2871,8 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 				}
 				return ""
 			}()),
-			AnchorID: packet.anchorID, BoxType: packet.boxType,
+			AnchorID: firstNonEmpty(packet.anchorID, monitor.StreamerID),
+			BoxType:  packet.boxType,
 			SendTime: packet.sendTime, DelayTime: packet.delayTime,
 		}
 		s.events[eventID] = event
@@ -2829,6 +2880,18 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 		monitor.PacketCount++
 		monitor.LastEventAt, monitor.LastPacketID, monitor.LastPacketTitle = now, packetID, packet.title
 		monitor.LastParticipantCount = packet.participants
+	}
+	// Ensure anchor is filled before dispatch for participation join.
+	for i := range newEvents {
+		if newEvents[i].AnchorID == "" {
+			newEvents[i].AnchorID = firstNonEmpty(
+				newEvents[i].AnchorID,
+				s.streamerIDForRoomLocked(newEvents[i].WebRID, newEvents[i].ActualRoomID),
+			)
+			if event := s.events[newEvents[i].ID]; event != nil && event.AnchorID == "" {
+				event.AnchorID = newEvents[i].AnchorID
+			}
+		}
 	}
 	s.scheduleSaveLocked()
 	handler := s.eventHandler
@@ -2847,6 +2910,26 @@ func (s *Store) pollOnce(ctx context.Context, id string, source monitorSource) t
 
 func eventParticipationMetadataReady(event *Event) bool {
 	return event != nil && strings.TrimSpace(event.ActualRoomID) != "" && validLuckyboxID(event.JoinBoxID)
+}
+
+// streamerIDForRoomLocked returns a native owner uid previously learned from a
+// live enter probe for the same web_rid / actual room. Used when center or
+// luckybox rows omit anchor_id.
+func (s *Store) streamerIDForRoomLocked(webRID, actualRoomID string) string {
+	webRID = strings.TrimSpace(webRID)
+	actualRoomID = strings.TrimSpace(actualRoomID)
+	for _, monitor := range s.monitors {
+		if monitor == nil || strings.TrimSpace(monitor.StreamerID) == "" {
+			continue
+		}
+		if webRID != "" && (monitor.WebRID == webRID || monitor.RoomID == webRID) {
+			return monitor.StreamerID
+		}
+		if actualRoomID != "" && monitor.ActualRoomID == actualRoomID {
+			return monitor.StreamerID
+		}
+	}
+	return ""
 }
 
 func (s *Store) acquireProbeSlot(ctx context.Context) (func(), bool) {
@@ -2959,7 +3042,10 @@ func extractRedPacket(data map[string]any) (packetMeta, bool) {
 	if !validLuckyboxID(meta.boxID) {
 		meta.boxID = ""
 	}
-	meta.anchorID = firstPairValue(pairs, "anchor_id", "anchorId")
+	// Prefer explicit anchor/owner identity fields (DY-KIRO's meta extractor).
+	// Real join success traces always include numeric anchor_id in both query
+	// and JSON body. Never fall back to bare id_str which collides with box/room.
+	meta.anchorID = extractAnchorID(data, pairs, meta.boxID)
 	meta.boxType = firstPairValue(pairs, "box_type", "boxType")
 	meta.sendTime = firstPairValue(pairs, "send_time", "sendTime", "start_time", "startTime")
 	meta.delayTime = firstPairValue(pairs, "delay_time", "delayTime", "duration", "duration_s")
@@ -3165,6 +3251,80 @@ func firstPairValue(pairs []pair, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+// extractAnchorID prefers explicit anchor/owner user ids from the luckybox
+// payload. Nested owner maps are walked before bare id_str pairs so box/room
+// identifiers cannot steal the anchor slot.
+func extractAnchorID(data map[string]any, pairs []pair, boxID string) string {
+	// Explicit anchor_* keys win even when non-numeric (tests / legacy rows).
+	for _, key := range []string{
+		"anchor_id", "anchorId", "anchor_user_id", "anchorUserId",
+		"owner_user_id", "ownerUserId", "owner_id", "ownerId",
+	} {
+		if value := strings.TrimSpace(firstPairValue(pairs, key)); value != "" && value != boxID {
+			return value
+		}
+	}
+	return walkMapAnchorID(data, 0, boxID)
+}
+
+func walkMapAnchorID(value any, depth int, boxID string) string {
+	if depth > 6 || value == nil {
+		return ""
+	}
+	switch item := value.(type) {
+	case map[string]any:
+		for _, key := range []string{"anchor_id", "anchorId", "anchor_user_id", "anchorUserId", "owner_user_id", "ownerUserId"} {
+			if candidate := validAnchorOrEmpty(item[key], boxID); candidate != "" {
+				return candidate
+			}
+		}
+		for _, nestKey := range []string{"owner", "anchor", "author", "user", "room_owner", "roomOwner"} {
+			if nest, ok := item[nestKey].(map[string]any); ok {
+				for _, key := range []string{"id_str", "idStr", "uid", "user_id", "userId", "id"} {
+					if candidate := validAnchorOrEmpty(nest[key], boxID); candidate != "" {
+						return candidate
+					}
+				}
+			}
+		}
+		for _, child := range item {
+			if found := walkMapAnchorID(child, depth+1, boxID); found != "" {
+				return found
+			}
+		}
+	case []any:
+		for _, child := range item {
+			if found := walkMapAnchorID(child, depth+1, boxID); found != "" {
+				return found
+			}
+		}
+	}
+	return ""
+}
+
+func validAnchorOrEmpty(value any, boxID string) string {
+	text := strings.TrimSpace(scalarString(value))
+	if !validAnchorUserID(text) || text == boxID {
+		return ""
+	}
+	return text
+}
+
+// validAnchorUserID accepts Douyin numeric user ids (typically 6+ digits).
+// Shorter values are almost always placeholder noise.
+func validAnchorUserID(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) < 6 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func firstPairInt(pairs []pair, keys ...string) int {

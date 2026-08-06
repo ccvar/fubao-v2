@@ -21,6 +21,8 @@ type nativePageParticipationTask struct {
 	ActualRoomID string `json:"actual_room_id"`
 	BoxID        string `json:"box_id"`
 	PacketID     string `json:"packet_id,omitempty"`
+	UserID       string `json:"user_id,omitempty"`
+	SecUID       string `json:"sec_uid,omitempty"`
 	AnchorID     string `json:"anchor_id,omitempty"`
 	BoxType      string `json:"box_type,omitempty"`
 	SendTime     string `json:"send_time,omitempty"`
@@ -163,7 +165,7 @@ func (b *pageParticipationBroker) Execute(ctx context.Context, request redpacket
 		task: nativePageParticipationTask{
 			TaskID: taskID, Action: request.Action, InstanceID: instanceID, AccountID: request.AccountID,
 			WebRID: request.WebRID, ActualRoomID: request.ActualRoomID, BoxID: request.BoxID,
-			PacketID: request.PacketID,
+			PacketID: request.PacketID, UserID: request.UserID, SecUID: request.SecUID,
 			AnchorID: request.AnchorID, BoxType: request.BoxType,
 			SendTime: request.SendTime, DelayTime: request.DelayTime,
 		},

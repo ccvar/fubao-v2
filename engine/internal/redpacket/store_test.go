@@ -103,7 +103,7 @@ func TestParticipationRecordPersistsAndDeduplicates(t *testing.T) {
 	if duplicate, err := store.ReserveParticipation(event, "account-1", "参与账号甲"); err != nil || duplicate {
 		t.Fatalf("same account/event must be deduplicated: reserved=%v err=%v", duplicate, err)
 	}
-	if err := store.CompleteParticipation(event.ID, "account-1", "rush", "already_joined", "红包已受理", 2, true, false, time.Minute); err != nil {
+	if err := store.CompleteParticipation(event.ID, "account-1", "rush", "already_joined", "红包已受理", 2, true, false, "", time.Minute); err != nil {
 		t.Fatal(err)
 	}
 
@@ -146,7 +146,7 @@ func TestParticipationSettingsPolicyAndActivityPersist(t *testing.T) {
 	if ok, err := store.ReserveParticipation(event, "account-1", "账号甲"); err != nil || !ok {
 		t.Fatalf("reserve: ok=%v err=%v", ok, err)
 	}
-	if err := store.CompleteParticipation(event.ID, "account-1", "join", "joined", "已受理", 1, true, false, 0); err != nil {
+	if err := store.CompleteParticipation(event.ID, "account-1", "join", "joined", "已受理", 1, true, false, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	if allowed, _ := store.ParticipationPolicy("account-1", time.Now()); allowed {
@@ -213,7 +213,7 @@ func TestParticipationTaskCapturesSettingsSnapshot(t *testing.T) {
 	if got := store.ParticipationSettingsForEvent(event.ID, "snapshot-account"); got != want {
 		t.Fatalf("record did not retain task settings: got=%+v want=%+v", got, want)
 	}
-	if err := store.CompleteParticipation(event.ID, "snapshot-account", "join", "joined", "已受理", 1, true, false, 0); err != nil {
+	if err := store.CompleteParticipation(event.ID, "snapshot-account", "join", "joined", "已受理", 1, true, false, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.ResolveParticipationDraw(event.ID, "snapshot-account", "not_won", "未中奖", "", 1); err != nil {
@@ -536,7 +536,7 @@ func TestParticipationTaskCompletionActivityAndOverviewPersist(t *testing.T) {
 		if reserveErr != nil || !reserved {
 			t.Fatalf("reserve %d failed: reserved=%v err=%v", index, reserved, reserveErr)
 		}
-		if err := store.CompleteParticipation(event.ID, "account-summary", "join", "joined", "已受理", 1, true, false, 0); err != nil {
+		if err := store.CompleteParticipation(event.ID, "account-summary", "join", "joined", "已受理", 1, true, false, "", 0); err != nil {
 			t.Fatal(err)
 		}
 		if won {
@@ -594,7 +594,7 @@ func TestParticipationBatchCompletesAsOneAggregatedActivity(t *testing.T) {
 		if reserved, err := store.ReserveParticipation(event, accountID, ""); err != nil || !reserved {
 			t.Fatalf("batch reserve failed: reserved=%v err=%v", reserved, err)
 		}
-		if err := store.CompleteParticipation(event.ID, accountID, "join", "joined", "已受理", 1, true, false, 0); err != nil {
+		if err := store.CompleteParticipation(event.ID, accountID, "join", "joined", "已受理", 1, true, false, "", 0); err != nil {
 			t.Fatal(err)
 		}
 		award := "8钻"
@@ -693,7 +693,7 @@ func TestReloadMigratesOverduePendingDrawToError(t *testing.T) {
 	if reserved, err := store.ReserveParticipation(event, "account-overdue", "过期账号"); err != nil || !reserved {
 		t.Fatalf("reserve overdue event: %v %v", reserved, err)
 	}
-	if err := store.CompleteParticipation(event.ID, "account-overdue", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
+	if err := store.CompleteParticipation(event.ID, "account-overdue", "join", "joined", "等待开奖", 1, true, false, "", 0); err != nil {
 		t.Fatal(err)
 	}
 	store.mu.Lock()
@@ -737,7 +737,7 @@ func TestRestartReconciliationStopsStaleTaskButKeepsPendingDrawResumable(t *test
 	if reserved, reserveErr := store.ReserveParticipation(event, "account-pending", "待开奖账号"); reserveErr != nil || !reserved {
 		t.Fatalf("reserve pending event: reserved=%v err=%v", reserved, reserveErr)
 	}
-	if err := store.CompleteParticipation(event.ID, "account-pending", "join", "joined", "等待开奖", 1, true, false, 0); err != nil {
+	if err := store.CompleteParticipation(event.ID, "account-pending", "join", "joined", "等待开奖", 1, true, false, "", 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -824,7 +824,7 @@ func TestParticipationStateExplainsStopAndDrawResultPersists(t *testing.T) {
 		if reserved, reserveErr := store.ReserveParticipation(event, "account", "账号甲"); reserveErr != nil || !reserved {
 			t.Fatalf("reserve %d: reserved=%v err=%v", index, reserved, reserveErr)
 		}
-		if err := store.CompleteParticipation(event.ID, "account", "join", "joined", "已受理，等待开奖", 1, true, false, 0); err != nil {
+		if err := store.CompleteParticipation(event.ID, "account", "join", "joined", "已受理，等待开奖", 1, true, false, "", 0); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1089,6 +1089,25 @@ func TestPollOnceSkipsRedPacketRequestUntilRoomIsLive(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("offline result callback was not invoked")
+	}
+}
+
+func TestExtractAnchorIDPrefersNestedOwnerUser(t *testing.T) {
+	payload := map[string]any{
+		"box_id_str": "7669047909329177395",
+		"title":      "钻石红包",
+		"owner": map[string]any{
+			"nickname": "主播甲",
+			"id_str":   "7500165983340938297",
+		},
+		"activity_kind": "red_packet",
+	}
+	packet, ok := extractRedPacket(payload)
+	if !ok {
+		t.Fatal("expected red-packet extraction")
+	}
+	if packet.anchorID != "7500165983340938297" {
+		t.Fatalf("expected nested owner id as anchor, got %q", packet.anchorID)
 	}
 }
 
