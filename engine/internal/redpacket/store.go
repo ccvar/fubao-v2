@@ -1658,7 +1658,11 @@ func (s *Store) ParticipationOverview() ParticipationOverview {
 // falseSuccessfulJoinCutover is when 0.1.42 stopped promoting soft-deny
 // (status_code=0 + succeed=false) to joined. Rows marked joined before this
 // without a confirmed win were produced by that classifier bug.
-var falseSuccessfulJoinCutover = time.Date(2026, 8, 6, 12, 0, 0, 0, time.Local)
+// The migration timestamp is a product-local timestamp, not the runner's
+// process timezone. Keep it pinned to the Beijing offset used by the stored
+// participation records so a UTC GitHub runner does not demote valid rows
+// created later that same local day.
+var falseSuccessfulJoinCutover = time.Date(2026, 8, 6, 12, 0, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
 
 // demoteFalseSuccessfulJoins clears Joined on pre-cutover soft-deny false
 // accepts so overview / account 参与成功 no longer include them. Confirmed wins
