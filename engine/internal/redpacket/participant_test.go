@@ -963,7 +963,9 @@ func TestPageParticipantStoppedBeforeRequestReleasesReservation(t *testing.T) {
 	executor.mu.Lock()
 	executor.response = PageParticipationResponse{
 		Endpoint: "join", HTTPStatus: 200,
-		Body: `{"status_code":0,"data":{"succeed":true}}`, Attempts: 1,
+		// An immediate prize keeps this reservation-lifecycle test out of the
+		// asynchronous receive retry path; that path belongs to draw-result tests.
+		Body: `{"status_code":0,"data":{"succeed":true,"hit_bonus":true,"diamond_count":1}}`, Attempts: 1,
 	}
 	executor.mu.Unlock()
 	participant.HandleEvent(event)
@@ -974,13 +976,16 @@ func TestPageParticipantStoppedBeforeRequestReleasesReservation(t *testing.T) {
 		executedAgain := len(executor.requests) == 2
 		executor.mu.Unlock()
 		records = recordStore.ParticipationRecords()
-		if executedAgain && len(records) == 1 && records[0].Status == "joined" && records[0].AttemptCount == 1 {
+		if executedAgain && len(records) == 1 && records[0].Status == "won" && records[0].AttemptCount == 1 {
 			break
 		}
 		time.Sleep(time.Millisecond)
 	}
-	if len(records) != 1 || records[0].Status != "joined" || records[0].AttemptCount != 1 {
+	if len(records) != 1 || records[0].Status != "won" || records[0].AttemptCount != 1 {
 		t.Fatalf("re-enabled context did not participate once: %+v", records)
+	}
+	if !participant.WaitIdle(2 * time.Second) {
+		t.Fatal("participant workers did not finish before the record store temporary directory was released")
 	}
 }
 

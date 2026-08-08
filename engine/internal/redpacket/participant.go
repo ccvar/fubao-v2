@@ -211,6 +211,7 @@ type Participant struct {
 	followMatcher       ParticipationFollowMatcher
 
 	mu        sync.Mutex
+	workers   sync.WaitGroup
 	attempted map[string]struct{}
 	delayed   map[string]struct{}
 	accounts  map[string]*sync.Mutex
@@ -565,7 +566,38 @@ func (p *Participant) dispatch(event Event, credential accounts.RedPacketPartici
 	if !p.reserve(key) {
 		return
 	}
-	go p.run(event, credential, key, decision)
+	p.workers.Add(1)
+	go func() {
+		defer p.workers.Done()
+		p.run(event, credential, key, decision)
+	}()
+}
+
+// WaitIdle waits for all participation work spawned by this scheduler,
+// including a draw lookup that was scheduled by a completed join. It is used
+// by lifecycle owners that are about to release their native data directory;
+// production callers normally keep the scheduler alive for the process.
+func (p *Participant) WaitIdle(timeout time.Duration) bool {
+	if p == nil {
+		return true
+	}
+	done := make(chan struct{})
+	go func() {
+		p.workers.Wait()
+		close(done)
+	}()
+	if timeout <= 0 {
+		<-done
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 // RetryEventForAccount is used after the user explicitly prepares an account's
@@ -813,7 +845,9 @@ func (p *Participant) scheduleDraw(event Event, accountID, accountName string) {
 	}
 	p.resolving[key] = struct{}{}
 	p.mu.Unlock()
+	p.workers.Add(1)
 	go func() {
+		defer p.workers.Done()
 		defer func() {
 			p.mu.Lock()
 			delete(p.resolving, key)
