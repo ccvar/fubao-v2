@@ -493,6 +493,8 @@
 	minimum_diamonds: number;
 	packet_type: ParticipationPacketType;
 	follow_policy: ParticipationFollowPolicy;
+	batch_concurrency: number;
+	prepare_timeout_seconds: number;
   };
 
   type ParticipationScheduleMode = "once" | "daily" | "interval";
@@ -678,6 +680,9 @@
 	minimum_diamonds: 1,
 	packet_type: "diamond",
 	follow_policy: "follow_priority",
+	// 0 = 自动：按 Go 引擎实时算出的浏览器运行建议上限决定同时参与的实例数。
+	batch_concurrency: 0,
+	prepare_timeout_seconds: 10,
   };
   let participationTaskMenuOpen = false;
   let participationScheduleModalOpen = false;
@@ -692,6 +697,23 @@
   let participationScheduleUnitMenuOpen = false;
   let participationSchedules: ParticipationSchedule[] = [];
   let participationBatchRunning = false;
+  // Rotation state for working a large account pool through a bounded number of
+  // concurrently running browser instances.
+  type ParticipationRotationSlot = { startedAt: number; everActive: boolean };
+  let participationRotationRunID = 0;
+  let participationRotationRunning = false;
+  let participationRotationQueue: string[] = [];
+  let participationRotationActive = new Map<string, ParticipationRotationSlot>();
+  let participationRotationStarted = 0;
+  let participationRotationSkipped = 0;
+  let participationRotationDone = 0;
+  let participationRotationTotal = 0;
+  let participationRotationAccountIDs: string[] = [];
+  let participationRotationBatchActivityID = "";
+  // Instances that already had their turn in the current run. Card visibility
+  // alone must not remount them: the slot they freed belongs to the queue, and
+  // a visible card would otherwise take it straight back and starve the rest.
+  let participationRotationRetired = new Set<string>();
   let participationScheduleClaiming = false;
   let participationScheduleModalElement: HTMLDialogElement;
   let participationScheduleModalX = 0;
@@ -784,6 +806,14 @@
   let browserNativeLayoutChain: Promise<void> = Promise.resolve();
   let browserLayoutRevision = 0;
   let browserLayoutChanging = false;
+  let browserLayoutChangingRevision = -1;
+  let browserSyncQueued = false;
+  // Set from browser-webview://slow: the page navigated but Rust is still
+  // waiting for it to paint before revealing the native surface.
+  let browserWebviewSlowIds: string[] = [];
+  // Timestamp of the last deliberate layout mutation, so the reconciler can
+  // tell "a drag is settling" from "a flag is stuck".
+  let browserLayoutMutationAt = 0;
   let selectedParticipationAccountIds: string[] = [];
   let instanceParticipationGroupFilter: ParticipationGroupFilter = "all";
   let instanceAccountsRefreshing = false;
@@ -826,6 +856,9 @@
   let participationRecords: ParticipationRecord[] = [];
 	let participationTaskRuns: ParticipationTaskRun[] = [];
 	let selectedParticipationRunId = "";
+	let participationRecordPageElement: HTMLElement;
+	let participationSplitPercent = 50;
+	let participationSplitPointer = -1;
   let participationRuntimeLogs: ParticipationTrace[] = [];
   let participationRecordsLoading = false;
   let participationRecordError = "";
@@ -1515,14 +1548,18 @@
   async function stopSidebarParticipationBatch(activityID: string, accountIDs: string[]) {
 	if (!isTauriDesktop() || stoppingSidebarActivityID) return;
 	stoppingSidebarActivityID = activityID;
+	// Stopping the batch must also cancel any queued rotation, otherwise the
+	// next tick would keep admitting accounts the user just stopped.
+	resetParticipationRotation();
 	try {
 		await engineRequest<{ account_ids: string[] }>("activity.stop_participation_batch", { activity_id: activityID });
 		const instanceIDs = browserInstances
 			.filter((instance) => accountIDs.includes(instance.account_id))
 			.map((instance) => instance.id);
-		await Promise.all(instanceIDs.map((instanceId) =>
-			invoke<void>("stop_browser_red_packet_context", { instanceId }).catch(() => undefined),
-		));
+		await Promise.all(instanceIDs.map(async (instanceId) => {
+			await invoke<void>("stop_browser_red_packet_context", { instanceId }).catch(() => undefined);
+			await invoke<void>("reset_browser_landing_page", { instanceId }).catch(() => undefined);
+		}));
 		browserRedPacketContextIds = browserRedPacketContextIds.filter((instanceID) => !instanceIDs.includes(instanceID));
 		await Promise.all([loadAccounts(false), loadBrowserParticipationContexts(), loadSidebarActivities()]);
 		showToast(`已停止本批次 ${accountIDs.length} 个账号的后续红包参与`);
@@ -1669,6 +1706,9 @@
 		follow_policy: (["all", "follow_priority", "follow_only"] as ParticipationFollowPolicy[]).includes(participationSettings.follow_policy)
 			? participationSettings.follow_policy
 			: "follow_priority" as ParticipationFollowPolicy,
+		// 0 保持"自动"，不参与钳制。
+		batch_concurrency: normalizedParticipationSetting(participationSettings.batch_concurrency, 64),
+		prepare_timeout_seconds: Math.max(4, normalizedParticipationSetting(participationSettings.prepare_timeout_seconds || 10, 60)),
 	};
 	if (!isTauriDesktop()) {
 		participationSettings = next;
@@ -2838,11 +2878,16 @@
       // Mounted child WebViews stay alive so returning preserves the exact
       // in-memory page, scroll, playback, dialog, and login state.
       browserLayoutRevision += 1;
+      browserLayoutMutationAt = Date.now();
+      // Geometry is meaningless until the new layout has rendered. Clear this
+      // only for a real browsers-page transition: an unrelated page switch, or
+      // re-selecting the page you are already on, must never unsettle a page
+      // that is currently showing its instances.
+      browserViewSettled = false;
     }
     if (leavingBrowsers) {
       void queueBrowserNativeLayout(hideEmbeddedBrowsers);
     }
-    browserViewSettled = false;
     activeView = key;
     query = "";
     searchOpen = false;
@@ -2859,6 +2904,18 @@
       void loadRedPacketMonitors();
       void loadRedPacketEvents();
       void loadParticipationRecords();
+    }
+    if (key === "browsers") {
+      // Settle as soon as the DOM has rendered, never as a side effect of the
+      // inventory refresh below. Those are two engine round trips on the
+      // sequential RPC loop; under heavy room monitoring they take seconds, and
+      // the page stayed unsettled — therefore fully hidden behind its HTML
+      // placeholder — for that entire time. The cards are already backed by the
+      // previously loaded browserInstances, which is the whole premise of
+      // returning to a preserved page, so revealing them needs no network at
+      // all. A later refresh that actually changes the list re-syncs through
+      // the reactive layout key.
+      void settleBrowserView();
     }
     if (key === "browsers" && engineListenerReady) {
       void loadBrowserInstances();
@@ -3061,6 +3118,7 @@
       browserWebviewMountedIds = browserWebviewMountedIds.filter((id) => id !== instance.id);
       browserWebviewMountingIds = browserWebviewMountingIds.filter((id) => id !== instance.id);
       browserWebviewLoadingIds = browserWebviewLoadingIds.filter((id) => id !== instance.id);
+      browserWebviewSlowIds = browserWebviewSlowIds.filter((id) => id !== instance.id);
       if (engineListenerReady) {
         browserCapacity = await engineRequest<BrowserCapacity>("browser.runtime.release", {
           instance_id: instance.id,
@@ -3081,6 +3139,7 @@
       isExternalChromeInstance(instance) ||
       isChromeRepairRunning(instance) ||
       browserIndependentWindowIds.includes(instance.id) ||
+      participationRotationSuspended(instance.id) ||
       browserWebviewMountingIds.includes(instance.id) ||
       browserWebviewMountingIds.length >= browserWebviewMountConcurrency ||
       activeView !== "browsers" ||
@@ -3178,6 +3237,26 @@
     }
   }
 
+  // Runs outside the serialized native layout queue so a slow engine can never
+  // delay geometry. A failed or slow lease refresh says nothing about the
+  // mounted WebView: keep it and retry on a later tick.
+  async function refreshBrowserRuntimeLease(instance: BrowserInstance) {
+    try {
+      const admission = await engineRequest<BrowserAdmission>("browser.runtime.acquire", {
+        instance_id: instance.id,
+      });
+      browserCapacity = admission.capacity;
+      updateBrowserRuntimeState(instance.id, admission.state, admission.queue_position ?? 0);
+      if (!admission.granted && browserWebviewMountedIds.includes(instance.id)) {
+        await releaseEmbeddedBrowser({ ...instance, runtime_state: "running" });
+      }
+    } catch {
+      // Allow an immediate retry on the next tick rather than waiting out the
+      // throttle after a transient engine failure.
+      browserRuntimeLeaseSyncedAt.delete(instance.id);
+    }
+  }
+
   async function syncEmbeddedBrowsers(expectedRevision = browserLayoutRevision) {
     if (
       !isTauriDesktop() ||
@@ -3252,25 +3331,18 @@
         // lease only changes when capacity does. Re-acquiring per frame floods
         // the engine's sequential RPC loop, and a request that then exceeds the
         // frontend timeout used to be read as "the native surface died".
+        //
+        // The lease refresh must never be awaited here. Every native layout
+        // operation shares one serialized queue, so awaiting an engine round
+        // trip inside it stalls all later geometry work behind the sequential
+        // RPC loop — and under heavy room monitoring that is seconds, not
+        // milliseconds. The queued syncs then arrive with a stale revision and
+        // drop themselves, which is why repeated page switches progressively
+        // stranded every card on its HTML placeholder.
         if (browserRuntimeLeaseIsStale(instance)) {
-          try {
-            const admission = await engineRequest<BrowserAdmission>("browser.runtime.acquire", {
-              instance_id: instance.id,
-            });
-            if (browserLayoutChanging || expectedRevision !== browserLayoutRevision) return;
-            browserRuntimeLeaseSyncedAt.set(instance.id, Date.now());
-            browserCapacity = admission.capacity;
-            updateBrowserRuntimeState(instance.id, admission.state, admission.queue_position ?? 0);
-            if (!admission.granted) {
-              await releaseEmbeddedBrowser({ ...instance, runtime_state: "running" });
-              return;
-            }
-          } catch {
-            // A slow or unavailable engine says nothing about the mounted
-            // WebView. Keep it and retry the lease on a later tick; never
-            // rebuild the page a participation task is running inside.
-            if (browserLayoutChanging || expectedRevision !== browserLayoutRevision) return;
-          }
+          // Throttle immediately so the fire-and-forget refresh cannot pile up.
+          browserRuntimeLeaseSyncedAt.set(instance.id, Date.now());
+          void refreshBrowserRuntimeLease(instance);
         }
         if (
           browserLayoutChanging ||
@@ -3306,16 +3378,62 @@
 
   function scheduleEmbeddedBrowserSync() {
     if (!isTauriDesktop() || browserLayoutChanging) return;
-    const revision = browserLayoutRevision;
     window.cancelAnimationFrame(browserWebviewSyncFrame);
     browserWebviewSyncFrame = window.requestAnimationFrame(() => {
-      void queueBrowserNativeLayout(() => syncEmbeddedBrowsers(revision));
+      // Scroll, resize, intersection and reactive updates all schedule a sync.
+      // Without coalescing, each one appends another job to the shared native
+      // queue and they accumulate faster than they drain. One pending sync is
+      // always enough because it measures geometry when it runs, not now.
+      if (browserSyncQueued) return;
+      browserSyncQueued = true;
+      void queueBrowserNativeLayout(async () => {
+        // Cleared on entry, so state changes during this pass can queue the
+        // next one immediately.
+        browserSyncQueued = false;
+        // Read the revision when the operation actually starts, not when it was
+        // scheduled. A queued sync can wait behind earlier native work, and a
+        // page switch in between used to make it discard itself on arrival with
+        // nothing left to reschedule it. The revision still guards against a
+        // bump *during* the sync.
+        await syncEmbeddedBrowsers(browserLayoutRevision);
+      });
     });
   }
 
   function scheduleBrowserColumnControlSync() {
     window.requestAnimationFrame(scheduleEmbeddedBrowserSync);
     window.setTimeout(scheduleEmbeddedBrowserSync, 170);
+  }
+
+  // Revealing a mounted child WebView depends on a long conjunction of
+  // transient flags, a cancellable animation frame, and a serialized native
+  // queue whose work aborts on a revision bump. Any single one of them getting
+  // stuck leaves live WebViews hidden behind their HTML placeholder with the
+  // Go runtime leases still held, and nothing ever retries — the page stays
+  // blank until the client restarts.
+  //
+  // This reconciler asserts the desired end state on a slow tick instead of
+  // trusting every edge to fire exactly once. It touches no engine RPC: the
+  // normal sync it triggers only calls native geometry commands, and its lease
+  // refresh keeps its own 5-second throttle.
+  function reconcileBrowserViewLatches() {
+    if (!isTauriDesktop() || activeView !== "browsers") return;
+    if (
+      instanceModalOpen ||
+      licenseModalOpen ||
+      updateModalOpen ||
+      participationSettingsModalOpen ||
+      participationScheduleModalOpen ||
+      sidebarActivityDetailID ||
+      followingLiveModalInstance ||
+      browserPendingClose
+    ) return;
+    // A column drag legitimately holds the layout down for ~200ms. Only treat
+    // the flags as stuck once the page has been quiet well past that.
+    if (Date.now() - browserLayoutMutationAt < 1500) return;
+    if (browserLayoutChanging) browserLayoutChanging = false;
+    if (!browserViewSettled) browserViewSettled = true;
+    scheduleEmbeddedBrowserSync();
   }
 
   function scheduleAccountRebindSync() {
@@ -4736,6 +4854,44 @@
 	selectedParticipationRunId = selectedParticipationRunId === runID ? "" : runID;
   }
 
+  function setParticipationSplitFromPointer(clientY: number) {
+	if (!participationRecordPageElement) return;
+	const rect = participationRecordPageElement.getBoundingClientRect();
+	if (rect.height <= 0) return;
+	const minimumPercent = Math.min(40, Math.max(18, (118 / rect.height) * 100));
+	participationSplitPercent = Math.max(
+		minimumPercent,
+		Math.min(100 - minimumPercent, ((clientY - rect.top) / rect.height) * 100),
+	);
+  }
+
+  function startParticipationSplitDrag(event: PointerEvent) {
+	if (event.button !== 0) return;
+	event.preventDefault();
+	participationSplitPointer = event.pointerId;
+	(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId);
+	setParticipationSplitFromPointer(event.clientY);
+  }
+
+  function moveParticipationSplitDrag(event: PointerEvent) {
+	if (event.pointerId !== participationSplitPointer) return;
+	setParticipationSplitFromPointer(event.clientY);
+  }
+
+  function endParticipationSplitDrag(event: PointerEvent) {
+	if (event.pointerId !== participationSplitPointer) return;
+	participationSplitPointer = -1;
+	const target = event.currentTarget as HTMLElement;
+	if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId);
+  }
+
+  function adjustParticipationSplit(event: KeyboardEvent) {
+	if (event.key !== "ArrowUp" && event.key !== "ArrowDown" && event.key !== "Home") return;
+	event.preventDefault();
+	if (event.key === "Home") participationSplitPercent = 50;
+	else participationSplitPercent = Math.max(20, Math.min(80, participationSplitPercent + (event.key === "ArrowDown" ? 3 : -3)));
+  }
+
   async function toggleRoomRedPacketMonitor(monitor: RedPacketMonitor) {
     if (redPacketMonitorActionId || redPacketBatchAction) return;
     redPacketMonitorActionId = monitor.id;
@@ -5170,8 +5326,25 @@
     }
   }
 
+  // The browsers page keeps every native child WebView hidden while it is
+  // unsettled, so this flag must always come back — it can never be left to a
+  // network result. A stuck `false` strands every card on its HTML placeholder
+  // forever while the Go runtime leases stay held ("4 个运行" with four empty
+  // cards), and nothing in the app clears it again.
+  async function settleBrowserView() {
+    await tick();
+    browserViewSettled = activeView === "browsers";
+    if (browserViewSettled) window.setTimeout(scheduleEmbeddedBrowserSync, 120);
+  }
+
   async function loadBrowserInstances() {
-    if (browserLoading) return;
+    if (browserLoading) {
+      // A refresh already in flight settles the view when it finishes, but it
+      // may have passed that point before this page transition began. Settle
+      // here too so returning to the page never depends on that race.
+      await settleBrowserView();
+      return;
+    }
     browserLoading = true;
     browserError = "";
     try {
@@ -5192,12 +5365,15 @@
           // The browser-only preview has no native surface to refresh.
         }
       }
-      browserViewSettled = activeView === "browsers";
-      window.setTimeout(scheduleEmbeddedBrowserSync, 120);
     } catch (error) {
       browserError = error instanceof Error ? error.message : String(error);
     } finally {
       browserLoading = false;
+      // A failed inventory refresh says nothing about the mounted child
+      // WebViews: the previously loaded instances are still on screen and
+      // still hold their leases. Settling here is what keeps an engine
+      // timeout from permanently blanking the page.
+      await settleBrowserView();
     }
   }
 
@@ -5226,13 +5402,27 @@
 	return Boolean((context?.active && context?.prepared) || browserRedPacketContextIds.includes(instanceID));
   }
 
+  // A superseded column-resize settle must still hand the layout latch back.
+  // switchView bumps browserLayoutRevision without taking ownership of the
+  // latch, so an abandoned settle used to leave browserLayoutChanging stuck at
+  // true — and both syncEmbeddedBrowsers and scheduleEmbeddedBrowserSync bail
+  // on their first line while it is, permanently. Only release it when a newer
+  // resize has not already taken the latch over.
+  function releaseBrowserLayoutLatch(revision: number) {
+    if (browserLayoutChangingRevision !== revision) return;
+    browserLayoutChanging = false;
+    if (activeView === "browsers") window.setTimeout(scheduleEmbeddedBrowserSync, 60);
+  }
+
   function updateBrowserColumns(event: Event) {
     const value = Number((event.currentTarget as HTMLInputElement).value);
     browserColumns = Math.max(1, Math.min(10, Math.round(value)));
     localStorage.setItem("fubao.browserColumns", String(browserColumns));
     browserLayoutChanging = true;
     browserLayoutRevision += 1;
+    browserLayoutMutationAt = Date.now();
     const revision = browserLayoutRevision;
+    browserLayoutChangingRevision = revision;
     window.cancelAnimationFrame(browserWebviewSyncFrame);
     window.clearTimeout(browserColumnSyncTimer);
     // Every native visibility mutation shares one queue. Without this, a
@@ -5240,14 +5430,20 @@
     // final reveal and randomly strand a card on its HTML placeholder.
     void queueBrowserNativeLayout(hideEmbeddedBrowsers);
     browserColumnSyncTimer = window.setTimeout(async () => {
-      if (revision !== browserLayoutRevision) return;
+      if (revision !== browserLayoutRevision) {
+        releaseBrowserLayoutLatch(revision);
+        return;
+      }
       // Flush any native bounds request that may have completed after the
       // first hide, then measure only the final settled grid.
       await queueBrowserNativeLayout(hideEmbeddedBrowsers);
       await tick();
       await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
       await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
-      if (revision !== browserLayoutRevision) return;
+      if (revision !== browserLayoutRevision) {
+        releaseBrowserLayoutLatch(revision);
+        return;
+      }
       browserLayoutChanging = false;
       await queueBrowserNativeLayout(() => syncEmbeddedBrowsers(revision));
     }, 180);
@@ -5623,9 +5819,13 @@
       browserError = "";
       try {
         await invoke<void>("stop_browser_red_packet_context", { instanceId: instance.id });
+        // Only after the context ended: leaving the card parked on a live room
+        // keeps decoding a stream nobody is watching and makes the next mount
+        // resume that stale room.
+        await invoke<void>("reset_browser_landing_page", { instanceId: instance.id }).catch(() => undefined);
         browserRedPacketContextIds = browserRedPacketContextIds.filter((id) => id !== instance.id);
 		void loadBrowserParticipationContexts();
-        showToast(`已停止「${instance.account_name}」的红包页面参与，未发出的任务已取消`);
+        showToast(`已停止「${instance.account_name}」的红包页面参与，已返回抖音首页`);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         browserError = message;
@@ -5668,7 +5868,7 @@
     }
   }
 
-  async function startBrowserRedPacketFromBatch(instance: BrowserInstance) {
+  async function startBrowserRedPacketFromBatch(instance: BrowserInstance, batchActivityID: string) {
 	const context = browserParticipationContexts[instance.id];
 	if (context?.accepting || context?.active || context?.task_active || browserRedPacketContextIds.includes(instance.id)) return false;
 	if (isExternalChromeInstance(instance)) return false;
@@ -5695,11 +5895,16 @@
 			});
 			accounts = accounts.map((item) => item.id === account.id ? updated : item);
 		}
+		// Bounded wait: inside a batch the alternative to waiting out a slow page
+		// is simply handing the rotation slot to the next account, and the packet
+		// window is only a minute or two. A manual 准备页面上下文 keeps the long wait.
 		await invoke<string>("prepare_browser_red_packet_context", {
 			instanceId: instance.id,
 			webRid: target.webRID,
 			resultOnly: false,
 			allowChallengeRecovery: false,
+			batchActivityId: batchActivityID,
+			readyTimeoutSeconds: Math.max(4, Number(participationSettings.prepare_timeout_seconds) || 10),
 		});
 		if (!browserRedPacketContextIds.includes(instance.id)) {
 			browserRedPacketContextIds = [...browserRedPacketContextIds, instance.id];
@@ -5725,9 +5930,179 @@
 	}
   }
 
-  async function executeParticipationBatch(execution?: ParticipationScheduleExecution) {
+  // A machine can only run a bounded number of real browser instances, so a
+  // larger account pool is worked through in rotations: this many accounts hold
+  // a prepared live-room context at once, and each finished account frees its
+  // slot for the next one. Zero means 自动, taken from the Go engine's live
+  // CPU/memory-based recommendation rather than a number guessed here.
+  function participationRotationLimit() {
+	const configured = Number(participationSettings.batch_concurrency);
+	if (Number.isFinite(configured) && configured > 0) return Math.trunc(configured);
+	const auto = browserCapacity?.effective_limit || browserCapacity?.recommended_limit || 0;
+	return Math.max(1, auto || 4);
+  }
+
+  // Prepare up to the rotation limit at a time. Preparation is dominated by
+  // native page navigation and login-readiness waits, not by request rate, so
+  // running the admitted accounts concurrently shortens the batch by an order
+  // of magnitude — and participation timing is the primary factor in whether a
+  // join lands inside the packet's window at all.
+  async function fillParticipationRotation(runID: number) {
+	if (runID !== participationRotationRunID) return;
+	const limit = participationRotationLimit();
+	const openings = limit - participationRotationActive.size;
+	if (openings <= 0) return;
+	const admitted: BrowserInstance[] = [];
+	while (admitted.length < openings && participationRotationQueue.length > 0) {
+		const instanceID = participationRotationQueue.shift()!;
+		const instance = browserInstances.find((item) => item.id === instanceID);
+		if (!instance) {
+			participationRotationSkipped += 1;
+			continue;
+		}
+		admitted.push(instance);
+	}
+	if (admitted.length === 0) return;
+	// Reserve the slots before awaiting so a concurrent tick cannot overshoot.
+	for (const instance of admitted) {
+		participationRotationActive.set(instance.id, { startedAt: Date.now(), everActive: false });
+	}
+	participationRotationActive = participationRotationActive;
+	await Promise.all(
+		admitted.map(async (instance) => {
+			const ok = await startBrowserRedPacketFromBatch(instance, participationRotationBatchActivityID);
+			if (runID !== participationRotationRunID) return;
+			if (ok) {
+				participationRotationStarted += 1;
+				if (!participationRotationAccountIDs.includes(instance.account_id)) {
+					participationRotationAccountIDs = [...participationRotationAccountIDs, instance.account_id];
+				}
+				return;
+			}
+			// Could not start (no lease, expired CK, cooling, no live target):
+			// free the slot immediately so the next account can use it.
+			participationRotationActive.delete(instance.id);
+			participationRotationSkipped += 1;
+		}),
+	);
+	participationRotationActive = participationRotationActive;
+  }
+
+  // Runs on the existing browser status tick. Retires accounts whose task has
+  // ended, then refills the freed slots from the queue.
+  async function advanceParticipationRotation() {
+	const runID = participationRotationRunID;
+	if (!isTauriDesktop() || participationRotationActive.size === 0) {
+		if (participationRotationQueue.length > 0) await fillParticipationRotation(runID);
+		else if (participationRotationRunning && participationRotationActive.size === 0) {
+			await finishParticipationRotation(runID);
+		}
+		return;
+	}
+	const finished: string[] = [];
+	for (const [instanceID, slot] of participationRotationActive) {
+		const context = browserParticipationContexts[instanceID];
+		const engaged = Boolean(context?.task_active || context?.accepting || context?.waiting_draw);
+		if (engaged) {
+			slot.everActive = true;
+			continue;
+		}
+		if (context?.stopped) {
+			finished.push(instanceID);
+			continue;
+		}
+		if (slot.everActive) {
+			finished.push(instanceID);
+			continue;
+		}
+		// Never seen engaged: the context may still be coming up. Give it a
+		// bounded grace period rather than holding the slot forever.
+		if (Date.now() - slot.startedAt > 90_000) finished.push(instanceID);
+	}
+	for (const instanceID of finished) {
+		participationRotationActive.delete(instanceID);
+		participationRotationDone += 1;
+		await retireParticipationInstance(instanceID);
+	}
+	participationRotationActive = participationRotationActive;
+	if (runID !== participationRotationRunID) return;
+	if (participationRotationQueue.length > 0) {
+		await fillParticipationRotation(runID);
+		return;
+	}
+	if (participationRotationActive.size === 0) await finishParticipationRotation(runID);
+  }
+
+  // Suspend a finished account: end its participation context, then release the
+  // native WebView and the Go runtime lease so the next account can be admitted.
+  async function retireParticipationInstance(instanceID: string) {
+	const instance = browserInstances.find((item) => item.id === instanceID);
+	try {
+		await invoke<void>("stop_browser_red_packet_context", { instanceId: instanceID });
+	} catch {
+		// Already gone; the release below is still the part that frees capacity.
+	}
+	// Strictly after the context ended: a live room is the heaviest page in the
+	// app and is also what the landing-page memory would restore on the next
+	// mount, so send this account home before its surface goes away.
+	await invoke<void>("reset_browser_landing_page", { instanceId: instanceID }).catch(() => undefined);
+	browserRedPacketContextIds = browserRedPacketContextIds.filter((id) => id !== instanceID);
+	participationRotationRetired.add(instanceID);
+	participationRotationRetired = participationRotationRetired;
+	if (instance) await releaseEmbeddedBrowser(instance);
+  }
+
+  async function finishParticipationRotation(runID: number) {
+	if (runID !== participationRotationRunID || !participationRotationRunning) return;
+	participationRotationRunning = false;
+	participationRotationQueue = [];
+	const batchActivityID = participationRotationBatchActivityID;
+	participationRotationBatchActivityID = "";
+	if (batchActivityID) {
+		try {
+			await engineRequest("red_packet_participation.batch_result", {
+				activity_id: batchActivityID,
+				started: participationRotationStarted,
+				skipped: participationRotationSkipped,
+				account_ids: participationRotationAccountIDs,
+			});
+			await Promise.all([loadBrowserParticipationContexts(), loadSidebarActivities(), loadAccounts(false)]);
+		} catch (error) {
+			showToast(error instanceof Error ? error.message : String(error));
+		}
+	}
+	void loadBrowserParticipationContexts();
+	showToast(
+		`红包参与轮换完成：共 ${participationRotationStarted} 个账号参与` +
+			(participationRotationSkipped > 0 ? `，跳过 ${participationRotationSkipped} 个` : ""),
+	);
+  }
+
+  function resetParticipationRotation() {
+	participationRotationRunID += 1;
+	participationRotationRunning = false;
+	participationRotationQueue = [];
+	participationRotationActive = new Map();
+	participationRotationStarted = 0;
+	participationRotationSkipped = 0;
+	participationRotationDone = 0;
+	participationRotationTotal = 0;
+	participationRotationAccountIDs = [];
+	participationRotationBatchActivityID = "";
+	participationRotationRetired = new Set();
+  }
+
+  // True while this instance is deliberately suspended for the current run.
+  function participationRotationSuspended(instanceID: string) {
+	return participationRotationRunning && participationRotationRetired.has(instanceID);
+  }
+
+	async function executeParticipationBatch(execution?: ParticipationScheduleExecution) {
 	closeParticipationTaskMenu();
-	if (participationBatchRunning) return;
+	if (participationBatchRunning || participationRotationRunning) {
+		showToast("当前红包参与任务仍在运行，请等待完成或先停止任务");
+		return;
+	}
 	if (!isTauriDesktop()) {
 		showToast("红包参与任务仅支持桌面客户端");
 		scheduleEmbeddedBrowserSync();
@@ -5735,10 +6110,10 @@
 	}
 	participationBatchRunning = true;
 	browserError = "";
-	let started = 0;
-	let skipped = 0;
 	let monitorPreparationWarning = "";
-	const startedAccountIDs: string[] = [];
+	// A new task always starts the rotation over from the beginning.
+	resetParticipationRotation();
+	const runID = participationRotationRunID;
 	try {
 		// Scheduled runs normally reach this point after the Go-side prewarm.
 		// Immediate runs, zero-minute settings, or a missed prewarm still get a
@@ -5750,27 +6125,55 @@
 		} catch (error) {
 			monitorPreparationWarning = error instanceof Error ? error.message : String(error);
 		}
-		await Promise.all([loadAccounts(false), loadBrowserParticipationContexts()]);
-		for (const instance of browserInstances) {
-			if (await startBrowserRedPacketFromBatch(instance)) {
-				started += 1;
-				startedAccountIDs.push(instance.account_id);
-			} else skipped += 1;
+		// Refresh capacity so 自动 uses this machine's current CPU/memory state
+		// rather than a value measured before monitoring started.
+		try {
+			browserCapacity = await engineRequest<BrowserCapacity>("browser.capacity");
+		} catch {
+			// Fall back to the last known capacity; the rotation limit floors at 1.
 		}
-		await engineRequest("red_packet_participation.batch_result", {
+		await Promise.all([loadAccounts(false), loadBrowserParticipationContexts()]);
+		if (runID !== participationRotationRunID) return;
+		const batchAccountIDs = [...new Set(browserInstances.map((instance) => instance.account_id).filter(Boolean))];
+		const batch = await engineRequest<{ activity_id: string }>("red_packet_participation.batch_begin", {
 			schedule_id: execution?.schedule_id || "",
 			mode: execution?.mode || "immediate",
-			started,
-			skipped,
-			account_ids: startedAccountIDs,
+			account_ids: batchAccountIDs,
 		});
+		participationRotationBatchActivityID = batch.activity_id;
+		participationRotationQueue = browserInstances.map((instance) => instance.id);
+		participationRotationTotal = participationRotationQueue.length;
+		participationRotationRunning = true;
+		void loadSidebarActivities();
+		await fillParticipationRotation(runID);
+		if (runID !== participationRotationRunID) return;
+		const started = participationRotationStarted;
+		const skipped = participationRotationSkipped;
 		await Promise.all([loadBrowserParticipationContexts(), loadSidebarActivities(), loadAccounts(false)]);
 		const prefix = execution ? `${participationScheduleModeLabel(execution.mode)}计划已执行` : "红包参与任务已启动";
-		showToast(`${prefix}：成功 ${started} 个${skipped > 0 ? `，跳过 ${skipped} 个` : ""}${monitorPreparationWarning ? "；直播间监测未能全部补启" : ""}`);
+		const queued = participationRotationQueue.length;
+		showToast(
+			`${prefix}：成功 ${started} 个` +
+				(skipped > 0 ? `，跳过 ${skipped} 个` : "") +
+				(queued > 0 ? `，${queued} 个排队轮换` : "") +
+				(monitorPreparationWarning ? "；直播间监测未能全部补启" : ""),
+		);
+		if (participationRotationQueue.length === 0 && participationRotationActive.size === 0) {
+			await finishParticipationRotation(runID);
+		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		browserError = message;
 		showToast(message);
+		if (participationRotationBatchActivityID) {
+			await engineRequest("red_packet_participation.batch_result", {
+				activity_id: participationRotationBatchActivityID,
+				started: participationRotationStarted,
+				skipped: participationRotationSkipped,
+				account_ids: participationRotationAccountIDs,
+			}).catch(() => undefined);
+		}
+		resetParticipationRotation();
 	} finally {
 		participationBatchRunning = false;
 		scheduleEmbeddedBrowserSync();
@@ -5942,6 +6345,7 @@
     let unlistenParticipationLogClear: (() => void) | undefined;
     let unlistenBrowserWebviewReady: (() => void) | undefined;
     let unlistenBrowserWebviewLoadError: (() => void) | undefined;
+    let unlistenBrowserWebviewSlow: (() => void) | undefined;
     let unlistenBrowserInstanceWindowClosed: (() => void) | undefined;
     if ("__TAURI_INTERNALS__" in window) {
       void listen<string>("engine://message", (event) => handleEngineMessage(event.payload))
@@ -5993,6 +6397,7 @@
         const instanceId = event.payload.instance_id?.trim();
         if (!instanceId) return;
         browserWebviewLoadingIds = browserWebviewLoadingIds.filter((id) => id !== instanceId);
+        browserWebviewSlowIds = browserWebviewSlowIds.filter((id) => id !== instanceId);
         if (!browserWebviewReadyIds.includes(instanceId)) {
           browserWebviewReadyIds = [...browserWebviewReadyIds, instanceId];
         }
@@ -6008,6 +6413,19 @@
         scheduleEmbeddedBrowserSync();
       }).then((unlisten) => {
         unlistenBrowserWebviewReady = unlisten;
+      });
+      // Rust reports that a page has navigated but still has not painted. The
+      // card stays on its own loading state either way; this only replaces the
+      // generic spinner copy with something that explains the wait, because a
+      // silent multi-second spinner is indistinguishable from a stuck one.
+      void listen<BrowserWebviewEvent>("browser-webview://slow", (event) => {
+        const instanceId = event.payload.instance_id?.trim();
+        if (!instanceId) return;
+        if (!browserWebviewSlowIds.includes(instanceId)) {
+          browserWebviewSlowIds = [...browserWebviewSlowIds, instanceId];
+        }
+      }).then((unlisten) => {
+        unlistenBrowserWebviewSlow = unlisten;
       });
       void listen<BrowserWebviewEvent>("browser-webview://load-error", (event) => {
         const instanceId = event.payload.instance_id?.trim();
@@ -6067,7 +6485,10 @@
 	}, 2000);
     const browserStatusTimer = window.setInterval(() => {
       void pollBrowserInstanceStatuses();
-	  void loadBrowserParticipationContexts();
+	  // The rotation reads the contexts refreshed here, so advance it only after
+	  // that refresh resolves.
+	  void loadBrowserParticipationContexts().then(() => advanceParticipationRotation());
+	  reconcileBrowserViewLatches();
     }, 2000);
     const followingRoomSyncTimer = window.setInterval(() => {
       if (!engineListenerReady) return;
@@ -6112,6 +6533,7 @@
       unlistenParticipationLogClear?.();
       unlistenBrowserWebviewReady?.();
       unlistenBrowserWebviewLoadError?.();
+      unlistenBrowserWebviewSlow?.();
       unlistenBrowserInstanceWindowClosed?.();
       for (const pending of pendingRequests.values()) {
         window.clearTimeout(pending.timer);
@@ -6438,7 +6860,7 @@
                 </span>
               </span>
             </span>
-            {#if !participationTaskMenuOpen && (participationBatchRunning || browserParticipationRuntime.accounts > 0)}
+            {#if !participationTaskMenuOpen && (participationBatchRunning || participationRotationRunning || browserParticipationRuntime.accounts > 0)}
               <button
                 class="browser-participation-runtime topbar-participation-runtime"
                 aria-label="查看实际红包参与情况"
@@ -6455,6 +6877,13 @@
                   <span>待开奖 {browserParticipationRuntime.pending}</span>
                   <span>中奖 {browserParticipationRuntime.won}</span>
                 {/if}
+                {#if participationRotationRunning && participationRotationTotal > participationRotationLimit()}
+                  <span
+                    >轮换 {participationRotationDone}/{participationRotationTotal}{participationRotationQueue.length > 0
+                      ? ` · 排队 ${participationRotationQueue.length}`
+                      : ""}</span
+                  >
+                {/if}
               </button>
             {/if}
           {/if}
@@ -6470,6 +6899,16 @@
                 data-tooltip={browserRecommendedLimitTooltip(browserCapacity)}
                 data-tooltip-placement="top"
               >建议上限 {browserCapacity.recommended_limit}</span>
+              {#if browserCapacity.waiting > 0 || browserCapacity.resources.pressure === "constrained" || browserCapacity.resources.pressure === "critical"}
+                <button
+                  type="button"
+                  class:critical={browserCapacity.resources.pressure === "critical"}
+                  class="browser-capacity-warning-icon"
+                  aria-label={browserCapacity.message}
+                  data-tooltip={browserCapacity.message}
+                  data-tooltip-placement="top"
+                ><WarningCircle size={11} weight="fill" /></button>
+              {/if}
               {#if browserCapacity.waiting > 0}<span class="browser-subtitle-copy" data-tauri-drag-region>· {browserCapacity.waiting} 个等待</span>{/if}
             {:else}
               {browserSubtitle}
@@ -6637,15 +7076,6 @@
         {#if browserLoading && browserInstances.length === 0}
           <div class="empty-state"><ArrowClockwise class="spinning" size={25} /><strong>正在读取浏览器实例</strong><span>由 Go 引擎加载本机独立配置</span></div>
         {:else if visibleBrowserInstances.length > 0}
-          {#if browserCapacity && (browserCapacity.waiting > 0 || browserCapacity.resources.pressure === "constrained" || browserCapacity.resources.pressure === "critical")}
-            <div class="browser-runtime-strip">
-              <div class:critical={browserCapacity.resources.pressure === "critical"} class="browser-capacity-note">
-                <ClockCountdown size={14} />
-                <span>{browserCapacity.message}</span>
-                <small>运行 {browserCapacity.running}/{browserCapacity.effective_limit} · 建议 {browserCapacity.recommended_limit}</small>
-              </div>
-            </div>
-          {/if}
           <div
             class="card-grid simple-grid browser-instance-grid"
             style={`--browser-columns:${browserColumns}`}
@@ -6713,6 +7143,12 @@
                         <strong>等待运行资源</strong>
                         <small>队列第 {item.queue_position || 1} 位，资源释放后自动启动</small>
                       </span>
+                    {:else if browserWebviewSlowIds.includes(item.id)}
+                      <span class="browser-preview-loading waiting">
+                        <span class="browser-loading-icon"><ArrowClockwise class="spinning" size={15} /></span>
+                        <strong>页面加载缓慢</strong>
+                        <small>抖音页面已开始加载但尚未显示内容，出现内容后会自动展开</small>
+                      </span>
                     {:else if browserWebviewMountingIds.includes(item.id) || browserWebviewLoadingIds.includes(item.id)}
                       <span class="browser-preview-loading loading">
                         <span class="browser-loading-icon"><ArrowClockwise class="spinning" size={15} /></span>
@@ -6728,6 +7164,12 @@
                         <WarningCircle size={18} />
                         <strong>真实浏览器暂不可用</strong>
                         <small>{browserWebviewErrors[item.id]}</small>
+                      </span>
+                    {:else if participationRotationSuspended(item.id)}
+                      <span class="browser-preview-loading waiting">
+                        <ClockCountdown size={18} />
+                        <strong>本轮参与已完成</strong>
+                        <small>已挂起并让出运行资源，等待本次任务的其余账号轮换完成</small>
                       </span>
                     {:else}
                       <span class="browser-preview-loading">
@@ -7440,7 +7882,12 @@
             {:else if participationRecordsLoading && participationRecords.length === 0 && participationTaskRuns.length === 0}
               <div class="account-empty"><ArrowClockwise class="spinning" size={22} /><span>正在读取参与记录…</span></div>
             {:else}
-              <div class="participation-record-page">
+              <div
+				class:resizing={participationSplitPointer !== -1}
+				class="participation-record-page"
+				bind:this={participationRecordPageElement}
+				style={`--participation-run-share: ${participationSplitPercent}%`}
+			  >
                 <section class:empty={participationTaskRuns.length === 0} class="participation-run-section">
                   <div class="participation-section-heading">
                     <div><strong>任务运行记录</strong><span>{participationTaskRuns.length}</span></div>
@@ -7471,6 +7918,26 @@
                     </div>
                   {/if}
                 </section>
+
+				<button
+				  type="button"
+				  class="participation-table-splitter"
+				  role="slider"
+				  aria-label="调整任务记录和参与明细的高度"
+				  aria-orientation="vertical"
+				  aria-valuemin="20"
+				  aria-valuemax="80"
+				  aria-valuenow={Math.round(participationSplitPercent)}
+				  aria-valuetext={`上方任务记录占 ${Math.round(participationSplitPercent)}%`}
+				  tabindex="0"
+				  data-tooltip="上下拖动调整表格高度"
+				  data-tooltip-placement="top"
+				  onpointerdown={startParticipationSplitDrag}
+				  onpointermove={moveParticipationSplitDrag}
+				  onpointerup={endParticipationSplitDrag}
+				  onpointercancel={endParticipationSplitDrag}
+				  onkeydown={adjustParticipationSplit}
+				><span aria-hidden="true"></span></button>
 
                 <section class="participation-detail-section">
                   <div class="participation-section-heading detail">
@@ -7930,6 +8397,27 @@
                 >{/if}</span
             >
             <span class="number-field"><input type="number" min="0" max="300" step="1" bind:value={participationSettings.participation_countdown_seconds} /><em>秒</em></span>
+          </label>
+          <label class="participation-setting-row">
+            <span
+              ><strong>同时参与实例数</strong
+              ><small
+                >同时准备红包页面上下文的实例数量；账号多于这个值时按批轮换，先完成的实例挂起并让出资源给下一批。填 0
+                为自动，按本机 CPU/内存实时算出的运行建议上限{browserCapacity?.recommended_limit
+                  ? `（当前 ${participationRotationLimit()} 个）`
+                  : ""}</small
+              ></span
+            >
+            <span class="number-field"><input type="number" min="0" max="64" step="1" bind:value={participationSettings.batch_concurrency} /><em>个</em></span>
+          </label>
+          <label class="participation-setting-row">
+            <span
+              ><strong>参与准备超时</strong
+              ><small
+                >批量/轮换启动时，等待单个账号的直播间页面就绪的上限；超时即让位给下一个账号。抢包窗口只有一两分钟，等一个慢页面不如换下一个。手动「准备页面上下文」不受此限制</small
+              ></span
+            >
+            <span class="number-field"><input type="number" min="4" max="60" step="1" bind:value={participationSettings.prepare_timeout_seconds} /><em>秒</em></span>
           </label>
           <label class="participation-setting-row">
             <span><strong>参与停止</strong><small>参与达到指定次数后，不再分配后续红包任务</small></span>

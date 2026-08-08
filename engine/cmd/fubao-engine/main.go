@@ -1652,6 +1652,7 @@ func main() {
 				continue
 			}
 			var params struct {
+				ActivityID string   `json:"activity_id"`
 				ScheduleID string   `json:"schedule_id"`
 				Mode       string   `json:"mode"`
 				Started    int      `json:"started"`
@@ -1662,11 +1663,37 @@ func main() {
 				writeError(encoder, req.ID, "invalid_params", "红包参与批量执行结果无效")
 				continue
 			}
-			if err := redPacketStore.RecordParticipationBatchResult(params.ScheduleID, params.Mode, params.Started, params.Skipped, params.AccountIDs); err != nil {
+			var err error
+			if strings.TrimSpace(params.ActivityID) != "" {
+				err = redPacketStore.CompleteParticipationBatch(params.ActivityID, params.Started, params.Skipped, params.AccountIDs)
+			} else {
+				err = redPacketStore.RecordParticipationBatchResult(params.ScheduleID, params.Mode, params.Started, params.Skipped, params.AccountIDs)
+			}
+			if err != nil {
 				writeError(encoder, req.ID, "participation_batch_result_failed", err.Error())
 				continue
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{"recorded": true}})
+		case "red_packet_participation.batch_begin":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			var params struct {
+				ScheduleID string   `json:"schedule_id"`
+				Mode       string   `json:"mode"`
+				AccountIDs []string `json:"account_ids"`
+			}
+			if err := json.Unmarshal(req.Params, &params); err != nil {
+				writeError(encoder, req.ID, "invalid_params", "红包参与批次参数无效")
+				continue
+			}
+			activityID, err := redPacketStore.BeginParticipationBatch(params.ScheduleID, params.Mode, params.AccountIDs)
+			if err != nil {
+				writeError(encoder, req.ID, "participation_batch_begin_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]any{"activity_id": activityID}})
 		case "red_packet_participation.contexts":
 			if redPacketStoreErr != nil || browserStoreErr != nil || pageParticipation == nil {
 				writeError(encoder, req.ID, "participation_unavailable", "红包参与状态不可用")
@@ -1749,6 +1776,7 @@ func main() {
 		case "red_packet_participation.native_context":
 			var params struct {
 				InstanceID             string `json:"instance_id"`
+				BatchActivityID        string `json:"batch_activity_id"`
 				Ready                  bool   `json:"ready"`
 				ResultOnly             bool   `json:"result_only"`
 				AllowChallengeRecovery bool   `json:"allow_challenge_recovery"`
@@ -1793,7 +1821,7 @@ func main() {
 				continue
 			}
 			if params.Ready && !params.ResultOnly {
-				if err := redPacketStore.RecordParticipationStarted(accountID, accountName); err != nil {
+				if err := redPacketStore.RecordParticipationStartedInBatch(accountID, accountName, params.BatchActivityID); err != nil {
 					writeError(encoder, req.ID, "participation_task_start_failed", err.Error())
 					continue
 				}

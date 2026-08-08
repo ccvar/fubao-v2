@@ -128,6 +128,49 @@ func TestParticipationRecordPersistsAndDeduplicates(t *testing.T) {
 	}
 }
 
+func TestBatchConcurrencyKeepsAutoAndClampsExplicitValues(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Zero is 自动 (derived from live browser runtime capacity) and must never
+	// be normalized into a fixed number.
+	if got := store.GetParticipationSettings().BatchConcurrency; got != 0 {
+		t.Fatalf("default participation concurrency should be 自动, got %d", got)
+	}
+	settings, err := store.SetParticipationSettings(ParticipationSettings{BatchConcurrency: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings.BatchConcurrency != 10 {
+		t.Fatalf("explicit concurrency was not kept: %d", settings.BatchConcurrency)
+	}
+	clamped, err := store.SetParticipationSettings(ParticipationSettings{BatchConcurrency: 9999})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if clamped.BatchConcurrency != maxBatchConcurrency {
+		t.Fatalf("unsafe concurrency was not clamped: %d", clamped.BatchConcurrency)
+	}
+	if negative, err := store.SetParticipationSettings(ParticipationSettings{BatchConcurrency: -5}); err != nil {
+		t.Fatal(err)
+	} else if negative.BatchConcurrency != 0 {
+		t.Fatalf("a negative concurrency should fall back to 自动, got %d", negative.BatchConcurrency)
+	}
+
+	if _, err := store.SetParticipationSettings(ParticipationSettings{BatchConcurrency: 12}); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.GetParticipationSettings().BatchConcurrency; got != 12 {
+		t.Fatalf("participation concurrency did not persist: %d", got)
+	}
+}
+
 func TestParticipationSettingsPolicyAndActivityPersist(t *testing.T) {
 	dataDir := t.TempDir()
 	store, err := NewStore(dataDir)
@@ -191,7 +234,8 @@ func TestParticipationTaskCapturesSettingsSnapshot(t *testing.T) {
 		RiskControlCooldownMinutes: 60,
 		PacketType:                 ParticipationPacketTypeGift, FollowPolicy: ParticipationFollowPolicyOnly,
 	}
-	want.DrawResultTimeoutSeconds = 10 // legacy compatibility field is normalized on write
+	want.DrawResultTimeoutSeconds = 10                        // legacy compatibility field is normalized on write
+	want.PrepareTimeoutSeconds = defaultPrepareTimeoutSeconds // defaulted on write
 	if _, err := store.SetParticipationSettings(want); err != nil {
 		t.Fatal(err)
 	}
@@ -885,6 +929,47 @@ func TestParticipationBatchCompletesAsOneAggregatedActivity(t *testing.T) {
 	runs := store.ParticipationTaskRuns()
 	if len(runs) != 1 || runs[0].Mode != "immediate" || runs[0].AccountCount != 2 || runs[0].Status != "completed" || runs[0].SuccessCount != 2 || len(runs[0].TaskIDs) != 2 {
 		t.Fatalf("batch must remain one task-run row: %+v", runs)
+	}
+}
+
+func TestRotatingParticipationBatchKeepsOneRunWhileAccountsEnterLater(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	batchID, err := store.BeginParticipationBatch("", "immediate", []string{"rotate-a", "rotate-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordParticipationStartedInBatch("rotate-a", "账号甲", batchID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishParticipationTask("rotate-a", "本轮参与已完成"); err != nil {
+		t.Fatal(err)
+	}
+	runs := store.ParticipationTaskRuns()
+	if len(runs) != 1 || runs[0].ID != batchID || runs[0].Status != "running" || runs[0].AccountCount != 2 {
+		t.Fatalf("open rotating batch must stay one running two-account row: %+v", runs)
+	}
+	if _, exists := store.participationRuns[store.participationTasks["rotate-a"].ID]; exists {
+		t.Fatal("batch child must not create a separate task-run row")
+	}
+
+	if err := store.RecordParticipationStartedInBatch("rotate-b", "账号乙", batchID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.FinishParticipationTask("rotate-b", "本轮参与已完成"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteParticipationBatch(batchID, 2, 0, []string{"rotate-a", "rotate-b"}); err != nil {
+		t.Fatal(err)
+	}
+	runs = store.ParticipationTaskRuns()
+	if len(runs) != 1 || runs[0].ID != batchID || runs[0].Status != "completed" || runs[0].AccountCount != 2 || len(runs[0].TaskIDs) != 2 {
+		t.Fatalf("completed rotating batch must remain one aggregated row: %+v", runs)
+	}
+	if activities := store.Activities(); len(activities) != 1 || activities[0].ID != batchID || activities[0].BatchOpen {
+		t.Fatalf("rotating batch activity was split or left open: %+v", activities)
 	}
 }
 

@@ -62,6 +62,8 @@ Keep persistent desktop chrome very compact: the main top bar should stay around
 
 Do not append the decorative “本机运行” phrase to any main top-bar subtitle. Browser-instance resource metrics such as CPU and memory remain visible because they carry real runtime data.
 
+Browser-instance capacity pressure never uses a separate yellow banner above the cards. Keep “建议上限 N” in the compact title subtitle and place one small warning icon immediately after it only while capacity is constrained, critical, or has queued instances; the icon uses the shared dark Tooltip to show the engine-provided capacity message, while the limit text retains its detailed calculation Tooltip.
+
 Primary sidebar pages support desktop-style detached windows: normal left-click switches the current window, while the row context menu, Command/Ctrl-click, and middle-click open that page in its own native window. Reopening the same page focuses its existing detached window. Detached windows show only the selected business page and share the same Go engine/account store; native child WebViews for browser cards and account login/rebind flows must attach to the invoking page window rather than being hard-coded to `main`.
 
 Use one compact modal-footer button standard across every dialog: right-align actions, use a 30px control height, 8px radius, 6px gap, and content-sized widths with a small minimum; the destructive confirmation dialog follows the same dimensions.
@@ -98,6 +100,8 @@ Desktop self-updates use Tauri's signed updater flow, matching Pilot: download a
 
 The sidebar footer always shows the current application version followed by the current license edition. When a desktop update is available, show only a compact red corner dot on the version control (never the text badge “可升级”); the version tooltip still names the latest version. A fresh installation defaults to “免费版”; successful Keygen activation changes it to “专业版”. Reuse the legacy 福宝/DY-KIRO product, device fingerprint, machine activation, refresh, unbind, and offline-grace semantics in the Go engine. License keys remain only in the permission-restricted Go store and the frontend receives only safe status and masked metadata. Free and professional editions currently have no feature-level restrictions. The active-license panel shows its absolute expiry or “永久有效” when Keygen provides no expiry, and exposes an icon-only “更换授权码” action; replacing a key must validate the new key before overwriting the current working authorization. When a professional license has a finite expiry, the sidebar footer shows a compact “剩余 N 天” reminder immediately after the edition badge and uses the shared dark in-app Tooltip to reveal the exact expiry; permanent licenses omit this reminder.
 
+The sidebar version update indicator stays deliberately tiny: use a 4px red corner dot with only a 1px separator ring so it remains noticeable without covering the version number or competing with the edition badge.
+
 For the professional edition, show a very small cloud-download icon immediately after “福宝控制台” in the sidebar footer once the center-library state has loaded. The downward arrow represents receiving center-library data. Use green when a center-library Key is bound and gray when it is unbound; the free edition shows no icon. The icon uses the shared dark in-app Tooltip and opens the existing authorization-management dialog. Center-library icons inside that dialog use the same downward-arrow direction.
 
 At narrow widths (760px and below), the sidebar becomes a true icon rail. Never render a web logo or any decorative mark in the native traffic-light strip, because it overlaps macOS window controls. Keep the four primary navigation icons in one dense uninterrupted group, then separate the workspace and recent-activity icon groups with restrained spacing.
@@ -131,6 +135,12 @@ On the browser-instance title subtitle, after CPU/memory usage show a compact te
 页面 join 是**纯接口路径，禁止 DOM 点击兜底**：在我们自己的 join 之后再合成点击，会让页面对同一红包发出第二次请求，直接换来 `rush_spam` 风控。一次 `join`，`attempts=1`，只走 `fetch` 让 `bdms.js` 重签（`msToken`/`a_bogus`）；请求有约 6 秒上限，绝不能超过红包抢包窗口。**join 不得回退 XHR**：XHR 绕过 fetch 钩子拿不到配套签名，实测全历史 14 次 XHR join 全部被拒、20 次受理全部来自 fetch，而且对同一红包再发一次正是招来 `rush_spam` 的双请求形状。XHR 只保留给 `receive`。`fetch` 无响应时 join 是否到达抖音本就未知，按页面层超时（`network_error`）上报，绝不能记成 soft-deny，也不能为了拿到可读响应再补发一次。URL 必须克隆页面真实的 `live.douyin.com/webcast/*` 请求作为模板,只删签名与列表游标（`msToken`/`a_bogus`/`cursor`/`count` 等）后用 `set` 覆盖 join 字段，从而继承该直播页已经用成功过的会话与指纹键；**不要**自己嗅探并附加 `msToken`（与 bdms 算出的签名不配套即 soft-deny），也不要清空 query 后按固定顺序重建。指纹沿用 Chrome/124 + `enter_from=link_share`，`browser_version` 取自真实 `navigator`。
 
 参与时序是 join 成败的首要因素，比查询参数更关键。Go 只在「剩余时间 ≤ 参与倒计时」时才派发账号，所以原生侧从派发到真正发出 `join` 的全部耗时都是从红包抢包窗口里扣的。join 前的页面等待必须保持在 1.6 秒量级，参与路径上的登录就绪等待不超过 1.2 秒（用户手动「准备页面上下文」仍可长等），并且**不得**以「页面实时 room_id 已嗅探到」作为跳出等待的条件：嵌入式 WebView 里 `pageRoom=0` 是常态，等它会烧掉整个窗口。有实时 room_id 就用，没有就直接用任务的 `ActualRoomID`（已验证的成功路径正是用任务房间号）。同样禁止在 join 前发未签名的 `room/web/enter` 探测补参数——它拿不到 room_id，只增加延迟与风控暴露。裸 soft-deny（无 rush_spam）仍记为参与失败，不进风控冷却。
+
+一台机器只能同时运行有限个真实浏览器实例,所以账号数超过这个上限时,红包参与按**轮换**推进而不是一次性全开:同时只有"同时参与实例数"个账号持有已准备好的直播间上下文,某个账号的参与任务结束后立即结束其上下文、关闭子 WebView、归还运行租约,空出的名额交给队列里的下一个账号,直到本次任务的全部账号都轮过一遍。新的一次任务总是从头重新排队。这个值 **0 表示自动**,取 Go 引擎按实时 CPU/内存算出的浏览器运行建议上限,也可以在红包参与设置里手动指定。
+
+轮换有两条必须守住的规则。其一,**同一批的准备必须并发进行**:准备耗时由原生页面导航与登录就绪等待主导,不是请求速率,串行遍历上百个实例会把整个抢包窗口耗光,而参与时序是 join 成败的首要因素。其二,**已轮换过的实例必须保持挂起**,卡片可见性不得把它重新挂载回来——它刚让出的名额属于队列里的下一个账号,可见的卡片抢回名额会让后面的账号永远等不到资源。挂起的卡片要显示"本轮参与已完成"而不是通用占位符,否则看起来像加载失败。手动停止批次必须同时清空轮换队列,否则下一拍还会继续放行刚被停掉的账号。
+
+参与任务结束后(轮换让位、手动停止、批次停止都算)必须把该实例**导航回 `https://www.douyin.com/` 并改写落地页记忆**。直播间是全应用最重的页面——视频加上礼物动画——把跑完的账号停在那里等于持续为没人看的直播流付费;而且落地页记忆会让下一次挂载直接恢复那个已经过期的直播间。即使表面随后就会被关闭(轮换就是如此),也要改写记忆。这一步**只能在参与上下文确实结束之后**做:导航会摧毁任务赖以签名的页面模板。
 
 The compact sidebar footer gear opens 红包参与设置 rather than license management. Its global values are persisted by the Go red-packet store and captured as an immutable snapshot for each newly started participation task; changing the dialog affects future tasks only. The snapshot is enforced independently for each participation account: 参与停止 blocks future assignments after the configured joined count, 参与冷却 waits the configured seconds after an accepted join, and 中奖停止 blocks future assignments after the configured confirmed-win count; zero means unlimited. Each explicit browser-account start of red-packet participation appends a safe persistent “参与账号…启动了红包参与” entry to the sidebar recent-activity feed. License management remains available from the edition badge.
 
@@ -192,6 +202,14 @@ Embedded browser previews must mount as soon as a useful portion of their previe
 
 Returning to the browser-instance screen must show each already-rendered instance exactly as it was left, including its in-memory page, scroll, playback, dialog, and login state. Switching to another application page hides the native child WebViews without destroying them or releasing their runtime leases; returning repositions and reveals those same WebViews immediately and must not show a restoring state. A newly mounted instance still uses the same account-keyed native profile and last safe Douyin page.
 
+守住这条行为的两个门闩 (`browserViewSettled`、`browserLayoutChanging`) **必须无条件归位**,否则表现完全一样且无法自愈:子 WebView 还活着、运行租约还held(标题栏仍显示「N 个运行」),但再也不会收到 `reveal`,四张卡片一起退回「真实浏览器准备就绪」占位符。两条已经踩过的坑:(1) `browserViewSettled` 不得只在拉取成功后置位——引擎 RPC 是串行单循环,监测繁忙时 `browser.list`/`browser.capacity` 完全可能超时,而清单拉取失败**不代表**已挂载的子 WebView 有任何问题,必须在 `finally` 里归位;同一函数的"已有请求在飞"提前返回路径也要归位。(2) 列宽拖动的 settle 回调在 `browserLayoutRevision` 被别人(比如 `switchView`)改掉后提前 return 时,必须把 `browserLayoutChanging` 交还——`switchView` 只递增 revision 而不接管这个门闩,一旦漏放,`syncEmbeddedBrowsers` 与 `scheduleEmbeddedBrowserSync` 会在第一行永久 bail。归还时要判断是否已被更新的一次拖动接管。通用规则:任何"暂停几何同步"的标志位都必须由 `finally` 或显式的所有权归还来释放,绝不能依赖某条 happy path 走到底。
+
+但仅靠逐条修补边界是不够的:显示一个已挂载的子 WebView 依赖"一长串瞬时标志位 + 一个可被取消的 rAF + 一条会因 revision 变化而中途放弃的串行原生队列"的**合取**,任何一环漏一次就是永久空白。因此必须有一个**周期性对账器**(约 2 秒一次)直接断言目标状态:在浏览器实例页、无模态、且距上次布局变更已安静 1.5 秒以上时,清掉卡住的门闩并重新触发一次常规同步。它只允许触发原生几何命令,不得自己发起引擎 RPC(常规同步里的租约刷新仍保留自己的 5 秒节流),这样既不给串行 RPC 队列加压,又能把这一整类故障从"永久"降级为"最多 2 秒自愈"。判断"门闩卡住"必须依据距上次**主动**布局变更的时间,否则会和正在进行的列宽拖动打架。
+
+这条链路的**累积性**故障(切换几次才坏)有三个必须同时守住的规则。其一,几何同步的 revision 必须在**排队任务真正开始执行时**读取,而不是在调度时捕获:同步任务会在共享的原生队列里排队,期间发生一次切页就让它到达时自我作废,而且没有任何东西会重新调度它——切换次数越多越容易撞上,这正是"多切几次就坏"的来源。任务执行时才测量几何,所以用当前 revision 校验才是对的;revision 仍然防护同步**过程中**的变更。其二,运行租约刷新**绝不能在原生布局队列里被 await**:所有原生几何操作共用一条串行队列,而引擎 RPC 又是串行单循环,监测繁忙时一次租约往返是秒级,会把后面所有几何工作全部堵死,连锁引发上面那种作废。租约刷新必须 fire-and-forget 并自带节流(失败时清掉节流以便下一拍重试)。其三,scroll / resize / IntersectionObserver / 响应式更新都会调度同步,必须**合并**成至多一个待执行任务,否则它们进入队列的速度快过排空速度;一个待执行任务永远足够,因为它在执行时才测量几何。
+
+最后也是最容易反复踩的一条:**"页面已就绪"必须是纯 DOM 判定,不得等任何网络结果**。返回浏览器实例页时,卡片本来就由上一次加载的 `browserInstances` 支撑——这正是"返回即保持原样"的前提——所以显示它们完全不需要网络。把就绪标志挂在清单刷新(`browser.list` + `browser.capacity`,两次串行 RPC 往返)之后,监测繁忙时就是好几秒,这段时间页面全程躲在占位符后面。就绪应当在 `switchView` 里 `await tick()` 之后立即置位;清单刷新是正交的,列表真的变了会经由响应式 layout key 再同步一次。同理,就绪标志只能在**真正发生**浏览器页进出时清除:重复点击当前页、或切换与浏览器页无关的页面,都不得把一个正在正常显示的页面打回未就绪。
+
 Browser instance records are not a fixed concurrency allowance. The Go engine computes a recommended runtime limit from the current machine's CPU and available memory, admits visible or explicitly opened instances into shared resource leases, and queues the rest in stable order. Existing work is never killed merely because pressure rises, but critical memory pressure closes new admission until recovery. Switching application pages only hides mounted child WebViews and retains their leases so their exact in-memory state survives; scrolling a card out of the usable viewport still destroys its embedded child WebView and releases its lease. Waiting cards retry automatically and show their queue state. Independently opened browser windows consume the same shared runtime capacity.
 
 Go 引擎的 RPC 是严格串行的单循环，所以嵌入式实例的几何同步**不得**每帧都向引擎申请运行租约：租约只在容量变化时才变，按帧申请会把 acquire 洪水灌进同一条 RPC 队列，把包括房间列表和参与记录在内的所有请求推过前端 12 秒超时。租约按实例节流（至少 5 秒一次，或运行状态尚未确认时），几何同步只调用原生命令、不走引擎往返。引擎 RPC 失败或超时**绝不能**被解读成“原生子 WebView 已丢失”：保留挂载、下一轮再试租约。只有原生几何命令自身被 Rust 拒绝才证明表面消失，即便如此，持有红包参与上下文的实例也不得重建——重建会销毁任务赖以签名的页面模板，表现为参与记录里的“直播页面红包请求等待超时”、空白卡片，以及 receive 无处可发导致的开奖异常。
@@ -237,6 +255,14 @@ Each browser-instance identity row may show the number of accounts currently liv
 The followed-live detail dialog is resizable within the desktop viewport like a lightweight Pilot utility panel. Its list owns vertical scrolling with a thin quiet scrollbar, never exposes horizontal scrolling, and reflows each live-room row when the dialog is narrowed instead of forcing fixed-width columns beyond the panel edge.
 
 Browser instance cards keep a compact loading indicator visible until the native child WebView reports its first completed Douyin page load. Initial child WebViews remain hidden and off-card until ready; never let an unpainted white native surface cover the HTML loading state.
+
+**揭开原生表面这件事归 Rust 管,不归前端管。** `schedule_browser_webview_reveal` 在固定延时后调 `webview.show()`,**然后**才发 `browser-webview://ready`——即 show 先于事件。前端 `sync_browser_webview` 的 `reveal` 参数只决定后续几何同步走 `apply_browser_bounds`(带 show)还是 `apply_browser_geometry`(不带),**它永远不会隐藏一个已经 show 过的表面**。所以任何试图靠前端状态(例如把实例留在 `browserWebviewLoadingIds` 里)推迟首次揭开的做法都是无效的:白色的原生页面照样盖在 HTML 状态之上,用户看到的是纯白、没有任何图标文字。这个错误已经犯过一次,别再犯。
+
+因此揭开的条件写在 `schedule_browser_webview_reveal` 里:settle 延时之后**轮询页面是否已有实质内容,内容就绪或超过硬上限(12 秒)才 `show()`**。判定用与布局无关的 `textContent` 长度——`innerText` 依赖布局,对隐藏或零尺寸的子 WebView 一律返回空串,而尚未揭开的卡片恰恰就是这个状态,用它会永远读不到内容。探针无结论只能当作"尚未渲染",绝不能让它失败一次挂载。等待期间卡片自然停在自己的 HTML 加载态(`ready` 事件在 `show()` 之后才发),这正是我们要的反馈;超过 6 秒再发一次 `browser-webview://slow`,把通用转圈文案换成「页面加载缓慢」——**沉默的多秒转圈和卡死无法区分**。
+
+这个探测**必须在 Rust 的 async runtime 里做,绝不能从前端按数百毫秒轮询**:一次 IPC 往返加主线程跳转会和正在加载的页面抢 macOS 主线程,实测反而让白屏时间更长。
+
+批量/轮换启动单个账号时等待页面就绪的上限必须**可配置且明显短于手动路径**(默认 10 秒,手动「准备页面上下文」保持 18 秒)。抢包窗口只有一两分钟,而在批次里等一个慢页面的代价是整整一个轮换名额,换下一个账号几乎总是更划算。
 
 On Windows, an independently opened browser instance uses only the native system title bar; do not render the redundant in-page account/title strip above the Douyin surface. Opening an instance must restore, bring forward, and focus its independent window. Reopening the same instance reuses and foregrounds the existing native window instead of creating a duplicate WebView or surfacing an `already exists` error.
 
@@ -286,7 +312,7 @@ On Windows, retain the native caption and system window controls. Keep the sideb
 
 浏览器实例页提供全局“启动任务”入口，支持立即执行、指定日期、每天固定时间和间隔执行。计划定义、下次执行时间和原子到期领取必须持久化在 Go redpacket store；间隔计划保存后立即执行第一轮。每次触发只批量准备真实已登录浏览器实例的红包页面上下文并开启对应参与账号的红包接口参与池，已激活任务不得重复并发启动；失败实例回滚本次自动开启的参与池开关。计划创建、触发、批量成功数和跳过数必须写入安全的最近活动，原始 CK、签名和接口响应仍不得进入前端。
 
-顶部批量红包参与每次执行在最近活动中只保留一条批次摘要，不重复显示逐账号启动活动。摘要文案包含执行方式、参与实例数和跳过数；活动标题比数据概览小一号，第二行按“相对时间、停止、详情”的顺序显示紧凑控件，不显示向右展开箭头。详情图标打开紧凑弹窗展示本批次账号及安全状态，弹窗打开期间必须持续隐藏原生实例 WebView，停止图标则停止整个批次。停止批次应先在 Go 层阻止这些账号的未来分配并关闭参与池，再清理对应原生页面上下文；已经发出的单次请求允许完成。
+顶部批量红包参与每次执行在最近活动中只保留一条批次摘要，不重复显示逐账号启动活动。批次父任务必须在有界浏览器轮换开始前落库，后续取得运行槽位的每个账号任务都挂到同一个批次 id；即使机器并发上限只有 1，“立即执行”选择 4 个账号也必须从开始到结束保持为一条 4 账号任务，不能在后续轮换时退化成 4 条单账号任务。摘要文案包含执行方式、参与实例数和跳过数；活动标题比数据概览小一号，第二行按“相对时间、停止、详情”的顺序显示紧凑控件，不显示向右展开箭头。详情图标打开紧凑弹窗展示本批次账号及安全状态，弹窗打开期间必须持续隐藏原生实例 WebView，停止图标则停止整个批次。停止批次应先在 Go 层阻止这些账号的未来分配并关闭参与池，再清理对应原生页面上下文；已经发出的单次请求允许完成。
 
 最近活动中的普通历史消息只读展示，不得复用页面切换或刷新行为制造虚假的可点击反馈；只有具备账号明细的红包参与批次摘要提供详情弹窗入口，运行中的批次另提供明确的停止操作。
 
@@ -314,7 +340,7 @@ On Windows, retain the native caption and system window controls. Keep the sideb
 
 在“账号与红包池”的“监测账号”后保留独立“参与记录”页签。每个账号与红包事件的参与尝试必须在 Go redpacket store 中先持久化占位再发送请求，以提供跨客户端重启的幂等去重；记录只向前端暴露账号、红包、直播间、接口类型、请求次数、结果、冷却和时间等安全元数据，绝不保存或返回 CK、签名参数、请求头或原始响应体。
 
-“参与记录”页在单次参与明细表上方保留一张任务运行汇总表，上下两张表严格各占参与记录可用内容区的 50%，并分别在自己的表体内滚动；下方参与明细使用约 56px 的紧凑行高、小头像和轻量结果徽标，在不省略账号、红包、结果、接口和时间结构的前提下提高单屏信息量。每次单账号明确启动或批量/计划实际触发只生成一条 Go 持久化任务行。任务按本地开始日期倒序分组，同一天共用一条可折叠、可吸顶的日期标题，日期标题汇总当天任务数、成功参与次数、中奖次数和中奖钻数；最近日期默认展开，历史日期默认收起。任务行将开始与结束时间合并到同一列，跨天结束明确标注“次日”或相隔天数，并用独立任务耗时列按“3分20秒”这类天/小时/分/秒精确组合显示；同时展示运行状态、参与账号数、成功参与次数、参与失败次数、中奖次数和中奖钻数。批量任务不得拆成多条账号任务；运行中数据实时汇总，终态数据跨客户端重启保留。点击日期标题只展开/收起分组，点击任务行才筛选下方属于该任务的参与明细，不允许前端按当前账号累计值猜测历史任务数据。每个日期分组必须拥有独立的前端组件与本地折叠状态，展开/收起只能更新该日期组件，不能让包含全部参与明细的桌面主组件进入同一个更新周期；任务行挂载后只切换可见性，并隔离下方大量参与明细的布局计算。
+“参与记录”页在单次参与明细表上方保留一张任务运行汇总表，上下两张表默认各占参与记录可用内容区的 50%，并分别在自己的表体内滚动；两表之间提供紧凑的横向拖动手柄，允许鼠标上下拖动或键盘方向键调整高度，同时为两张表保留最小可用高度。下方参与明细使用约 56px 的紧凑行高、小头像和轻量结果徽标，在不省略账号、红包、结果、接口和时间结构的前提下提高单屏信息量。每次单账号明确启动或批量/计划实际触发只生成一条 Go 持久化任务行。任务按本地开始日期倒序分组，同一天共用一条可折叠、可吸顶的日期标题，日期标题汇总当天任务数、成功参与次数、中奖次数和中奖钻数；最近日期默认展开，历史日期默认收起。任务行将开始与结束时间合并到同一列，跨天结束明确标注“次日”或相隔天数，并用独立任务耗时列按“3分20秒”这类天/小时/分/秒精确组合显示；同时展示运行状态、参与账号数、成功参与次数、参与失败次数、中奖次数和中奖钻数。批量任务不得拆成多条账号任务；运行中数据实时汇总，终态数据跨客户端重启保留。点击日期标题只展开/收起分组，点击任务行才筛选下方属于该任务的参与明细，不允许前端按当前账号累计值猜测历史任务数据。每个日期分组必须拥有独立的前端组件与本地折叠状态，展开/收起只能更新该日期组件，不能让包含全部参与明细的桌面主组件进入同一个更新周期；任务行挂载后只切换可见性，并隔离下方大量参与明细的布局计算。
 
 浏览器实例页的标题副文案在“本机运行”后紧凑显示实时 CPU 与内存占用百分比；资源数据由 Go 原生层采样并随现有容量轮询刷新，详细内存用量使用共享暗色 Tooltip 展示。
 

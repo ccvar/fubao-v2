@@ -210,11 +210,9 @@ func (s *Store) ClaimDueParticipationSchedules(now time.Time) ([]ParticipationSc
 	return executions, nil
 }
 
-// RecordParticipationBatchResult adds one compact, safe dispatch summary to
-// recent activity after native browser preparation has completed.
-func (s *Store) RecordParticipationBatchResult(scheduleID, mode string, started, skipped int, accountIDs []string) error {
+func participationBatchDescriptor(scheduleID, mode string) (label, verb, normalizedMode string) {
 	mode = strings.TrimSpace(mode)
-	label := "立即执行"
+	label = "立即执行"
 	if strings.TrimSpace(scheduleID) != "" {
 		label = "红包参与计划"
 		if mode == ParticipationScheduleDaily {
@@ -225,46 +223,19 @@ func (s *Store) RecordParticipationBatchResult(scheduleID, mode string, started,
 			label = "指定日期"
 		}
 	}
-	verb := "已启动"
+	verb = "已启动"
 	if strings.TrimSpace(scheduleID) != "" {
 		verb = "已执行"
 	}
-	message := fmt.Sprintf("%s“%s”：%d 个实例参与", verb, label, maxInt(started, 0))
-	if skipped > 0 {
-		message += fmt.Sprintf("，%d 个实例跳过", skipped)
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// The batch summary replaces only the per-account start activities created
-	// by this exact batch. Participation tasks and detailed request records stay
-	// intact; only the noisy sidebar entries are consolidated.
-	for _, accountID := range accountIDs {
-		task := s.participationTasks[strings.TrimSpace(accountID)]
-		if task == nil || strings.TrimSpace(task.ID) == "" {
-			continue
-		}
-		if activity := s.activities[task.ID]; activity != nil && (activity.Kind == "participation_started" || activity.Kind == "participation_task_completed") {
-			delete(s.activities, task.ID)
-			delete(s.participationRuns, task.ID)
-		}
-	}
-	if scheduleID = strings.TrimSpace(scheduleID); scheduleID != "" {
-		for id, activity := range s.activities {
-			if activity.Kind == "participation_schedule_dispatched" && activity.AccountID == scheduleID {
-				delete(s.activities, id)
-			}
-		}
-	}
-	activity := s.addActivityLocked("participation_batch_executed", "", message, time.Now())
-	s.participationRuns[activity.ID] = activity
-	activity.Title = label
-	activity.Mode = mode
+	normalizedMode = mode
 	if strings.TrimSpace(scheduleID) == "" {
-		activity.Mode = "immediate"
+		normalizedMode = "immediate"
 	}
-	activity.StartedCount = maxInt(started, 0)
-	activity.SkippedCount = maxInt(skipped, 0)
-	activity.TaskIDs = map[string]string{}
+	return label, verb, normalizedMode
+}
+
+func uniqueParticipationAccountIDs(accountIDs []string) []string {
+	result := make([]string, 0, len(accountIDs))
 	seen := make(map[string]struct{}, len(accountIDs))
 	for _, accountID := range accountIDs {
 		accountID = strings.TrimSpace(accountID)
@@ -275,29 +246,107 @@ func (s *Store) RecordParticipationBatchResult(scheduleID, mode string, started,
 			continue
 		}
 		seen[accountID] = struct{}{}
-		activity.AccountIDs = append(activity.AccountIDs, accountID)
+		result = append(result, accountID)
+	}
+	return result
+}
+
+// BeginParticipationBatch persists the one parent task before bounded native
+// browser rotation begins. Every later account task attaches to this id, so a
+// four-account top-bar action remains one row even when capacity admits only
+// one account at a time.
+func (s *Store) BeginParticipationBatch(scheduleID, mode string, accountIDs []string) (string, error) {
+	accountIDs = uniqueParticipationAccountIDs(accountIDs)
+	label, verb, normalizedMode := participationBatchDescriptor(scheduleID, mode)
+	now := time.Now()
+	message := fmt.Sprintf("%s“%s”：%d 个实例参与", verb, label, len(accountIDs))
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if scheduleID = strings.TrimSpace(scheduleID); scheduleID != "" {
+		for id, activity := range s.activities {
+			if activity.Kind == "participation_schedule_dispatched" && activity.AccountID == scheduleID {
+				delete(s.activities, id)
+			}
+		}
+	}
+	activity := s.addActivityLocked("participation_batch_executed", "", message, now)
+	s.participationRuns[activity.ID] = activity
+	activity.Title = label
+	activity.Mode = normalizedMode
+	activity.StartedCount = len(accountIDs)
+	activity.Active = len(accountIDs) > 0
+	activity.BatchOpen = len(accountIDs) > 0
+	activity.AccountIDs = append([]string(nil), accountIDs...)
+	activity.TaskIDs = map[string]string{}
+	if len(accountIDs) == 0 {
+		activity.FinishedAt = now.Format(time.RFC3339Nano)
+	}
+	if err := s.saveLocked(); err != nil {
+		return "", err
+	}
+	return activity.ID, nil
+}
+
+// CompleteParticipationBatch closes account admission and records the actual
+// started/skipped membership. Existing child tasks may still be active; their
+// final account result will close the single parent row later.
+func (s *Store) CompleteParticipationBatch(activityID string, started, skipped int, accountIDs []string) error {
+	accountIDs = uniqueParticipationAccountIDs(accountIDs)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	activity := s.activities[strings.TrimSpace(activityID)]
+	if activity == nil || activity.Kind != "participation_batch_executed" {
+		return errors.New("红包参与批次不存在")
+	}
+	activity.BatchOpen = false
+	activity.Active = false
+	activity.StartedCount = maxInt(started, 0)
+	activity.SkippedCount = maxInt(skipped, 0)
+	activity.AccountIDs = append(activity.AccountIDs[:0], accountIDs...)
+	if activity.TaskIDs == nil {
+		activity.TaskIDs = map[string]string{}
+	}
+	// Compatibility for tasks that started immediately before their batch id
+	// was returned: fold their temporary per-account row into this parent.
+	for _, accountID := range accountIDs {
 		if task := s.participationTasks[accountID]; task != nil && task.ID != "" {
+			if child := s.activities[task.ID]; child != nil && (child.Kind == "participation_started" || child.Kind == "participation_task_completed") {
+				delete(s.activities, task.ID)
+				delete(s.participationRuns, task.ID)
+			}
 			activity.TaskIDs[accountID] = task.ID
 			task.BatchActivityID = activity.ID
-			// The batch starts when its first native account task starts, not
-			// after every browser context has finished preparing and this result
-			// RPC finally arrives.
-			if task.StartedAt != "" && (activity.CreatedAt == "" || task.StartedAt < activity.CreatedAt) {
-				activity.CreatedAt = task.StartedAt
-			}
 			if task.Active {
 				activity.Active = true
 			}
 		}
 	}
-	if len(activity.AccountIDs) > 0 && !activity.Active {
-		s.finalizeParticipationBatchActivityLocked(activity.ID, false, time.Now())
-	} else if len(activity.AccountIDs) == 0 {
-		// A fully skipped/empty dispatch is still a terminal task-run row, but
-		// keep the established recent-activity dispatch wording intact.
+	label, verb, _ := participationBatchDescriptor("", activity.Mode)
+	if activity.Mode != "immediate" {
+		label = strings.TrimSpace(activity.Title)
+		verb = "已执行"
+	}
+	activity.Label = fmt.Sprintf("%s“%s”：%d 个实例参与", verb, label, maxInt(started, 0))
+	if skipped > 0 {
+		activity.Label += fmt.Sprintf("，%d 个实例跳过", skipped)
+	}
+	if len(activity.AccountIDs) == 0 {
 		activity.FinishedAt = time.Now().Format(time.RFC3339Nano)
+	} else if !activity.Active {
+		s.finalizeParticipationBatchActivityLocked(activity.ID, false, time.Now())
 	}
 	return s.saveLocked()
+}
+
+// RecordParticipationBatchResult preserves the original atomic API used by
+// existing callers and tests while the desktop uses the two-phase begin/end
+// flow for long-running account rotation.
+func (s *Store) RecordParticipationBatchResult(scheduleID, mode string, started, skipped int, accountIDs []string) error {
+	activityID, err := s.BeginParticipationBatch(scheduleID, mode, accountIDs)
+	if err != nil {
+		return err
+	}
+	return s.CompleteParticipationBatch(activityID, started, skipped, accountIDs)
 }
 
 // StopParticipationBatch prevents future assignments for every account in the
@@ -320,6 +369,7 @@ func (s *Store) StopParticipationBatch(activityID string) ([]string, error) {
 		}
 	}
 	activity.EndReason = "批次手动停止"
+	activity.BatchOpen = false
 	s.finalizeParticipationBatchActivityLocked(activity.ID, true, stoppedAt)
 	if err := s.saveLocked(); err != nil {
 		return nil, err

@@ -3855,6 +3855,53 @@ fn apply_browser_bounds(webview: &tauri::Webview, bounds: &BrowserBounds) -> Res
         .map_err(|error| format!("显示嵌入浏览器失败：{error}"))
 }
 
+/// How long a not-yet-painted page may stay hidden before the card is told the
+/// load is slow, and the hard bound after which it is shown regardless.
+const BROWSER_REVEAL_SLOW_AFTER: Duration = Duration::from_secs(6);
+const BROWSER_REVEAL_CONTENT_MAX_WAIT: Duration = Duration::from_secs(12);
+
+/// Cheap "has this document actually painted anything?" probe.
+///
+/// Runs on the async runtime, like the login probe, and deliberately does no
+/// DOM traversal — it only measures text length. Readiness must be measured
+/// against `textContent`, never `innerText`: innerText is layout-dependent and
+/// returns '' for a hidden or zero-sized child WebView, which is exactly the
+/// state a not-yet-revealed card is in, so it would never report content.
+async fn douyin_page_has_content(webview: &tauri::Webview) -> bool {
+    if webview
+        .eval(
+            r#"(() => {
+              try {
+                const text = document.body ? document.body.textContent : '';
+                const painted = document.readyState !== 'loading' &&
+                  Boolean(document.body) &&
+                  String(text || '').trim().length > 20;
+                document.cookie = 'fubao_paint_probe=' + (painted ? '1' : '0') +
+                  '; Path=/; Secure; SameSite=None';
+              } catch (_) {
+                // An inconclusive frame is "not yet painted", never an error.
+              }
+            })();"#,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    tokio::time::sleep(Duration::from_millis(90)).await;
+    let painted = webview
+        .cookies()
+        .map(|cookies| {
+            cookies
+                .iter()
+                .find(|cookie| cookie.name() == "fubao_paint_probe")
+                .is_some_and(|cookie| cookie.value() == "1")
+        })
+        .unwrap_or(false);
+    let _ = webview
+        .eval("document.cookie='fubao_paint_probe=; Path=/; Secure; SameSite=None; Max-Age=0'");
+    painted
+}
+
 fn schedule_browser_webview_reveal(
     webview: tauri::Webview,
     app: tauri::AppHandle,
@@ -3876,6 +3923,38 @@ fn schedule_browser_webview_reveal(
         }
         if browser_webview_is_closing(&runtime, &webview_label) {
             return;
+        }
+        // PageLoadEvent::Finished fires when navigation completes, which for
+        // Douyin's SPA is long before first paint. Showing at that point is
+        // what put a blank white native surface over the card's own loading
+        // state — with no feedback and no way to tell loading from stuck. Wait
+        // for real content here, in the async runtime that is already idling,
+        // rather than polling from the frontend: an IPC round trip plus a
+        // main-thread hop every few hundred milliseconds competes with the very
+        // page render being waited on and makes the blank period longer.
+        let started = Instant::now();
+        let mut slow_reported = false;
+        loop {
+            if browser_webview_is_closing(&runtime, &webview_label) {
+                return;
+            }
+            if douyin_page_has_content(&webview).await {
+                break;
+            }
+            let waited = started.elapsed();
+            if waited >= BROWSER_REVEAL_CONTENT_MAX_WAIT {
+                // Show anyway: a partially painted but interactive page is more
+                // useful than one that stays hidden indefinitely.
+                break;
+            }
+            if !slow_reported && waited >= BROWSER_REVEAL_SLOW_AFTER {
+                slow_reported = true;
+                let _ = app.emit(
+                    "browser-webview://slow",
+                    json!({ "instance_id": instance_id.clone() }),
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(400)).await;
         }
         let (tx, rx) = std::sync::mpsc::channel();
         let dispatch = app.run_on_main_thread(move || {
@@ -4496,6 +4575,8 @@ async fn prepare_browser_red_packet_context(
     web_rid: String,
     result_only: Option<bool>,
     allow_challenge_recovery: Option<bool>,
+    batch_activity_id: Option<String>,
+    ready_timeout_seconds: Option<u64>,
 ) -> Result<String, String> {
     let instance_id = instance_id.trim().to_string();
     let web_rid = web_rid.trim().to_string();
@@ -4538,7 +4619,13 @@ async fn prepare_browser_red_packet_context(
     // After www.douyin.com → live.douyin.com navigation the SPA commonly sits
     // in Unknown for several seconds even with a valid jar. Wait longer so the
     // red-packet icon does not immediately toast “尚未完成加载”.
-    let snapshot = wait_for_douyin_login_ready(&webview, Duration::from_secs(18)).await?;
+    //
+    // A batch/rotation caller passes a shorter bound: the packet window is only
+    // a minute or two, so holding a rotation slot for the full manual wait
+    // costs more than simply giving the slot to the next account. A manual
+    // “准备页面上下文” keeps the long wait.
+    let ready_timeout = Duration::from_secs(ready_timeout_seconds.unwrap_or(18).clamp(4, 60));
+    let snapshot = wait_for_douyin_login_ready(&webview, ready_timeout).await?;
     match snapshot.state {
         BrowserLoginState::LoggedIn => {}
         BrowserLoginState::LoggedOut => return Err("当前实例尚未登录，请先重新绑定 CK".into()),
@@ -4565,6 +4652,7 @@ async fn prepare_browser_red_packet_context(
             "ready": true,
             "result_only": result_only.unwrap_or(false),
             "allow_challenge_recovery": allow_challenge_recovery.unwrap_or(false),
+            "batch_activity_id": batch_activity_id.unwrap_or_default(),
             "secret": runtime.native_secret,
         }),
     )
@@ -4587,6 +4675,45 @@ async fn prepare_browser_red_packet_context(
         .map_err(|_| "红包页面上下文状态锁不可用")?
         .insert(instance_id);
     Ok(format!("https://live.douyin.com/{web_rid}"))
+}
+
+#[tauri::command]
+/// Returns a finished participation instance to the Douyin home page.
+///
+/// A live room is the heaviest page this app ever hosts — video plus gift
+/// animations — and it is also the page the landing-page memory would restore
+/// on the next mount. Leaving a finished account parked there keeps paying for
+/// a stream nobody is watching and makes a later remount resume a stale room.
+/// The remembered location is rewritten even when the surface is already gone,
+/// which is the case in a rotation where the WebView is closed right after.
+///
+/// Only safe to call once the participation context has ended: navigating away
+/// destroys the signed-request template a running task depends on.
+async fn reset_browser_landing_page(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+    runtime: tauri::State<'_, Arc<EngineRuntime>>,
+    instance_id: String,
+) -> Result<(), String> {
+    let instance_id = instance_id.trim().to_string();
+    if instance_id.is_empty() {
+        return Err("浏览器实例参数无效".into());
+    }
+    let runtime = runtime.inner().clone();
+    let target: Url = "https://www.douyin.com/"
+        .parse()
+        .map_err(|error| format!("解析抖音首页地址失败：{error}"))?;
+    remember_browser_location(&runtime, &instance_id, &target);
+    let label = browser_webview_label(&instance_id, window.label());
+    if browser_webview_is_closing(runtime.as_ref(), &label) {
+        return Ok(());
+    }
+    if let Some(webview) = app.get_webview(&label) {
+        webview
+            .navigate(target)
+            .map_err(|error| format!("返回抖音首页失败：{error}"))?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -5883,6 +6010,7 @@ pub fn run() {
             close_browser_webview,
             prepare_browser_red_packet_context,
             stop_browser_red_packet_context,
+            reset_browser_landing_page,
             refresh_browser_account_cookie,
             sync_browser_account_cookie,
             sync_browser_following_live,

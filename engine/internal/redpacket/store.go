@@ -347,7 +347,28 @@ type ParticipationSettings struct {
 	MinimumDiamonds            int    `json:"minimum_diamonds"`
 	PacketType                 string `json:"packet_type"`
 	FollowPolicy               string `json:"follow_policy"`
+	// BatchConcurrency bounds how many participation accounts hold a prepared
+	// live-room context at the same time. A machine can only run a bounded
+	// number of real browser instances, so a larger account pool is worked
+	// through in rotations: finished accounts release their context and the
+	// next accounts take their place. Zero means 自动 — derived from the Go
+	// engine's own browser runtime capacity recommendation.
+	BatchConcurrency int `json:"batch_concurrency"`
+	// PrepareTimeoutSeconds bounds how long a batch/rotation start waits for one
+	// account's live-room page to become login-ready. The packet window is only
+	// a minute or two, so waiting out a slow page costs more than handing the
+	// rotation slot to the next account. A manual “准备页面上下文” is unaffected
+	// and keeps the longer native wait.
+	PrepareTimeoutSeconds int `json:"prepare_timeout_seconds"`
 }
+
+// maxBatchConcurrency is a safety bound only. The real limit is the browser
+// runtime capacity, which is computed from live CPU/memory pressure.
+const maxBatchConcurrency = 64
+
+// defaultPrepareTimeoutSeconds is deliberately well under the native manual
+// wait: inside a batch the alternative to waiting is simply the next account.
+const defaultPrepareTimeoutSeconds = 10
 
 // MonitoringSettings are safe, persisted throughput controls for the native
 // room-monitor pipeline. They contain no account credentials or request data.
@@ -372,16 +393,20 @@ type Activity struct {
 	Mode             string                   `json:"mode,omitempty"`
 	Label            string                   `json:"label"`
 	Active           bool                     `json:"active,omitempty"`
-	StartedCount     int                      `json:"started_count,omitempty"`
-	SkippedCount     int                      `json:"skipped_count,omitempty"`
-	JoinCount        int                      `json:"join_count,omitempty"`
-	FailureCount     int                      `json:"failure_count,omitempty"`
-	WinCount         int                      `json:"win_count,omitempty"`
-	WinDiamonds      float64                  `json:"win_diamonds,omitempty"`
-	CreatedAt        string                   `json:"created_at"`
-	FinishedAt       string                   `json:"finished_at,omitempty"`
-	StoppedAt        string                   `json:"stopped_at,omitempty"`
-	EndReason        string                   `json:"end_reason,omitempty"`
+	// BatchOpen keeps a bounded-concurrency batch alive while accounts are
+	// still waiting for their native browser slot. Child tasks can finish in
+	// between rotations without making the parent task look completed.
+	BatchOpen    bool    `json:"batch_open,omitempty"`
+	StartedCount int     `json:"started_count,omitempty"`
+	SkippedCount int     `json:"skipped_count,omitempty"`
+	JoinCount    int     `json:"join_count,omitempty"`
+	FailureCount int     `json:"failure_count,omitempty"`
+	WinCount     int     `json:"win_count,omitempty"`
+	WinDiamonds  float64 `json:"win_diamonds,omitempty"`
+	CreatedAt    string  `json:"created_at"`
+	FinishedAt   string  `json:"finished_at,omitempty"`
+	StoppedAt    string  `json:"stopped_at,omitempty"`
+	EndReason    string  `json:"end_reason,omitempty"`
 }
 
 // ParticipationSchedule is a credential-free persisted trigger definition.
@@ -1125,6 +1150,18 @@ func normalizeParticipationSettings(settings ParticipationSettings) Participatio
 	default:
 		settings.FollowPolicy = ParticipationFollowPolicyPriority
 	}
+	// Zero is 自动 and must survive normalization; only an explicit value is
+	// clamped.
+	if settings.BatchConcurrency < 0 {
+		settings.BatchConcurrency = 0
+	}
+	if settings.BatchConcurrency > maxBatchConcurrency {
+		settings.BatchConcurrency = maxBatchConcurrency
+	}
+	if settings.PrepareTimeoutSeconds <= 0 {
+		settings.PrepareTimeoutSeconds = defaultPrepareTimeoutSeconds
+	}
+	settings.PrepareTimeoutSeconds = maxInt(4, minInt(settings.PrepareTimeoutSeconds, 60))
 	if settings.StopAfterJoins < 0 {
 		settings.StopAfterJoins = 0
 	}
@@ -1520,8 +1557,16 @@ func (s *Store) ResolveParticipationDraw(eventID, accountID, status, message, aw
 
 // RecordParticipationStarted appends one real explicit start action.
 func (s *Store) RecordParticipationStarted(accountID, accountName string) error {
+	return s.RecordParticipationStartedInBatch(accountID, accountName, "")
+}
+
+// RecordParticipationStartedInBatch creates one account task and, when a
+// batch id is supplied, attaches it directly to that durable batch identity.
+// It deliberately does not create a second per-account activity/run row.
+func (s *Store) RecordParticipationStartedInBatch(accountID, accountName, batchActivityID string) error {
 	accountID = strings.TrimSpace(accountID)
 	accountName = strings.TrimSpace(accountName)
+	batchActivityID = strings.TrimSpace(batchActivityID)
 	if accountName == "" {
 		accountName = "参与账号"
 	}
@@ -1535,12 +1580,39 @@ func (s *Store) RecordParticipationStarted(accountID, accountName string) error 
 	activity.TaskIDs = map[string]string{accountID: activity.ID}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.participationTasks[accountID] = &ParticipationTask{
+	var batch *Activity
+	if batchActivityID != "" {
+		batch = s.activities[batchActivityID]
+		if batch == nil || batch.Kind != "participation_batch_executed" || !batch.BatchOpen {
+			return errors.New("红包参与批次已结束或不存在")
+		}
+	}
+	task := &ParticipationTask{
 		ID: activity.ID, AccountID: accountID, AccountName: accountName, Active: true, StartedAt: now.Format(time.RFC3339Nano),
 		Settings: s.settings,
 	}
-	s.activities[activity.ID] = activity
-	s.participationRuns[activity.ID] = activity
+	s.participationTasks[accountID] = task
+	if batch == nil {
+		s.activities[activity.ID] = activity
+		s.participationRuns[activity.ID] = activity
+	} else {
+		if batch.TaskIDs == nil {
+			batch.TaskIDs = map[string]string{}
+		}
+		member := false
+		for _, candidateID := range batch.AccountIDs {
+			if candidateID == accountID {
+				member = true
+				break
+			}
+		}
+		if !member {
+			batch.AccountIDs = append(batch.AccountIDs, accountID)
+		}
+		batch.TaskIDs[accountID] = task.ID
+		batch.Active = true
+		task.BatchActivityID = batch.ID
+	}
 	return s.saveLocked()
 }
 
@@ -1903,6 +1975,9 @@ func (s *Store) finalizeParticipationBatchActivityLocked(activityID string, stop
 		return false
 	}
 	s.participationRuns[activity.ID] = activity
+	if !stopped && activity.BatchOpen {
+		return false
+	}
 	if !stopped {
 		for accountID, taskID := range activity.TaskIDs {
 			if task := s.participationTasks[accountID]; task != nil && task.ID == taskID && task.Active {
@@ -2020,7 +2095,7 @@ func (s *Store) ParticipationTaskRuns() []ParticipationTaskRun {
 		}
 		active := activity.Active
 		if activity.Kind == "participation_batch_executed" {
-			active = false
+			active = activity.BatchOpen
 			for _, accountID := range activity.AccountIDs {
 				taskID := activity.TaskIDs[accountID]
 				if task := s.participationTasks[accountID]; task != nil && task.Active && (taskID == "" || task.ID == taskID) {
@@ -2130,6 +2205,7 @@ func (s *Store) ReconcileParticipationTasksAfterRestart(now time.Time) (Particip
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	result := ParticipationRestartReconciliation{}
+	changed := false
 	previous := make(map[string]ParticipationTask)
 	for accountID, task := range s.participationTasks {
 		if task == nil || !task.Active {
@@ -2155,10 +2231,25 @@ func (s *Store) ReconcileParticipationTasksAfterRestart(now time.Time) (Particip
 		task.EndReason = "客户端重启，原生参与上下文已结束"
 		s.finalizeParticipationTaskActivityLocked(task, now)
 		result.StoppedAccountIDs = append(result.StoppedAccountIDs, accountID)
+		changed = true
+	}
+	// Browser-slot queues cannot survive a process restart. Close admission on
+	// any two-phase parent batch; resumable pending-draw child tasks may remain
+	// active and will still keep that parent row running until resolved.
+	for _, activity := range s.activities {
+		if activity == nil || activity.Kind != "participation_batch_executed" || !activity.BatchOpen {
+			continue
+		}
+		activity.BatchOpen = false
+		if strings.TrimSpace(activity.EndReason) == "" {
+			activity.EndReason = "客户端重启，未开始的轮换账号已取消"
+		}
+		s.finalizeParticipationBatchActivityLocked(activity.ID, false, now)
+		changed = true
 	}
 	sort.Strings(result.StoppedAccountIDs)
 	sort.Strings(result.PendingAccountIDs)
-	if len(result.StoppedAccountIDs) == 0 {
+	if !changed {
 		return result, nil
 	}
 	if err := s.saveLocked(); err != nil {
@@ -2187,7 +2278,7 @@ func (s *Store) Activities() []Activity {
 			}
 		}
 		if copy.Kind == "participation_batch_executed" && copy.Active {
-			copy.Active = false
+			copy.Active = copy.BatchOpen
 			for _, accountID := range copy.AccountIDs {
 				taskID := copy.TaskIDs[accountID]
 				if task := s.participationTasks[accountID]; task != nil && task.Active && (taskID == "" || task.ID == taskID) {
