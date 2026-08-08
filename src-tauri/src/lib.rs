@@ -412,14 +412,12 @@ fn force_windows_webview_front(window: &tauri::WebviewWindow) {
 }
 
 #[cfg(windows)]
-fn force_windows_hwnd_front(hwnd: isize) {
-    use windows_sys::Win32::Foundation::HWND;
+fn force_windows_hwnd_front(hwnd: windows_sys::Win32::Foundation::HWND) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, SetForegroundWindow, SetWindowPos, ShowWindow, HWND_NOTOPMOST,
         HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_RESTORE,
     };
 
-    let hwnd = hwnd as HWND;
     let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW;
     unsafe {
         let _ = ShowWindow(hwnd, SW_RESTORE);
