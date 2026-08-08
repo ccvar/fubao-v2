@@ -129,13 +129,9 @@ func (m *Manager) loadConfig() error {
 		Version: configVersion, Endpoint: syncprotocol.DefaultEndpoint,
 		FallbackEndpoint: syncprotocol.DefaultFallbackEndpoint,
 	}
-	content, err := os.ReadFile(m.configPath)
-	if err == nil {
-		if err := json.Unmarshal(content, &m.config); err != nil {
-			return fmt.Errorf("解析远程同步配置失败: %w", err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("读取远程同步配置失败: %w", err)
+	defaultConfig := m.config
+	if _, err := loadRecoverablePrivateJSON(m.configPath, "远程同步配置", &m.config, defaultConfig); err != nil {
+		return err
 	}
 	if endpoint := strings.TrimSpace(os.Getenv("FUBAO_SYNC_ENDPOINT")); endpoint != "" {
 		m.config.Endpoint = endpoint
@@ -201,16 +197,13 @@ func (m *Manager) loadClientID() error {
 }
 
 func (m *Manager) loadOutbox() error {
-	content, err := os.ReadFile(m.outboxPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	payload := outboxFile{Version: configVersion}
+	loaded, err := loadRecoverablePrivateJSON(m.outboxPath, "远程同步队列", &payload, payload)
 	if err != nil {
-		return fmt.Errorf("读取远程同步队列失败: %w", err)
+		return err
 	}
-	var payload outboxFile
-	if err := json.Unmarshal(content, &payload); err != nil {
-		return fmt.Errorf("解析远程同步队列失败: %w", err)
+	if !loaded {
+		return nil
 	}
 	for _, item := range payload.Items {
 		if item.IdempotencyKey == "" || !json.Valid(item.Payload) {
@@ -978,7 +971,7 @@ func (m *Manager) saveConfigLocked() error {
 	if err != nil {
 		return err
 	}
-	return writePrivateFile(m.configPath, append(payload, '\n'))
+	return writePrivateJSONFile(m.configPath, append(payload, '\n'))
 }
 
 func (m *Manager) saveOutboxLocked() error {
@@ -986,7 +979,7 @@ func (m *Manager) saveOutboxLocked() error {
 	if err != nil {
 		return err
 	}
-	return writePrivateFile(m.outboxPath, append(payload, '\n'))
+	return writePrivateJSONFile(m.outboxPath, append(payload, '\n'))
 }
 
 func writePrivateFile(path string, content []byte) error {

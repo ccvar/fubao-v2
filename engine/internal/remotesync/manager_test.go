@@ -1,7 +1,9 @@
 package remotesync
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"net/http/httptest"
 	"os"
@@ -9,12 +11,121 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf16"
 
 	"fubao.ccvar.com/engine/internal/redpacket"
 	"fubao.ccvar.com/engine/internal/rooms"
 	"fubao.ccvar.com/engine/internal/syncprotocol"
 	"fubao.ccvar.com/engine/internal/syncserver"
 )
+
+func TestManagerRepairsNULPaddedRemoteSyncConfig(t *testing.T) {
+	dataDir := t.TempDir()
+	path := filepath.Join(dataDir, "remote_sync.json")
+	valid := []byte(`{"version":1,"enabled":true,"endpoint":"https://fbv2.ccvar.com/api/v1","fallback_endpoint":"https://fbv2.ccvar.com:8087/api/v1","device_token":"windows-device-token","device_access":"full"}`)
+	corrupted := append([]byte{0, 0}, valid...)
+	corrupted = append(corrupted, 0, 0)
+	if err := os.WriteFile(path, corrupted, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("NUL-padded remote config must recover: %v", err)
+	}
+	status := manager.Status()
+	if !status.Configured || !status.Enabled || status.TokenMasked != "wind…oken" {
+		t.Fatalf("recovered remote config was not retained: %+v", status)
+	}
+	repaired, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(repaired) || bytes.Contains(repaired, []byte{0}) {
+		t.Fatalf("canonical remote config was not rewritten as clean JSON: %q", repaired)
+	}
+	corruptFiles, err := filepath.Glob(path + ".corrupt-*")
+	if err != nil || len(corruptFiles) != 1 {
+		t.Fatalf("damaged remote config must be retained, files=%v err=%v", corruptFiles, err)
+	}
+}
+
+func TestManagerRepairsUTF16RemoteSyncConfig(t *testing.T) {
+	dataDir := t.TempDir()
+	path := filepath.Join(dataDir, "remote_sync.json")
+	text := `{"version":1,"enabled":true,"endpoint":"https://fbv2.ccvar.com/api/v1","device_token":"utf16-device-token","device_access":"full"}`
+	words := utf16.Encode([]rune(text))
+	encoded := []byte{0xFF, 0xFE}
+	for _, word := range words {
+		pair := make([]byte, 2)
+		binary.LittleEndian.PutUint16(pair, word)
+		encoded = append(encoded, pair...)
+	}
+	if err := os.WriteFile(path, encoded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("UTF-16 remote config must recover: %v", err)
+	}
+	status := manager.Status()
+	if !status.Configured || !status.Enabled || status.TokenMasked != "utf1…oken" {
+		t.Fatalf("UTF-16 remote config was not retained: %+v", status)
+	}
+	repaired, err := os.ReadFile(path)
+	if err != nil || !json.Valid(repaired) || bytes.Contains(repaired, []byte{0}) {
+		t.Fatalf("UTF-16 remote config was not normalized: %q err=%v", repaired, err)
+	}
+}
+
+func TestManagerQuarantinesUnrecoverableRemoteSyncConfig(t *testing.T) {
+	dataDir := t.TempDir()
+	path := filepath.Join(dataDir, "remote_sync.json")
+	if err := os.WriteFile(path, []byte{0, 0, 0, 0}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("unrecoverable optional remote config must not disable settings: %v", err)
+	}
+	status := manager.Status()
+	if status.Configured || status.Enabled {
+		t.Fatalf("rebuilt remote config must require explicit enrollment: %+v", status)
+	}
+	rebuilt, err := os.ReadFile(path)
+	if err != nil || !json.Valid(rebuilt) {
+		t.Fatalf("rebuilt remote config is invalid: %q err=%v", rebuilt, err)
+	}
+	corruptFiles, err := filepath.Glob(path + ".corrupt-*")
+	if err != nil || len(corruptFiles) != 1 {
+		t.Fatalf("unrecoverable remote config must be retained, files=%v err=%v", corruptFiles, err)
+	}
+}
+
+func TestManagerRepairsNULPaddedRemoteSyncOutbox(t *testing.T) {
+	dataDir := t.TempDir()
+	path := filepath.Join(dataDir, "remote_sync_outbox.json")
+	payload := []byte(`{"version":1,"items":[{"type":"red_packet","idempotency_key":"red_packet:1:2","occurred_at":"2026-08-08T00:00:00Z","payload":{"web_rid":"1","packet_id":"2","detected_at":"2026-08-08T00:00:00Z"}}]}`)
+	corrupted := append([]byte{0}, payload...)
+	corrupted = append(corrupted, 0)
+	if err := os.WriteFile(path, corrupted, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatalf("NUL-padded outbox must recover: %v", err)
+	}
+	if manager.Status().Pending != 1 {
+		t.Fatalf("recovered outbox item was lost: %+v", manager.Status())
+	}
+	repaired, err := os.ReadFile(path)
+	if err != nil || !json.Valid(repaired) || bytes.Contains(repaired, []byte{0}) {
+		t.Fatalf("remote outbox was not normalized: %q err=%v", repaired, err)
+	}
+}
 
 func TestSnapshotOutboxContainsOnlySafeRoomAndPacketData(t *testing.T) {
 	dataDir := t.TempDir()
