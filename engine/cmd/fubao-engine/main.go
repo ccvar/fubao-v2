@@ -85,6 +85,11 @@ func main() {
 	}
 	if redPacketStoreErr == nil && accountStoreErr == nil {
 		redPacketStore.SetRequestRecorder(accountStore.RecordMonitoringRequest)
+		redPacketStore.SetCooldownRecorder(accountStore.RecordMonitoringCooldown)
+		// A monitoring back-off belongs to the account pool that created it and
+		// cannot survive an engine restart, so a persisted window from the last
+		// session would only show a countdown nothing is enforcing.
+		_ = accountStore.ClearAllMonitoringCooldowns()
 		// A native Douyin page context cannot survive a real client/engine
 		// restart. Close stale tasks immediately so the frontend never reports
 		// a historical Active flag as a currently running participation task.
@@ -541,6 +546,22 @@ func main() {
 				ID:      req.ID,
 				OK:      true,
 				Result:  result,
+			})
+		case "account.clear_risk_cooldowns":
+			if accountStoreErr != nil {
+				writeError(encoder, req.ID, "account_store_unavailable", accountStoreErr.Error())
+				continue
+			}
+			n, err := accountStore.ClearAllParticipationRiskCooldowns()
+			if err != nil {
+				writeError(encoder, req.ID, "account_clear_risk_failed", err.Error())
+				continue
+			}
+			_ = encoder.Encode(response{
+				Version: protocolVersion,
+				ID:      req.ID,
+				OK:      true,
+				Result:  map[string]any{"cleared": n},
 			})
 		case "account.set_red_packet_api_enabled":
 			if accountStoreErr != nil {
@@ -1506,6 +1527,12 @@ func main() {
 				continue
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.ParticipationRecords()})
+		case "red_packet_participation.task_runs":
+			if redPacketStoreErr != nil {
+				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
+				continue
+			}
+			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: redPacketStore.ParticipationTaskRuns()})
 		case "red_packet_participation.logs":
 			if redPacketStoreErr != nil {
 				writeError(encoder, req.ID, "red_packet_store_unavailable", redPacketStoreErr.Error())
@@ -1887,6 +1914,11 @@ func main() {
 			if err != nil {
 				writeError(encoder, req.ID, "red_packet_stop_failed", err.Error())
 				continue
+			}
+			// The pool that owns those back-off windows is gone, so a persisted
+			// countdown would otherwise outlive it and keep showing 冷却中.
+			if accountStoreErr == nil {
+				_ = accountStore.ClearAllMonitoringCooldowns()
 			}
 			_ = encoder.Encode(response{Version: protocolVersion, ID: req.ID, OK: true, Result: map[string]int{"stopped": stopped}})
 		case "red_packet_monitor.start":

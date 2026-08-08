@@ -96,6 +96,9 @@ type fakePageParticipationExecutor struct {
 	requests []PageParticipationTask
 	response PageParticipationResponse
 	stopped  []string
+	// unreadyChecks makes the first N readiness probes report a page context
+	// that is still being rebuilt, as a remounting instance card does.
+	unreadyChecks int
 }
 
 func (e *fakePageParticipationExecutor) StopAccount(accountID string) {
@@ -109,30 +112,43 @@ type serialPageParticipationExecutor struct {
 	mu        sync.Mutex
 	active    int
 	maxActive int
-	started   chan struct{}
-	release   chan struct{}
+	tasks     []PageParticipationTask
+	// body overrides the default accepted-join payload so a test can keep the
+	// account out of the draw-result path.
+	body    string
+	started chan struct{}
+	release chan struct{}
 }
 
 func (e *serialPageParticipationExecutor) Ready(string) bool { return true }
 
-func (e *serialPageParticipationExecutor) Execute(context.Context, PageParticipationTask) PageParticipationResponse {
+func (e *serialPageParticipationExecutor) Execute(_ context.Context, task PageParticipationTask) PageParticipationResponse {
 	e.mu.Lock()
 	e.active++
 	if e.active > e.maxActive {
 		e.maxActive = e.active
 	}
+	e.tasks = append(e.tasks, task)
+	body := e.body
 	e.mu.Unlock()
 	e.started <- struct{}{}
 	<-e.release
 	e.mu.Lock()
 	e.active--
 	e.mu.Unlock()
-	return PageParticipationResponse{Endpoint: "join", HTTPStatus: 200, Body: `{"status_code":0,"data":{"succeed":true}}`, Attempts: 1}
+	if body == "" {
+		body = `{"status_code":0,"data":{"succeed":true}}`
+	}
+	return PageParticipationResponse{Endpoint: "join", HTTPStatus: 200, Body: body, Attempts: 1}
 }
 
 func (e *fakePageParticipationExecutor) Ready(string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.unreadyChecks > 0 {
+		e.unreadyChecks--
+		return false
+	}
 	return e.ready
 }
 
@@ -187,8 +203,8 @@ func TestParticipantUsesJoinOnlyWithoutRushFallback(t *testing.T) {
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if len(store.records) != 1 || store.records[0].status != "risk_control" || store.records[0].joined || store.records[0].cooldown < 60*time.Minute {
-		t.Fatalf("soft-deny join must become risk_control with settings cooldown: %+v", store.records)
+	if len(store.records) != 1 || store.records[0].status != "failed" || store.records[0].joined || store.records[0].cooldown > 0 {
+		t.Fatalf("soft-deny join must become failed without risk cooldown: %+v", store.records)
 	}
 }
 
@@ -767,6 +783,56 @@ func TestPageParticipantChallengeStopsNativeContextAndTask(t *testing.T) {
 	}
 }
 
+func TestPageParticipantSoftDenyIsFailedWithoutStoppingTask(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{RiskControlCooldownMinutes: 30}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationStarted("account-soft", "软拒绝账号"); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeParticipationStore{
+		credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-soft", AccountName: "软拒绝账号"}},
+		notify:      make(chan struct{}, 1),
+	}
+	executor := &fakePageParticipationExecutor{
+		ready: true,
+		response: PageParticipationResponse{
+			Endpoint: "join", HTTPStatus: 200,
+			Body: `{"status_code":0,"data":{"succeed":false,"hit_bonus":false,"can_rush_gem":false}}`, Attempts: 1,
+		},
+	}
+	participant := NewPageParticipant(store, executor, recordStore)
+	participant.HandleEvent(Event{
+		ID: "monitor:soft-event", WebRID: "7654321", ActualRoomID: "700001",
+		JoinBoxID: "7669047909329177395", Title: "钻石红包",
+	})
+	select {
+	case <-store.notify:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for soft-deny classification")
+	}
+
+	store.mu.Lock()
+	if len(store.records) != 1 || store.records[0].status != "failed" || store.records[0].joined || store.records[0].cooldown > 0 {
+		t.Fatalf("soft-deny must be failed without cooldown: %+v", store.records)
+	}
+	store.mu.Unlock()
+	executor.mu.Lock()
+	stopped := append([]string(nil), executor.stopped...)
+	executor.mu.Unlock()
+	if len(stopped) != 0 {
+		t.Fatalf("soft-deny must not stop native account context: %+v", stopped)
+	}
+	state := recordStore.GetParticipationState("account-soft", time.Now())
+	if !state.Active {
+		t.Fatalf("soft-deny must keep participation task active: %+v", state)
+	}
+}
+
 func TestPageParticipantRiskControlStopsNativeContextAndTask(t *testing.T) {
 	recordStore, err := NewStore(t.TempDir())
 	if err != nil {
@@ -786,7 +852,7 @@ func TestPageParticipantRiskControlStopsNativeContextAndTask(t *testing.T) {
 		ready: true,
 		response: PageParticipationResponse{
 			Endpoint: "join", HTTPStatus: 200,
-			Body: `{"status_code":0,"data":{"succeed":false,"hit_bonus":false,"can_rush_gem":false}}`, Attempts: 1,
+			Body: `{"status_code":0,"data":{"rush_spam":true},"status_msg":"操作频繁"}`, Attempts: 1,
 		},
 	}
 	participant := NewPageParticipant(store, executor, recordStore)
@@ -801,8 +867,8 @@ func TestPageParticipantRiskControlStopsNativeContextAndTask(t *testing.T) {
 	}
 
 	store.mu.Lock()
-	if len(store.records) != 1 || store.records[0].status != "risk_control" || store.records[0].joined || store.records[0].cooldown < 30*time.Minute {
-		t.Fatalf("soft-deny must cool the account: %+v", store.records)
+	if len(store.records) != 1 || store.records[0].status != "risk_control" || store.records[0].joined {
+		t.Fatalf("rush_spam must become risk_control: %+v", store.records)
 	}
 	store.mu.Unlock()
 	executor.mu.Lock()
@@ -820,8 +886,8 @@ func TestPageParticipantRiskControlStopsNativeContextAndTask(t *testing.T) {
 		t.Fatalf("risk-control task must finish early: %+v", state)
 	}
 	task := recordStore.participationTasks["account-risk"]
-	if task == nil || !strings.Contains(task.EndReason, "风控") {
-		t.Fatalf("task end reason should mention risk control: %+v", task)
+	if task == nil || strings.TrimSpace(task.EndReason) == "" {
+		t.Fatalf("task end reason should be set after risk control: %+v", task)
 	}
 }
 
@@ -938,6 +1004,73 @@ func TestPageParticipantSerializesTasksPerAccount(t *testing.T) {
 	}
 }
 
+// A packet admitted while still open can expire before the account's serialized
+// slot frees up. Sending that join only earns a soft-deny and a misleading
+// 参与失败 row, so the queued task must be dropped without a request.
+func TestPageParticipantSkipsJoinWhoseWindowClosedWhileQueued(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{ParticipationCountdownSeconds: 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationStarted("account-window", "窗口账号"); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeParticipationStore{
+		credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-window", AccountName: "窗口账号"}},
+		notify:      make(chan struct{}, 2),
+	}
+	executor := &serialPageParticipationExecutor{
+		// A bare soft-deny keeps the account out of the draw-result path, so the
+		// only thing that can reach the executor again is the queued join.
+		body:    `{"status_code":0,"data":{"succeed":false}}`,
+		started: make(chan struct{}, 2),
+		release: make(chan struct{}, 2),
+	}
+	participant := NewPageParticipant(store, executor, recordStore)
+	participant.HandleEvent(Event{
+		ID: "window-open", PacketID: "window-open", JoinBoxID: "7669047909329177395",
+		WebRID: "7654321", ActualRoomID: "700001", Title: "钻石红包", Prize: "总25钻，5份红包",
+		ExpiresAt: time.Now().Add(5 * time.Second).Format(time.RFC3339Nano),
+	})
+	select {
+	case <-executor.started:
+	case <-time.After(time.Second):
+		t.Fatal("first packet did not reach the page executor")
+	}
+	participant.HandleEvent(Event{
+		ID: "window-closing", PacketID: "window-closing", JoinBoxID: "7669047909329177396",
+		WebRID: "7654322", ActualRoomID: "700002", Title: "钻石红包", Prize: "总25钻，5份红包",
+		ExpiresAt: time.Now().Add(200 * time.Millisecond).Format(time.RFC3339Nano),
+	})
+	// Let the second packet's draw window close while it waits behind the first.
+	time.Sleep(350 * time.Millisecond)
+	executor.release <- struct{}{}
+	select {
+	case <-store.notify:
+	case <-time.After(time.Second):
+		t.Fatal("first packet never produced a result")
+	}
+	select {
+	case <-executor.started:
+	case <-time.After(150 * time.Millisecond):
+	}
+	executor.mu.Lock()
+	tasks := append([]PageParticipationTask(nil), executor.tasks...)
+	executor.mu.Unlock()
+	for _, task := range tasks {
+		if task.EventID == "window-closing" {
+			t.Fatalf("expired packet was still sent to the page executor: %+v", task)
+		}
+	}
+	records := recordStore.ParticipationRecords()
+	if len(records) != 1 || records[0].EventID != "window-open" {
+		t.Fatalf("expired packet must not leave a participation record: %+v", records)
+	}
+}
+
 func TestPageParticipantAutoFinishesLimitedTaskAndNextStartIsFresh(t *testing.T) {
 	recordStore, err := NewStore(t.TempDir())
 	if err != nil {
@@ -1005,8 +1138,8 @@ func TestParticipantResponseClassification(t *testing.T) {
 	}{
 		{name: "success", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":true}}`), status: "joined", joined: true},
 		{name: "immediate diamond win", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":true,"diamond_count":1,"hit_bonus":false}}`), status: "won", joined: true},
-		{name: "soft deny is risk control", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":false,"hit_bonus":false,"can_rush_gem":false}}`), status: "risk_control"},
-		{name: "rush zero flags still soft deny", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":false,"rush_spam":0,"rush_too_much":0,"rush_too_often":0,"expired":false}}`), status: "risk_control"},
+		{name: "soft deny is failed", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":false,"hit_bonus":false,"can_rush_gem":false}}`), status: "failed"},
+		{name: "rush zero flags still soft deny", response: jsonResponse(200, `{"status_code":0,"data":{"succeed":false,"rush_spam":0,"rush_too_much":0,"rush_too_often":0,"expired":false}}`), status: "failed"},
 		{name: "already joined", response: jsonResponse(200, `{"status_code":0,"data":{"rush_too_much":1}}`), status: "already_joined", joined: true},
 		{name: "expired overrides already", response: jsonResponse(200, `{"status_code":0,"data":{"rush_too_much":1,"expired":true}}`), status: "expired"},
 		{name: "risk", response: jsonResponse(200, `{"status_code":0,"data":{"rush_spam":true},"status_msg":"操作频繁"}`), status: "risk_control", cooldown: true},
@@ -1135,6 +1268,85 @@ func TestDrawResultTimeoutWithoutServiceResponseMarksError(t *testing.T) {
 	}
 	if allowed, _ := recordStore.ParticipationPolicy("account-timeout", time.Now()); !allowed {
 		t.Fatal("draw timeout must release the account for the next round")
+	}
+}
+
+func TestDrawQueryWaitsForPageContextInsteadOfConsumingAttempts(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{DrawResultDelaySeconds: 0, DrawResultMaxAttempts: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationStarted("account-context-wait", "上下文重建账号"); err != nil {
+		t.Fatal(err)
+	}
+	event := Event{
+		ID: "event-context-wait", WebRID: "123456", ActualRoomID: "700001", JoinBoxID: "7669063194534955828",
+		ExpiresAt: time.Now().Add(-100 * time.Millisecond).Format(time.RFC3339Nano),
+	}
+	if reserved, err := recordStore.ReserveParticipation(event, "account-context-wait", "上下文重建账号"); err != nil || !reserved {
+		t.Fatalf("reserve context-wait draw: %v %v", reserved, err)
+	}
+	if err := recordStore.CompleteParticipation(event.ID, "account-context-wait", "join", "joined", "等待开奖", 1, true, false, "", 0); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeParticipationStore{credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-context-wait"}}}
+	executor := &fakePageParticipationExecutor{
+		ready:         true,
+		unreadyChecks: 2,
+		response: PageParticipationResponse{
+			Endpoint: "receive", HTTPStatus: 200, Body: `{"status_code":0,"data":{"receive_info":[]}}`, Attempts: 1,
+		},
+	}
+	participant := NewPageParticipant(store, executor, recordStore)
+	participant.drawContextWait = 3 * time.Second
+	participant.resolveDraw(event, "account-context-wait", "上下文重建账号")
+	if len(executor.requests) != 1 {
+		t.Fatalf("a rebuilding page context must not consume the attempt budget: %+v", executor.requests)
+	}
+	records := recordStore.ParticipationRecords()
+	if len(records) != 1 || records[0].Status != "not_won" {
+		t.Fatalf("draw must resolve once the page context returns: %+v", records)
+	}
+}
+
+func TestDrawQueryReportsLostPageContextWithoutClaimingServiceSilence(t *testing.T) {
+	recordStore, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recordStore.SetParticipationSettings(ParticipationSettings{DrawResultDelaySeconds: 0, DrawResultMaxAttempts: 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := recordStore.RecordParticipationStarted("account-context-lost", "上下文丢失账号"); err != nil {
+		t.Fatal(err)
+	}
+	event := Event{
+		ID: "event-context-lost", WebRID: "123456", ActualRoomID: "700001", JoinBoxID: "7669063194534955828",
+		ExpiresAt: time.Now().Add(-100 * time.Millisecond).Format(time.RFC3339Nano),
+	}
+	if reserved, err := recordStore.ReserveParticipation(event, "account-context-lost", "上下文丢失账号"); err != nil || !reserved {
+		t.Fatalf("reserve context-lost draw: %v %v", reserved, err)
+	}
+	if err := recordStore.CompleteParticipation(event.ID, "account-context-lost", "join", "joined", "等待开奖", 1, true, false, "", 0); err != nil {
+		t.Fatal(err)
+	}
+	store := &fakeParticipationStore{credentials: []accounts.RedPacketParticipationCredential{{AccountID: "account-context-lost"}}}
+	executor := &fakePageParticipationExecutor{ready: false}
+	participant := NewPageParticipant(store, executor, recordStore)
+	participant.drawContextWait = time.Second
+	participant.resolveDraw(event, "account-context-lost", "上下文丢失账号")
+	if len(executor.requests) != 0 {
+		t.Fatalf("no receive request can be sent without a page context: %+v", executor.requests)
+	}
+	records := recordStore.ParticipationRecords()
+	if len(records) != 1 || records[0].Status != "draw_error" || !strings.Contains(records[0].Message, "页面上下文中断") {
+		t.Fatalf("a lost page context must not be reported as an unanswered interface: %+v", records)
+	}
+	if allowed, _ := recordStore.ParticipationPolicy("account-context-lost", time.Now()); !allowed {
+		t.Fatal("a lost page context must still release the account for the next round")
 	}
 }
 

@@ -37,8 +37,17 @@ const (
 	// Includes native live-room navigation + page join script. Too short a
 	// budget made healthy joins look like "页面超时" when room switches were slow.
 	defaultPageParticipationTimeout = 45 * time.Second
-	defaultDrawResultRequestTimeout = defaultPageParticipationTimeout
+	// A draw query only reads a personal result; unlike join it never needs the
+	// full room-navigation budget. Three 45s attempts kept an account's single
+	// unresolved slot blocked for over two minutes whenever its page context was
+	// being rebuilt, and every one of those attempts was already hopeless.
+	defaultDrawResultRequestTimeout = 20 * time.Second
 	defaultDrawResultRetryInterval  = time.Second
+	// Waiting for a page context to come back is not a query attempt. Poll for
+	// it separately so a card that is remounting cannot silently consume the
+	// whole attempt budget without sending a single request.
+	defaultDrawContextWaitBudget   = 45 * time.Second
+	defaultDrawContextPollInterval = 750 * time.Millisecond
 )
 
 // ParticipationStore is the private account-store surface used by the
@@ -94,6 +103,12 @@ type participationAccountStopper interface {
 	StopAccount(accountID string)
 }
 
+// participationConditionStore records a participation threshold that only the
+// rejected join response revealed, so the packet is skipped from then on.
+type participationConditionStore interface {
+	RecordEventCondition(eventID, condition string) error
+}
+
 type participationDrawAccountStore interface {
 	RecordRedPacketDrawResult(accountID, message string, won bool)
 }
@@ -106,6 +121,7 @@ type participationWalletRecordStore interface {
 	RecordParticipationWalletBaseline(eventID, accountID string, diamond int64) error
 	ParticipationWalletBaseline(eventID, accountID string) (int64, bool)
 	RecordParticipationWalletResult(eventID, accountID string, after, delta int64, source string) error
+	AnnotateFailedWithWalletWin(eventID, accountID, award string, delta int64) (bool, error)
 }
 
 type participationRetryStore interface {
@@ -191,6 +207,7 @@ type Participant struct {
 	sem                 chan struct{}
 	retryDelay          time.Duration
 	followPriorityDelay time.Duration
+	drawContextWait     time.Duration
 	followMatcher       ParticipationFollowMatcher
 
 	mu        sync.Mutex
@@ -203,6 +220,7 @@ type Participant struct {
 type participationResult struct {
 	status        string
 	message       string
+	condition     string
 	joined        bool
 	won           bool
 	award         string
@@ -243,6 +261,7 @@ func newParticipant(store ParticipationStore, concurrency int, factory participa
 		sem:                 make(chan struct{}, concurrency),
 		retryDelay:          250 * time.Millisecond,
 		followPriorityDelay: 2 * time.Second,
+		drawContextWait:     defaultDrawContextWaitBudget,
 		attempted:           map[string]struct{}{},
 		delayed:             map[string]struct{}{},
 		accounts:            map[string]*sync.Mutex{},
@@ -322,6 +341,12 @@ func followDecisionAllows(decision participationFollowDecision) bool {
 func (p *Participant) scheduleDispatch(event Event, credential accounts.RedPacketParticipationCredential, allowPriorityDelay bool) {
 	settings := p.settingsForAccount(credential.AccountID)
 	if !p.matchesPacketType(event, credential.AccountID) || !p.meetsMinimumDiamonds(event, credential.AccountID) {
+		return
+	}
+	// A packet gated behind a diamond cost or a fan-club badge cannot be won by
+	// a plain join: Douyin answers with a bare soft-deny. Skip it before any
+	// request so it produces no participation record and no task count.
+	if redPacketConditionSkipReason(event.Condition) != "" {
 		return
 	}
 	now := time.Now()
@@ -652,6 +677,20 @@ func (p *Participant) run(event Event, credential accounts.RedPacketParticipatio
 		event = enricher.EnrichParticipationEvent(event)
 	}
 
+	// The account lock, the bounded worker slot, the wallet baseline and the
+	// anchor enrichment above all sit between the admission decision and the
+	// request, and the native page still has to navigate and confirm login. With
+	// a short countdown window that queue time alone can push the join past the
+	// draw deadline, where it can only earn a soft-deny. Re-read the deadline and
+	// release the reservation instead of spending a request.
+	if deadline, ok := eventDeadline(event); ok && !time.Now().Before(deadline) {
+		if cancellationStore, ok := p.recordStore.(participationCancellationStore); ok {
+			_ = cancellationStore.CancelParticipation(event.ID, credential.AccountID)
+		}
+		p.forget(key)
+		return
+	}
+
 	result := p.attempt(event, credential, decision)
 	if result.joined && result.cooldown <= 0 {
 		if policy, ok := p.recordStore.(participationPolicyStore); ok {
@@ -674,6 +713,11 @@ func (p *Participant) run(event Event, credential accounts.RedPacketParticipatio
 			event.ID, credential.AccountID, result.endpoint, result.status, result.message,
 			result.attempts, result.joined, result.won, result.award, result.cooldown,
 		)
+	}
+	if result.condition != "" {
+		if conditionStore, ok := p.recordStore.(participationConditionStore); ok {
+			_ = conditionStore.RecordEventCondition(event.ID, result.condition)
+		}
 	}
 	p.store.RecordRedPacketParticipation(
 		credential.AccountID,
@@ -710,7 +754,39 @@ func (p *Participant) run(event Event, credential accounts.RedPacketParticipatio
 	if result.won {
 		p.captureWalletResult(event, credential.AccountID)
 	}
+	// Soft-deny (status=failed) still may credit diamonds: API returned
+	// succeed=false while the account actually entered the draw pool. Reconcile
+	// with delayed wallet reads and annotate "参与失败 · 已中N钻".
+	if result.status == "failed" && !result.joined && !result.won {
+		p.reconcileFailedJoinWithWallet(event, credential.AccountID)
+	}
 	p.finishTaskIfComplete(credential.AccountID)
+}
+
+// reconcileFailedJoinWithWallet probes diamond balance after soft-deny join.
+// Positive delta annotates the failed row without flipping it to status=won.
+func (p *Participant) reconcileFailedJoinWithWallet(event Event, accountID string) {
+	win, ok := p.confirmWalletWinWithRetries(event, accountID, 4, 1500*time.Millisecond)
+	if !ok || win.award == "" {
+		// Still persist a post-join wallet snapshot when baseline exists.
+		_, _ = p.captureWalletResult(event, accountID)
+		return
+	}
+	delta := int64(0)
+	if strings.HasSuffix(win.award, "钻") {
+		fmt.Sscanf(strings.TrimSuffix(win.award, "钻"), "%d", &delta)
+	}
+	records, recordsOK := p.recordStore.(participationWalletRecordStore)
+	if !recordsOK {
+		return
+	}
+	newWin, err := records.AnnotateFailedWithWalletWin(event.ID, accountID, win.award, delta)
+	if err != nil || !newWin {
+		return
+	}
+	if accountStore, ok := p.store.(participationDrawAccountStore); ok {
+		accountStore.RecordRedPacketDrawResult(accountID, win.message, true)
+	}
 }
 
 // ResolvePendingDraws resumes accepted records whenever an account page
@@ -769,13 +845,11 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 	attempts := 0
 	serviceReached := false
 	walletFallbackAllowed := true
+	contextLost := false
 	for attempts < maxAttempts {
-		if !p.pageExecutor.Ready(accountID) {
-			attempts++
-			if attempts < maxAttempts {
-				time.Sleep(defaultDrawResultRetryInterval)
-			}
-			continue
+		if !p.awaitPageContext(accountID) {
+			contextLost = true
+			break
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), defaultDrawResultRequestTimeout)
 		task := PageParticipationTask{
@@ -898,6 +972,11 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 	}
 
 	message := fmt.Sprintf("开奖查询失败：已尝试 %d 次，接口未返回", attempts)
+	if contextLost {
+		// Distinguish a page context that disappeared from Douyin refusing to
+		// answer: nothing was ever sent, so "接口未返回" would be wrong.
+		message = "开奖查询失败：直播页面上下文中断，未发出开奖请求"
+	}
 	if traceStore, ok := p.recordStore.(participationTraceStore); ok {
 		_ = traceStore.RecordParticipationTrace(PageParticipationTask{
 			Action: "receive_timeout", EventID: event.ID, AccountID: accountID, AccountName: accountName,
@@ -907,6 +986,30 @@ func (p *Participant) resolveDraw(event Event, accountID, accountName string) {
 	if _, err := drawStore.ResolveParticipationDraw(event.ID, accountID, "draw_error", message, "", attempts); err == nil {
 		p.retryCurrentEventsForAccount(accountID)
 		p.finishTaskIfComplete(accountID)
+	}
+}
+
+// awaitPageContext blocks until the account's native page context can serve a
+// request again, reporting false once the wait budget expires. A card that is
+// remounting recovers within seconds, so waiting here keeps the bounded attempt
+// budget for real Douyin responses.
+func (p *Participant) awaitPageContext(accountID string) bool {
+	if p.pageExecutor == nil {
+		return false
+	}
+	budget := p.drawContextWait
+	if budget <= 0 {
+		budget = defaultDrawContextWaitBudget
+	}
+	deadline := time.Now().Add(budget)
+	for {
+		if p.pageExecutor.Ready(accountID) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(defaultDrawContextPollInterval)
 	}
 }
 
@@ -988,6 +1091,32 @@ func minDuration(first, second time.Duration) time.Duration {
 		return first
 	}
 	return second
+}
+
+func parseAwardDiamondCount(award string) int64 {
+	award = strings.TrimSpace(award)
+	if award == "" {
+		return 0
+	}
+	// "2钻" / "已中2钻（钱包增量确认）"
+	digits := make([]rune, 0, 8)
+	for _, r := range award {
+		if r >= '0' && r <= '9' {
+			digits = append(digits, r)
+			continue
+		}
+		if len(digits) > 0 {
+			break
+		}
+	}
+	if len(digits) == 0 {
+		return 0
+	}
+	var n int64
+	for _, r := range digits {
+		n = n*10 + int64(r-'0')
+	}
+	return n
 }
 
 func (p *Participant) finishTaskIfComplete(accountID string) {
@@ -1458,18 +1587,27 @@ func classifyParticipationResponse(response *http.Response, requestErr error, en
 		return participationResult{status: "joined", message: firstNonEmpty(message, "红包参与请求已受理"), joined: true, terminal: true}
 	}
 	_ = endpoints
-	// Soft-deny (status_code=0 with succeed=false / hit_bonus=false) is the most
-	// common non-joined shape. Prefer an explicit message so participation
-	// records do not look like a transport failure.
+	// A packet gated behind a diamond cost or a fan-club badge answers with the
+	// requirement instead of a plain rejection. Only the human-readable message
+	// is inspected: raw payload keys such as gift_name carry the same words
+	// without describing a threshold.
+	if condition := redPacketConditionFromMessage(message); condition != "" {
+		return participationResult{
+			status:    "failed",
+			message:   firstNonEmpty(redPacketConditionSkipReason(condition), message),
+			condition: condition,
+			terminal:  true,
+		}
+	}
+	// Soft-deny (status_code=0 with succeed=false / hit_bonus=false).
+	// Product revision: bare soft-deny is "参与失败" only — do NOT enter risk
+	// cooldown or block the account. Explicit rush_spam / 操作频繁 above still cool.
 	if statusCode(payload) == 0 && data != nil {
 		if hasAnyKey(data, "succeed", "hit_bonus", "can_rush_gem") &&
 			!flagOn(data, "succeed", "succeeded", "joined", "has_joined", "hasJoined", "success", "is_success", "isSuccess") {
-			// Real Chrome captures with valid msToken/a_bogus still return this
-			// shape under risk pressure. Treat it as risk control so the account
-			// enters a configurable cooldown and stops taking new joins.
 			return participationResult{
-				status:   "risk_control",
-				message:  firstNonEmpty(message, "触发风控，账号已进入冷却"),
+				status:   "failed",
+				message:  firstNonEmpty(message, "参与失败"),
 				terminal: true,
 			}
 		}

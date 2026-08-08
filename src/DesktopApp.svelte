@@ -6,6 +6,7 @@
   import { check as checkUpdater, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
   import { tick, onMount } from "svelte";
   import ConfirmDialog from "./lib/ConfirmDialog.svelte";
+  import ParticipationRunGroup from "./lib/ParticipationRunGroup.svelte";
   import appIconUrl from "../src-tauri/icons/64x64.png";
   import {
     PulseIcon as Activity,
@@ -148,6 +149,9 @@
     last_error?: string;
     last_used_at?: string;
     last_use_status?: string;
+    last_use_message?: string;
+    monitor_cooldown_until?: string;
+    monitor_cooldown_reason?: string;
     total_request_count?: number;
     today_request_count?: number;
 	red_packet_api_enabled?: boolean;
@@ -391,6 +395,7 @@
     packet_id: string;
     title?: string;
     prize?: string;
+	condition?: string;
     source: string;
 	data_source?: string;
     detected_at: string;
@@ -404,6 +409,7 @@
     event_id: string;
     account_id: string;
     account_name: string;
+	task_id?: string;
     room_id?: string;
     web_rid?: string;
     room_name?: string;
@@ -425,6 +431,34 @@
 	cooldown_until?: string;
     created_at: string;
     updated_at: string;
+  };
+
+  type ParticipationTaskRun = {
+	id: string;
+	mode: string;
+	title?: string;
+	mode_label: string;
+	status: "running" | "completed" | "stopped" | "abnormal" | string;
+	account_count: number;
+	skipped_count?: number;
+	started_at: string;
+	ended_at?: string;
+	success_count: number;
+	failure_count: number;
+	win_count: number;
+	win_diamonds: number;
+	end_reason?: string;
+	task_ids: string[];
+  };
+
+  type ParticipationTaskRunGroup = {
+	key: string;
+	started_at: string;
+	runs: ParticipationTaskRun[];
+	task_count: number;
+	success_count: number;
+	win_count: number;
+	win_diamonds: number;
   };
 
   type ParticipationTrace = {
@@ -625,7 +659,9 @@
     auto_recycle_imported_no_packet_enabled: false,
   };
   let monitoringSettings: MonitoringSettings = {
-	global_request_interval_ms: 80,
+	// 0 = 自动：Go 引擎按可用监测账号数推导全局节奏。固定值会让整机吞吐
+	// 与账号数量脱钩，导入再多监测账号也不会更快。
+	global_request_interval_ms: 0,
 	account_request_interval_ms: 750,
 	global_concurrency: 32,
 	account_concurrency: 3,
@@ -709,6 +745,7 @@
   let browserCapacity: BrowserCapacity | null = null;
   let browserLoading = false;
   let browserStatusPolling = false;
+  let clearingRiskCooldowns = false;
   let browserCookieSyncing = false;
   let browserCookieCheckingIds: string[] = [];
   const browserCookieCheckedAt = new Map<string, number>();
@@ -737,6 +774,8 @@
   let browserWebviewMountedIds: string[] = [];
   let browserWebviewReleasingIds: string[] = [];
   const browserWebviewMountConcurrency = 2;
+  const browserRuntimeLeaseSyncedAt = new Map<string, number>();
+  const browserRuntimeLeaseIntervalMs = 5000;
   let browserWebviewErrors: Record<string, string> = {};
   let browserWebviewSyncFrame = 0;
   let browserViewSettled = false;
@@ -785,6 +824,8 @@
   let redPacketEventError = "";
   let redPacketRenderLimit = 300;
   let participationRecords: ParticipationRecord[] = [];
+	let participationTaskRuns: ParticipationTaskRun[] = [];
+	let selectedParticipationRunId = "";
   let participationRuntimeLogs: ParticipationTrace[] = [];
   let participationRecordsLoading = false;
   let participationRecordError = "";
@@ -975,6 +1016,12 @@
 	$: expiredParticipationAccountCount = participationAccounts.filter((account) => accountCookieStatus(account, "participation") === "expired").length;
 	$: expiredMonitoringAccountCount = monitoringAccounts.filter((account) => accountCookieStatus(account, "monitoring") === "expired").length;
 	$: riskCoolingParticipationAccountCount = participationAccounts.filter((account) => participationCooldownRemainingMs(account, redPacketClock) > 0).length;
+	$: coolingMonitoringAccountCount = monitoringAccounts.filter((account) => monitorCooldownRemainingMs(account, redPacketClock) > 0).length;
+	$: rateLimitedMonitoringAccountCount = monitoringAccounts.filter(
+		(account) =>
+			monitorCooldownRemainingMs(account, redPacketClock) > 0 &&
+			account.monitoring?.monitor_cooldown_reason === "rate_limited",
+	).length;
 	$: scopedRedPacketEvents = redPacketEvents.filter((event) => redPacketHistoryVisible
 		? !redPacketEventInLibraryWindow(event, redPacketClock)
 		: redPacketEventInLibraryWindow(event, redPacketClock));
@@ -982,7 +1029,7 @@
     const needle = query.trim().toLowerCase();
     const filtered = scopedRedPacketEvents.filter((event) => {
       if (!needle) return true;
-      return [event.title, event.prize, event.room_name, event.streamer_name, event.web_rid, event.room_id]
+      return [event.title, event.prize, event.condition, event.room_name, event.streamer_name, event.web_rid, event.room_id]
         .filter(Boolean)
         .some((value) => String(value).toLowerCase().includes(needle));
     });
@@ -997,7 +1044,11 @@
       .map(({ event }) => event);
   })();
   $: visibleRedPacketEvents = filteredRedPacketEvents.slice(0, redPacketRenderLimit);
+  $: selectedParticipationRun = participationTaskRuns.find((run) => run.id === selectedParticipationRunId);
+  $: participationTaskRunGroups = groupParticipationTaskRuns(participationTaskRuns);
+  $: selectedParticipationTaskIDs = new Set(selectedParticipationRun?.task_ids || []);
   $: filteredParticipationRecords = participationRecords.filter((record) => {
+	if (selectedParticipationRun && (!record.task_id || !selectedParticipationTaskIDs.has(record.task_id))) return false;
     const needle = query.trim().toLowerCase();
     if (!needle) return true;
     return [record.account_name, record.room_name, record.streamer_name, record.web_rid, record.room_id, record.title, record.prize, record.message]
@@ -1291,6 +1342,14 @@
 	accountStatusFilter = "cooldown";
   }
 
+  function showCoolingMonitoringAccounts() {
+	switchView("accounts");
+	// 监测账号 lives behind the collapsed 监测管理 group, so reuse the tab
+	// selector to expand it before applying the filter.
+	selectManagementTab("monitoring");
+	accountStatusFilter = "cooldown";
+  }
+
   function syncRecentActivityScrollbar() {
 	if (!recentActivityScroller) return;
 	recentActivityScrollTop = recentActivityScroller.scrollTop;
@@ -1527,13 +1586,21 @@
 	return Math.max(0, Math.min(maximum, Math.trunc(parsed)));
   }
 
+  // 全局请求间隔的 0 表示“自动”，由 Go 引擎按可用监测账号数推导，不是待钳制的
+  // 下限值；只有显式填写的正数才受安全下限约束。
+  function normalizedMonitorPace(value: number) {
+	const parsed = Number(value);
+	if (!Number.isFinite(parsed) || parsed <= 0) return 0;
+	return Math.max(5, Math.min(2000, Math.trunc(parsed)));
+  }
+
   async function saveParticipationSettings() {
 	if (participationSettingsBusy) return;
 	participationSettingsBusy = true;
 	participationSettingsError = "";
 	if (settingsTab === "monitoring") {
 		const nextMonitoringSettings = {
-			global_request_interval_ms: Math.max(40, Math.min(2000, normalizedParticipationSetting(monitoringSettings.global_request_interval_ms, 2000))),
+			global_request_interval_ms: normalizedMonitorPace(monitoringSettings.global_request_interval_ms),
 			account_request_interval_ms: Math.max(250, Math.min(5000, normalizedParticipationSetting(monitoringSettings.account_request_interval_ms, 5000))),
 			global_concurrency: Math.max(1, Math.min(512, normalizedParticipationSetting(monitoringSettings.global_concurrency, 512))),
 			account_concurrency: Math.max(1, Math.min(8, normalizedParticipationSetting(monitoringSettings.account_concurrency, 8))),
@@ -2153,6 +2220,21 @@
     return `CPU：${cpuCount} 核 × 1.5 = ${cpuLimit} · 内存：预留 ${formatFileSize(reserve)}，按 ${formatFileSize(capacity.estimated_per_instance_bytes)}/实例 = ${memoryLimit}\n取 CPU ${cpuLimit}、内存 ${memoryLimit}、自动上限 ${autoLimit} 的最小值，最终建议 ${capacity.recommended_limit}`;
   }
 
+  async function clearAllRiskCooldowns() {
+    if (clearingRiskCooldowns || !engineListenerReady) return;
+    clearingRiskCooldowns = true;
+    try {
+      const result = await engineRequest<{ cleared: number }>("account.clear_risk_cooldowns");
+      await loadAccounts(false);
+      const n = Math.max(0, result?.cleared ?? 0);
+      showToast(n > 0 ? `已清空 ${n} 个账号的风控冷却` : "当前没有处于风控冷却的账号");
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error));
+    } finally {
+      clearingRiskCooldowns = false;
+    }
+  }
+
   async function checkForAppUpdate(silent = false, openWhenAvailable = false) {
     if (!isTauriDesktop() || updateChecking) return;
     updateChecking = true;
@@ -2521,6 +2603,10 @@
     const seenAccounts = new Set<string>();
     const queue = instances.filter((instance) => {
       if (!instance.account_id || seenAccounts.has(instance.account_id)) return false;
+      // The page-based followed-live probe runs inside the same account WebView
+      // a participation task lives in, competing with join/receive for that
+      // document. Discovery can wait; the rush window cannot.
+      if (browserParticipationContextEnabled(instance.id)) return false;
       seenAccounts.add(instance.account_id);
       return true;
     });
@@ -2886,6 +2972,12 @@
     };
   }
 
+  function browserRuntimeLeaseIsStale(instance: BrowserInstance) {
+    if (instance.runtime_state !== "running") return true;
+    const syncedAt = browserRuntimeLeaseSyncedAt.get(instance.id) ?? 0;
+    return Date.now() - syncedAt >= browserRuntimeLeaseIntervalMs;
+  }
+
   function browserMountIsVisible(element: HTMLElement) {
     const bounds = embeddedBrowserBounds(element);
     return bounds.width >= 120 && bounds.height >= 90;
@@ -2960,6 +3052,7 @@
     }
     if (!mounted && !reserved) return;
     browserWebviewReleasingIds = [...browserWebviewReleasingIds, instance.id];
+    browserRuntimeLeaseSyncedAt.delete(instance.id);
     try {
       if (isTauriDesktop() && mounted) {
         await invoke("close_browser_webview", { instanceId: instance.id }).catch(() => undefined);
@@ -3012,6 +3105,7 @@
       const admission = await engineRequest<BrowserAdmission>("browser.runtime.acquire", {
         instance_id: instance.id,
       });
+      browserRuntimeLeaseSyncedAt.set(instance.id, Date.now());
       browserCapacity = admission.capacity;
       updateBrowserRuntimeState(instance.id, admission.state, admission.queue_position ?? 0);
       if (!admission.granted) {
@@ -3154,23 +3248,37 @@
           await mountEmbeddedBrowser(instance, element);
           return;
         }
-        try {
-          const admission = await engineRequest<BrowserAdmission>("browser.runtime.acquire", {
-            instance_id: instance.id,
-          });
-          if (browserLayoutChanging || expectedRevision !== browserLayoutRevision) return;
-          browserCapacity = admission.capacity;
-          updateBrowserRuntimeState(instance.id, admission.state, admission.queue_position ?? 0);
-          if (!admission.granted) {
-            await releaseEmbeddedBrowser({ ...instance, runtime_state: "running" });
-            return;
+        // Geometry sync runs on every scroll/resize/observer tick, but the Go
+        // lease only changes when capacity does. Re-acquiring per frame floods
+        // the engine's sequential RPC loop, and a request that then exceeds the
+        // frontend timeout used to be read as "the native surface died".
+        if (browserRuntimeLeaseIsStale(instance)) {
+          try {
+            const admission = await engineRequest<BrowserAdmission>("browser.runtime.acquire", {
+              instance_id: instance.id,
+            });
+            if (browserLayoutChanging || expectedRevision !== browserLayoutRevision) return;
+            browserRuntimeLeaseSyncedAt.set(instance.id, Date.now());
+            browserCapacity = admission.capacity;
+            updateBrowserRuntimeState(instance.id, admission.state, admission.queue_position ?? 0);
+            if (!admission.granted) {
+              await releaseEmbeddedBrowser({ ...instance, runtime_state: "running" });
+              return;
+            }
+          } catch {
+            // A slow or unavailable engine says nothing about the mounted
+            // WebView. Keep it and retry the lease on a later tick; never
+            // rebuild the page a participation task is running inside.
+            if (browserLayoutChanging || expectedRevision !== browserLayoutRevision) return;
           }
-          if (
-            browserLayoutChanging ||
-            expectedRevision !== browserLayoutRevision ||
-            !element.isConnected ||
-            !browserMountIsVisible(element)
-          ) return;
+        }
+        if (
+          browserLayoutChanging ||
+          expectedRevision !== browserLayoutRevision ||
+          !element.isConnected ||
+          !browserMountIsVisible(element)
+        ) return;
+        try {
           await invoke("sync_browser_webview", {
             instanceId: instance.id,
             bounds: embeddedBrowserBounds(element),
@@ -3183,7 +3291,12 @@
               !browserWebviewErrors[instance.id],
           });
         } catch {
+          // Only Rust rejecting the geometry command proves the child WebView
+          // is gone, and even then a live participation context must keep its
+          // page: rebuilding it destroys the signed-request template the task
+          // depends on.
           if (browserLayoutChanging || expectedRevision !== browserLayoutRevision) return;
+          if (browserParticipationContextEnabled(instance.id)) return;
           browserWebviewMountedIds = browserWebviewMountedIds.filter((id) => id !== instance.id);
           await mountEmbeddedBrowser(instance, element);
         }
@@ -3356,21 +3469,53 @@
 	return `${minutes}:${String(seconds).padStart(2, "0")}`;
   }
 
+  // The monitoring account pool backs an account off after Douyin rate-limits
+  // (444/429), rejects (401/403) or repeatedly fails on it. That window is
+  // persisted by Go; without surfacing it a throttled account keeps rendering
+  // 可用 while it silently stops issuing any request.
+  function monitorCooldownRemainingMs(account?: AccountItem, clock = Date.now()) {
+	const until = account?.monitoring?.monitor_cooldown_until;
+	if (!until) return 0;
+	const cooldownUntil = new Date(until).getTime();
+	if (Number.isNaN(cooldownUntil) || cooldownUntil <= clock) return 0;
+	return cooldownUntil - clock;
+  }
+
+  // A rate-limit back-off means "本机整体太快了"，而鉴权拒绝指向这一个账号的会话，
+  // 两者的处理方式完全不同，所以徽标文案要能分辨。
+  function monitorCooldownLabel(account?: AccountItem) {
+	switch (account?.monitoring?.monitor_cooldown_reason) {
+		case "rate_limited":
+			return "限流冷却";
+		case "auth":
+			return "鉴权冷却";
+		case "network":
+			return "网络冷却";
+		default:
+			return "冷却中";
+	}
+  }
+
   function accountStatus(account: AccountItem, clock = Date.now()) {
     const profile = accountRole === "monitoring" ? account.monitoring : account.participation;
     if (accountCookieStatus(account, accountRole) === "expired") return "CK 失效";
 	if (accountRole === "participation" && participationChallengeBlocked(account)) return "拦截";
 	if (accountRole === "participation" && participationCooldownRemainingMs(account, clock) > 0) return "冷却中";
-    if (!profile?.enabled || profile.last_error || /冷却|等待|cooldown/i.test(profile.last_use_status || "")) return "冷却中";
+	if (accountRole === "monitoring" && monitorCooldownRemainingMs(account, clock) > 0) return "冷却中";
+    if (!profile?.enabled || profile.last_error) return "冷却中";
     return "可用";
   }
 
   function accountStatusLabel(account: AccountItem, clock = Date.now()) {
 	const status = accountStatus(account, clock);
-	if (status === "冷却中" && accountRole === "participation") {
+	if (status !== "冷却中") return status;
+	if (accountRole === "participation") {
 		const remaining = participationCooldownRemainingMs(account, clock);
 		if (remaining > 0) return `冷却中 ${formatCooldownCountdown(remaining)}`;
+		return status;
 	}
+	const remaining = monitorCooldownRemainingMs(account, clock);
+	if (remaining > 0) return `${monitorCooldownLabel(account)} ${formatCooldownCountdown(remaining)}`;
 	return status;
   }
 
@@ -3395,6 +3540,13 @@
 		if (remaining > 0) {
 			return account.participation?.last_red_packet_message ||
 				`账号冷却中，约 ${formatCooldownCountdown(remaining)} 后可再次参与`;
+		}
+	}
+	if (role === "monitoring") {
+		const remaining = monitorCooldownRemainingMs(account, Date.now());
+		if (remaining > 0) {
+			const reason = account.monitoring?.last_use_message || monitorCooldownLabel(account);
+			return `${reason}，约 ${formatCooldownCountdown(remaining)} 后自动恢复。CK 仍然有效，无需重新绑定`;
 		}
 	}
 	return accountCookieMessage(account, role);
@@ -4457,7 +4609,8 @@
 		for (const event of next.filter((item) => !previousIDs.has(item.id)).reverse()) {
 		  const accountLabel = event.account_name || event.account_id || "未分配监测账号";
 		  const roomLabel = event.room_name || event.streamer_name || `直播间 ${event.web_rid || event.room_id}`;
-		  appendMonitorLog(`监测账号「${accountLabel}」在直播间「${roomLabel}」发现红包「${event.title || event.packet_id}」；奖品：${event.prize || "待解析"}；${redPacketEventExpiry(event)}`, "success");
+		  const conditionLabel = event.condition ? `；参与门槛：${event.condition}（不参与）` : "";
+		  appendMonitorLog(`监测账号「${accountLabel}」在直播间「${roomLabel}」发现红包「${event.title || event.packet_id}」；奖品：${event.prize || "待解析"}${conditionLabel}；${redPacketEventExpiry(event)}`, "success");
 		}
 	  }
 	  redPacketEvents = next;
@@ -4474,7 +4627,15 @@
     participationRecordsLoading = true;
     participationRecordError = "";
     try {
-      participationRecords = await engineRequest<ParticipationRecord[]>("red_packet_participation.list");
+	  const [records, taskRuns] = await Promise.all([
+		engineRequest<ParticipationRecord[]>("red_packet_participation.list"),
+		engineRequest<ParticipationTaskRun[]>("red_packet_participation.task_runs"),
+	  ]);
+	  participationRecords = records;
+	  participationTaskRuns = taskRuns;
+	  if (selectedParticipationRunId && !taskRuns.some((run) => run.id === selectedParticipationRunId)) {
+		selectedParticipationRunId = "";
+	  }
     } catch (error) {
       participationRecordError = error instanceof Error ? error.message : String(error);
     } finally {
@@ -4491,6 +4652,13 @@
     if (record.status === "already_joined") return { label: "已参与", tone: "success" };
     if (record.status === "challenge_blocked") return { label: "验证拦截", tone: "warning" };
     if (record.status === "risk_control") return { label: "风控冷却", tone: "warning" };
+    if (record.status === "failed") {
+      if (record.won || record.award) {
+        const award = String(record.award || "").trim();
+        return { label: award ? `参与失败 · 已中${award}` : "参与失败 · 已中奖", tone: "success" };
+      }
+      return { label: "参与失败", tone: "error" };
+    }
     if (record.status === "login_expired") return { label: "CK 失效", tone: "error" };
     if (record.status === "network_error") {
       // Page-context timeouts were previously labeled as generic network errors
@@ -4519,6 +4687,53 @@
     return Number.isFinite(timestamp)
       ? new Date(timestamp).toLocaleString("zh-CN", { hour12: false })
       : record.updated_at;
+  }
+
+  function participationRunName(run: ParticipationTaskRun) {
+	if (run.mode === "manual" || (!run.mode && run.account_count === 1)) {
+	  return run.title || "单账号启动";
+	}
+	return run.mode_label || run.title || "红包参与任务";
+  }
+
+  function participationRunDateKey(value?: string) {
+	const timestamp = Date.parse(value || "");
+	if (!Number.isFinite(timestamp)) return "unknown";
+	const date = new Date(timestamp);
+	return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+  }
+
+  function groupParticipationTaskRuns(runs: ParticipationTaskRun[]) {
+	const groups = new Map<string, ParticipationTaskRunGroup>();
+	for (const run of runs) {
+	  const key = participationRunDateKey(run.started_at);
+	  const current = groups.get(key) || {
+		key,
+		started_at: run.started_at,
+		runs: [],
+		task_count: 0,
+		success_count: 0,
+		win_count: 0,
+		win_diamonds: 0,
+	  };
+	  current.runs.push(run);
+	  current.task_count += 1;
+	  current.success_count += Math.max(0, Number(run.success_count) || 0);
+	  current.win_count += Math.max(0, Number(run.win_count) || 0);
+	  current.win_diamonds += Math.max(0, Number(run.win_diamonds) || 0);
+	  if (Date.parse(run.started_at) > Date.parse(current.started_at)) current.started_at = run.started_at;
+	  groups.set(key, current);
+	}
+	return [...groups.values()]
+	  .map((group) => ({
+		...group,
+		runs: group.runs.slice().sort((left, right) => Date.parse(right.started_at) - Date.parse(left.started_at)),
+	  }))
+	  .sort((left, right) => Date.parse(right.started_at) - Date.parse(left.started_at));
+  }
+
+  function selectParticipationRun(runID: string) {
+	selectedParticipationRunId = selectedParticipationRunId === runID ? "" : runID;
   }
 
   async function toggleRoomRedPacketMonitor(monitor: RedPacketMonitor) {
@@ -6007,6 +6222,18 @@
           <strong class="quick-value">{riskCoolingParticipationAccountCount}</strong>
         </button>
       {/if}
+      {#if coolingMonitoringAccountCount > 0}
+        <button
+          class="quick-row warning"
+          onclick={showCoolingMonitoringAccounts}
+          data-tooltip={rateLimitedMonitoringAccountCount > 0
+            ? `其中 ${rateLimitedMonitoringAccountCount} 个因接口限流暂停，可在监测设置中调大全局请求间隔`
+            : "监测账号已被接口暂停请求，到期后自动恢复"}
+        >
+          <span>冷却中的监测账号</span>
+          <strong class="quick-value">{coolingMonitoringAccountCount}</strong>
+        </button>
+      {/if}
     </div>
 
     <div class="sidebar-recent-activity-shell">
@@ -6254,6 +6481,15 @@
               data-tooltip={browserCapacity ? browserResourceUsageTooltip(browserCapacity) : "正在读取本机资源占用"}
               data-tooltip-placement="bottom"
             >CPU {browserCapacity ? browserCPUUsagePercent(browserCapacity) : "--"}% · 内存 {browserCapacity ? browserMemoryUsagePercent(browserCapacity) : "--"}%</span>
+            <button
+              type="button"
+              class="browser-clear-risk-cooldown"
+              aria-label="一键清空全部参与账号的风控冷却"
+              data-tooltip="一键清空风控冷却"
+              data-tooltip-placement="bottom"
+              disabled={clearingRiskCooldowns}
+              onclick={clearAllRiskCooldowns}
+            >{clearingRiskCooldowns ? "清空中…" : "清空风控冷却"}</button>
             {#if participationSchedules.length > 0}
               <button class="participation-schedule-manage-trigger" onclick={openParticipationScheduleManager}>
                 <ClockCountdown size={11} />
@@ -6980,7 +7216,15 @@
 					  <small>{event.streamer_name || "尚未读取主播"} · {event.data_source === "center" ? "中心库同步" : `账号 ${event.account_name || event.account_id || "待解析"}`}</small>
                     </div>
 					<div class="red-packet-event-prize">
-					  <strong>{event.prize || "奖品待解析"}</strong>
+					  <span class="red-packet-event-prize-line">
+						<strong>{event.prize || "奖品待解析"}</strong>
+						{#if event.condition}
+						  <span
+							class="red-packet-event-condition"
+							data-tooltip={`参与门槛 ${event.condition}，不会自动参与`}
+						  >{event.condition}</span>
+						{/if}
+					  </span>
 					  <small class="red-packet-event-expiry">
 						{#if expiry.countdown}
 						  <span class:expired={expiry.expired} class="red-packet-event-countdown">{expiry.countdown}</span>
@@ -7193,58 +7437,101 @@
                 <span>{participationRecordError}</span>
                 <button onclick={loadParticipationRecords}>重试</button>
               </div>
-            {:else if participationRecordsLoading && participationRecords.length === 0}
+            {:else if participationRecordsLoading && participationRecords.length === 0 && participationTaskRuns.length === 0}
               <div class="account-empty"><ArrowClockwise class="spinning" size={22} /><span>正在读取参与记录…</span></div>
-            {:else if visibleParticipationRecords.length === 0}
-              <div class="account-empty">
-                <Gift size={28} />
-                <strong>{query ? "没有匹配的参与记录" : "还没有参与记录"}</strong>
-                <span>{query ? "换个关键词试试" : "开启参与账号的红包接口开关后，真实参与结果会保留在这里"}</span>
-              </div>
             {:else}
-              <div class="participation-record-list">
-                <div class="participation-record-head">
-                  <span>参与账号</span><span>红包 / 直播间</span><span>参与结果</span><span>接口</span><span>时间</span>
-                </div>
-                {#each visibleParticipationRecords as record}
-                  {@const result = participationRecordStatus(record)}
-                  <article class="participation-record-row">
-                    <div class="participation-record-account">
-                      <span class="participation-record-icon"><UserCircle size={16} weight="fill" /></span>
-                      <div><strong>{record.account_name || "已删除账号"}</strong><small>账号记录 {record.account_id.slice(0, 8)}</small></div>
-                    </div>
-                    <div class="participation-record-event">
-                      <div class="participation-record-event-title">
-                        <strong>{record.title || record.prize || "直播红包"}</strong>
-                        {#if record.web_rid && /^\d{6,24}$/.test(record.web_rid)}
-                          <button
-                            class="icon-button room-open-live-action"
-                            aria-label="打开参与记录对应直播间"
-                            data-tooltip="打开直播间"
-                            data-tooltip-placement="top"
-                            onclick={() => openLiveRoomByWebRID(record.web_rid!)}
-                          ><ArrowSquareOut size={11} /></button>
-                        {/if}
-                      </div>
-                      <small>{record.room_name || record.streamer_name || `直播间 ${record.web_rid || record.room_id || "未知"}`} · {record.prize || "奖品待解析"}</small>
-                    </div>
-                    <div class="participation-record-result">
-                      <span class={`participation-result-pill ${result.tone}`} data-tooltip={record.message || result.label} data-tooltip-placement="top">{result.label}</span>
-                      <small>{record.status === "not_won" ? "已开奖" : record.message || "等待结果"}</small>
-                    </div>
-                    <div class="participation-record-endpoint">
-                      <strong>{participationRecordEndpoint(record)}</strong>
-                      <small>{record.attempt_count ? `${record.attempt_count} 次请求` : "尚未请求"}</small>
-                    </div>
-                    <span class="participation-record-time" data-tooltip={participationRecordExactTime(record)} data-tooltip-placement="left">{formatMonitorTime(record.updated_at)}</span>
-                  </article>
-                {/each}
-                {#if visibleParticipationRecords.length < filteredParticipationRecords.length}
-                  <div class="room-list-more">
-                    <span>已显示 {visibleParticipationRecords.length} / {filteredParticipationRecords.length} 条</span>
-                    <button onclick={() => (participationRecordRenderLimit += 300)}>继续显示</button>
+              <div class="participation-record-page">
+                <section class:empty={participationTaskRuns.length === 0} class="participation-run-section">
+                  <div class="participation-section-heading">
+                    <div><strong>任务运行记录</strong><span>{participationTaskRuns.length}</span></div>
+                    {#if selectedParticipationRun}
+                      <button
+                        type="button"
+                        class="participation-run-clear"
+                        aria-label="取消任务筛选"
+                        data-tooltip="查看全部参与明细"
+                        data-tooltip-placement="left"
+                        onclick={() => (selectedParticipationRunId = "")}
+                      ><X size={11} /><span>查看全部</span></button>
+                    {/if}
                   </div>
-                {/if}
+                  {#if participationTaskRuns.length === 0}
+                    <div class="participation-run-empty"><ClockCountdown size={15} /><span>暂无任务运行记录</span></div>
+                  {:else}
+                    <div class="participation-run-list">
+                      {#each participationTaskRunGroups as group, groupIndex (group.key)}
+                        <ParticipationRunGroup
+                          {group}
+                          initialExpanded={groupIndex === 0}
+                          selectedRunId={selectedParticipationRunId}
+                          clock={redPacketClock}
+                          onSelect={selectParticipationRun}
+                        />
+                      {/each}
+                    </div>
+                  {/if}
+                </section>
+
+                <section class="participation-detail-section">
+                  <div class="participation-section-heading detail">
+                    <div>
+                      <strong>{selectedParticipationRun ? `${participationRunName(selectedParticipationRun)} · 参与明细` : "全部参与明细"}</strong>
+                      <span>{filteredParticipationRecords.length}</span>
+                    </div>
+                  </div>
+                  {#if visibleParticipationRecords.length === 0}
+                    <div class="account-empty participation-detail-empty">
+                      <Gift size={24} />
+                      <strong>{selectedParticipationRun ? "这次任务还没有参与明细" : query ? "没有匹配的参与记录" : "还没有参与记录"}</strong>
+                      <span>{selectedParticipationRun ? "任务发出真实参与请求后会显示在这里" : query ? "换个关键词试试" : "开启参与账号的红包接口开关后，真实参与结果会保留在这里"}</span>
+                    </div>
+                  {:else}
+                    <div class="participation-record-list">
+                      <div class="participation-record-head">
+                        <span>参与账号</span><span>红包 / 直播间</span><span>参与结果</span><span>接口</span><span>时间</span>
+                      </div>
+                      {#each visibleParticipationRecords as record (record.id)}
+                        {@const result = participationRecordStatus(record)}
+                        <article class="participation-record-row">
+                          <div class="participation-record-account">
+                            <span class="participation-record-icon"><UserCircle size={16} weight="fill" /></span>
+                            <div><strong>{record.account_name || "已删除账号"}</strong><small>账号记录 {record.account_id.slice(0, 8)}</small></div>
+                          </div>
+                          <div class="participation-record-event">
+                            <div class="participation-record-event-title">
+                              <strong>{record.title || record.prize || "直播红包"}</strong>
+                              {#if record.web_rid && /^\d{6,24}$/.test(record.web_rid)}
+                                <button
+                                  class="icon-button room-open-live-action"
+                                  aria-label="打开参与记录对应直播间"
+                                  data-tooltip="打开直播间"
+                                  data-tooltip-placement="top"
+                                  onclick={() => openLiveRoomByWebRID(record.web_rid!)}
+                                ><ArrowSquareOut size={11} /></button>
+                              {/if}
+                            </div>
+                            <small>{record.room_name || record.streamer_name || `直播间 ${record.web_rid || record.room_id || "未知"}`} · {record.prize || "奖品待解析"}</small>
+                          </div>
+                          <div class="participation-record-result">
+                            <span class={`participation-result-pill ${result.tone}`} data-tooltip={record.message || result.label} data-tooltip-placement="top">{result.label}</span>
+                            <small>{record.status === "not_won" ? "已开奖" : record.message || "等待结果"}</small>
+                          </div>
+                          <div class="participation-record-endpoint">
+                            <strong>{participationRecordEndpoint(record)}</strong>
+                            <small>{record.attempt_count ? `${record.attempt_count} 次请求` : "尚未请求"}</small>
+                          </div>
+                          <span class="participation-record-time" data-tooltip={participationRecordExactTime(record)} data-tooltip-placement="left">{formatMonitorTime(record.updated_at)}</span>
+                        </article>
+                      {/each}
+                      {#if visibleParticipationRecords.length < filteredParticipationRecords.length}
+                        <div class="room-list-more">
+                          <span>已显示 {visibleParticipationRecords.length} / {filteredParticipationRecords.length} 条</span>
+                          <button onclick={() => (participationRecordRenderLimit += 300)}>继续显示</button>
+                        </div>
+                      {/if}
+                    </div>
+                  {/if}
+                </section>
               </div>
             {/if}
           {:else if accountError}
@@ -7633,7 +7920,15 @@
             <span class="number-field"><input type="number" min="1" max="1000000" step="1" bind:value={participationSettings.minimum_diamonds} /><em>钻</em></span>
           </label>
           <label class="participation-setting-row">
-            <span><strong>参与倒计时</strong><small>仅在红包有效期剩余不超过该秒数时参与；填 0 表示不限制，但已过期红包仍不会参与</small></span>
+            <span
+              ><strong>参与倒计时</strong><small
+                >仅在红包有效期剩余不超过该秒数时参与；填 0 表示不限制，但已过期红包仍不会参与</small
+              >{#if participationSettings.participation_countdown_seconds > 0 && participationSettings.participation_countdown_seconds < 20}<small
+                  class="participation-setting-caution"
+                  >窗口过窄：直播页面导航与登录确认本身要占掉一两秒，join 容易落在最后几秒甚至过期后被拒。实测
+                  30 秒受理率明显更高</small
+                >{/if}</span
+            >
             <span class="number-field"><input type="number" min="0" max="300" step="1" bind:value={participationSettings.participation_countdown_seconds} /><em>秒</em></span>
           </label>
           <label class="participation-setting-row">
@@ -7645,7 +7940,7 @@
             <span class="number-field"><input type="number" min="0" max="86400" step="1" bind:value={participationSettings.cooldown_seconds} /><em>秒</em></span>
           </label>
           <label class="participation-setting-row">
-            <span><strong>风控冷却</strong><small>接口返回 succeed=false 等风控结果后，账号进入冷却并不再接收新任务；单独启动会提示，批量启动会跳过</small></span>
+            <span><strong>风控冷却</strong><small>仅在接口返回操作频繁/rush_spam 等明确风控结果后进入冷却并不再接收新任务；裸 succeed=false 只记参与失败。单独启动会提示，批量启动会跳过</small></span>
             <span class="number-field"><input type="number" min="1" max="1440" step="1" bind:value={participationSettings.risk_control_cooldown_minutes} /><em>分钟</em></span>
           </label>
           <label class="participation-setting-row">
@@ -7677,8 +7972,8 @@
         <p class="participation-settings-intro">以下参数由 Go 引擎持久化并热更新正在运行的监测池；降低间隔或提高并发会增加接口压力，遇到限流时账号仍会自动冷却。</p>
         <div class="participation-settings-list monitoring-settings-list">
           <label class="participation-setting-row">
-            <span><strong>全局请求间隔</strong><small>本机所有监测账号发起两次请求之间的最小间隔</small></span>
-            <span class="number-field"><input type="number" min="40" max="2000" step="10" bind:value={monitoringSettings.global_request_interval_ms} /><em>毫秒</em></span>
+            <span><strong>全局请求间隔</strong><small>本机所有监测账号发起两次请求之间的最小间隔；填 0 为自动，按可用监测账号数推导，账号越多整机越快</small></span>
+            <span class="number-field"><input type="number" min="0" max="2000" step="10" bind:value={monitoringSettings.global_request_interval_ms} /><em>毫秒</em></span>
           </label>
           <label class="participation-setting-row">
             <span><strong>单账号请求间隔</strong><small>同一监测账号发起两次请求之间的最小间隔</small></span>
@@ -7693,7 +7988,7 @@
             <span class="number-field"><input type="number" min="1" max="8" step="1" bind:value={monitoringSettings.account_concurrency} /><em>条</em></span>
           </label>
           <label class="participation-setting-row">
-            <span><strong>原生探测窗口</strong><small>同时进入直播状态探测与红包查询流水线的任务上限</small></span>
+            <span><strong>原生探测窗口</strong><small>同时进入直播状态探测与红包查询流水线的任务上限，同时决定批量监测的工作协程数量</small></span>
             <span class="number-field"><input type="number" min="8" max="1024" step="8" bind:value={monitoringSettings.probe_concurrency} /><em>个</em></span>
           </label>
         </div>

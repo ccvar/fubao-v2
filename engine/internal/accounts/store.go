@@ -33,18 +33,49 @@ const (
 )
 
 type MonitoringProfile struct {
-	Enabled           bool   `json:"enabled"`
-	CookieStatus      string `json:"cookie_status,omitempty"`
-	CookieMessage     string `json:"cookie_message,omitempty"`
-	CookieChecked     string `json:"cookie_checked_at,omitempty"`
-	LastValidatedAt   string `json:"last_validated_at,omitempty"`
-	LastError         string `json:"last_error,omitempty"`
-	LastUsedAt        string `json:"last_used_at,omitempty"`
-	LastUseStatus     string `json:"last_use_status,omitempty"`
-	LastUseMessage    string `json:"last_use_message,omitempty"`
-	TotalRequestCount int    `json:"total_request_count"`
-	TodayRequestCount int    `json:"today_request_count"`
-	TodayRequestDate  string `json:"today_request_date,omitempty"`
+	Enabled         bool   `json:"enabled"`
+	CookieStatus    string `json:"cookie_status,omitempty"`
+	CookieMessage   string `json:"cookie_message,omitempty"`
+	CookieChecked   string `json:"cookie_checked_at,omitempty"`
+	LastValidatedAt string `json:"last_validated_at,omitempty"`
+	LastError       string `json:"last_error,omitempty"`
+	LastUsedAt      string `json:"last_used_at,omitempty"`
+	LastUseStatus   string `json:"last_use_status,omitempty"`
+	LastUseMessage  string `json:"last_use_message,omitempty"`
+	// MonitorCooldownUntil is the account pool's own back-off window, set when
+	// Douyin rate-limits or rejects this monitoring account. Without it a
+	// rate-limited account keeps rendering as 可用 while it silently stops
+	// issuing requests, which is exactly the signal an operator needs.
+	// This is throughput state, never CK health: a temporary request failure
+	// must not mark a monitoring Cookie expired.
+	MonitorCooldownUntil  string `json:"monitor_cooldown_until,omitempty"`
+	MonitorCooldownReason string `json:"monitor_cooldown_reason,omitempty"`
+	TotalRequestCount     int    `json:"total_request_count"`
+	TodayRequestCount     int    `json:"today_request_count"`
+	TodayRequestDate      string `json:"today_request_date,omitempty"`
+}
+
+// Monitoring cooldown reasons. They separate a throughput problem (the machine
+// is asking too fast) from an account problem (Douyin rejected this session),
+// which need very different operator responses.
+const (
+	MonitorCooldownRateLimited = "rate_limited"
+	MonitorCooldownAuth        = "auth"
+	MonitorCooldownNetwork     = "network"
+)
+
+// ActiveMonitorCooldown reports whether a persisted monitoring cooldown window
+// has not expired yet.
+func ActiveMonitorCooldown(until string, now time.Time) bool {
+	until = strings.TrimSpace(until)
+	if until == "" {
+		return false
+	}
+	expiry, err := time.Parse(time.RFC3339Nano, until)
+	if err != nil {
+		return false
+	}
+	return now.Before(expiry)
 }
 
 type ParticipationProfile struct {
@@ -288,6 +319,9 @@ func (s *Store) RecordMonitoringRequest(accountID string, requestErr error) {
 	} else {
 		profile.LastUseStatus = "success"
 		profile.LastUseMessage = ""
+		// A successful request proves the pool's back-off is over.
+		profile.MonitorCooldownUntil = ""
+		profile.MonitorCooldownReason = ""
 		// Monitoring CK health is deliberately independent from the browser /
 		// participation login check. A successful room or red-packet request is
 		// authoritative evidence that this Cookie can still perform monitoring.
@@ -300,6 +334,70 @@ func (s *Store) RecordMonitoringRequest(accountID string, requestErr error) {
 	account.UpdatedAt = profile.LastUsedAt
 	s.monitoringUsageDirty = true
 	s.scheduleMonitoringUsageFlushLocked()
+}
+
+// RecordMonitoringCooldown persists the account pool's back-off window so the
+// account row can show why a monitoring account stopped issuing requests. A
+// zero `until` clears the window. It deliberately never touches CookieStatus:
+// per the monitoring health rule only an absent Cookie may be marked expired,
+// and a rejected request is not proof that the session is dead.
+func (s *Store) RecordMonitoringCooldown(accountID string, until time.Time, reason, message string) {
+	if strings.TrimSpace(accountID) == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	account := s.accounts[accountID]
+	if account == nil || account.Monitoring == nil {
+		return
+	}
+	profile := account.Monitoring
+	if until.IsZero() {
+		if profile.MonitorCooldownUntil == "" && profile.MonitorCooldownReason == "" {
+			return
+		}
+		profile.MonitorCooldownUntil = ""
+		profile.MonitorCooldownReason = ""
+	} else {
+		profile.MonitorCooldownUntil = until.Format(time.RFC3339Nano)
+		profile.MonitorCooldownReason = strings.TrimSpace(reason)
+		if text := strings.TrimSpace(message); text != "" {
+			profile.LastUseStatus = "cooling"
+			profile.LastUseMessage = text
+		}
+	}
+	account.UpdatedAt = time.Now().Format(time.RFC3339Nano)
+	s.monitoringUsageDirty = true
+	s.scheduleMonitoringUsageFlushLocked()
+}
+
+// ClearAllMonitoringCooldowns drops every persisted monitoring back-off window.
+// Used when the user stops monitoring so a stale countdown cannot outlive the
+// pool that created it.
+func (s *Store) ClearAllMonitoringCooldowns() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cleared := 0
+	for _, account := range s.accounts {
+		if account == nil || account.Monitoring == nil {
+			continue
+		}
+		if account.Monitoring.MonitorCooldownUntil == "" && account.Monitoring.MonitorCooldownReason == "" {
+			continue
+		}
+		account.Monitoring.MonitorCooldownUntil = ""
+		account.Monitoring.MonitorCooldownReason = ""
+		if account.Monitoring.LastUseStatus == "cooling" {
+			account.Monitoring.LastUseStatus = ""
+			account.Monitoring.LastUseMessage = ""
+		}
+		cleared++
+	}
+	if cleared > 0 {
+		s.monitoringUsageDirty = true
+		s.scheduleMonitoringUsageFlushLocked()
+	}
+	return cleared
 }
 
 func (s *Store) scheduleMonitoringUsageFlushLocked() {
@@ -703,6 +801,50 @@ func (s *Store) ReconcileParticipationStatsFromRecords(patches []ParticipationSt
 			changed++
 			account.UpdatedAt = now.Format(time.RFC3339Nano)
 		}
+	}
+	if changed == 0 {
+		return 0, nil
+	}
+	if err := s.saveLocked(); err != nil {
+		return 0, err
+	}
+	return changed, nil
+}
+
+// ClearAllParticipationRiskCooldowns clears every participation risk-control
+// timer and restores the red-packet API switch so cooled accounts can accept
+// tasks again. Challenge blocks are left alone — those need a manual restart
+// after the user handles captcha.
+func (s *Store) ClearAllParticipationRiskCooldowns() (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	changed := 0
+	for _, account := range s.accounts {
+		if account == nil || account.Participation == nil {
+			continue
+		}
+		profile := account.Participation
+		cleared := false
+		if strings.TrimSpace(profile.RedPacketCooldownUntil) != "" {
+			profile.RedPacketCooldownUntil = ""
+			cleared = true
+		}
+		if profile.LastRedPacketStatus == redPacketStatusRiskControl {
+			profile.LastRedPacketStatus = ""
+			profile.LastRedPacketMessage = ""
+			cleared = true
+		}
+		// Risk control previously forced the API switch off; turn it back on so
+		// “清空冷却” is enough to resume without per-account re-enable clicks.
+		if !profile.RedPacketAPIEnabled && cleared {
+			profile.RedPacketAPIEnabled = true
+		}
+		if !cleared {
+			continue
+		}
+		account.UpdatedAt = now.Format(time.RFC3339Nano)
+		changed++
 	}
 	if changed == 0 {
 		return 0, nil

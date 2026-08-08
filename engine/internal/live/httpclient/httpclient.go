@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -28,6 +29,12 @@ const SignedUserAgent = abogus.SignedUserAgent
 // request_timeout default.
 const DefaultTimeout = 10 * time.Second
 
+// defaultMaxIdleConnsPerHost is the keep-alive pool size used by a Client that
+// was not given an explicit Doer. Go's own default is 2, which is far too small
+// for the room monitor: every request beyond the second concurrent one would
+// open a fresh connection and close it again on completion.
+const defaultMaxIdleConnsPerHost = 16
+
 // Doer is the minimal HTTP interface the Client depends on. net/http.Client
 // satisfies it. Tests may substitute a fake to avoid hitting the network.
 type Doer interface {
@@ -46,7 +53,14 @@ type Client struct {
 	// Cookie is the raw Cookie header value sent with signed requests. May be
 	// empty.
 	Cookie string
+	// timeout is applied only when New has to build the default executor. A
+	// caller-supplied Doer owns its own timeout policy.
+	timeout time.Duration
 }
+
+// Doer returns the underlying request executor. It lets callers that build many
+// short-lived Clients confirm they are all sharing one connection pool.
+func (c *Client) Doer() Doer { return c.http }
 
 // Option configures a Client.
 type Option func(*Client)
@@ -67,12 +81,36 @@ func WithCookie(cookie string) Option {
 }
 
 // WithTimeout sets the timeout on the default underlying *http.Client. It has no
-// effect if WithDoer was also supplied.
+// effect if WithDoer was also supplied, because a caller-supplied Doer owns its
+// own timeout policy.
+// It deliberately never mutates a supplied Doer: that Doer is typically a shared
+// pooled client, and reaching into it here would change the timeout for every
+// other caller sharing it.
 func WithTimeout(d time.Duration) Option {
-	return func(c *Client) {
-		if hc, ok := c.http.(*http.Client); ok {
-			hc.Timeout = d
-		}
+	return func(c *Client) { c.timeout = d }
+}
+
+// NewPooledTransport returns the shared-connection transport used for webcast
+// requests. It keeps the HTTP/1.1 pinning described on New and, unlike Go's
+// zero-value transport, retains a keep-alive pool large enough for the room
+// monitor's concurrency. Callers are expected to build one of these and share it
+// across many Clients: a transport per request means a DNS lookup, TCP connect
+// and full TLS handshake on every single probe.
+func NewPooledTransport(maxIdleConnsPerHost int) *http.Transport {
+	if maxIdleConnsPerHost < 2 {
+		maxIdleConnsPerHost = 2
+	}
+	return &http.Transport{
+		TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{},
+		DialContext: (&net.Dialer{
+			Timeout:   8 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          maxIdleConnsPerHost * 2,
+		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   8 * time.Second,
+		ExpectContinueTimeout: time.Second,
 	}
 }
 
@@ -80,17 +118,18 @@ func WithTimeout(d time.Duration) Option {
 // pinned to HTTP/1.1: the Python reference uses requests (HTTP/1.1) and Douyin's
 // webcast endpoints are validated against that; forcing HTTP/1.1 avoids Go's
 // default HTTP/2 upgrade, keeping the wire behaviour identical to the reference.
+// The default executor is built only when no Doer was supplied, so a caller that
+// shares one pooled transport never allocates a throwaway connection pool.
 func New(opts ...Option) *Client {
-	c := &Client{
-		http: &http.Client{
-			Timeout: DefaultTimeout,
-			Transport: &http.Transport{
-				TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{},
-			},
-		},
-	}
+	c := &Client{timeout: DefaultTimeout}
 	for _, opt := range opts {
 		opt(c)
+	}
+	if c.http == nil {
+		c.http = &http.Client{
+			Timeout:   c.timeout,
+			Transport: NewPooledTransport(defaultMaxIdleConnsPerHost),
+		}
 	}
 	return c
 }

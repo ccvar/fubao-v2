@@ -181,6 +181,39 @@ func TestReconcileParticipationStatsFromRecordsBackfillsToday(t *testing.T) {
 	}
 }
 
+func TestClearAllParticipationRiskCooldowns(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, _, err := store.UpsertAuthenticatedCookie("sessionid_ss=risk-clear", "冷却账号", "40001", "sec-40001", RoleParticipation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.RecordRedPacketParticipation(view.ID, "risk_control", "触发风控，账号已进入冷却（60 分钟）", false, false, 60*time.Minute, false)
+	before := store.List(RoleParticipation)[0].Participation
+	if before == nil || before.RedPacketCooldownUntil == "" || before.LastRedPacketStatus != "risk_control" {
+		t.Fatalf("expected risk cooldown before clear: %+v", before)
+	}
+	if before.RedPacketAPIEnabled {
+		t.Fatal("risk control should disable API switch")
+	}
+	n, err := store.ClearAllParticipationRiskCooldowns()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("cleared=%d, want 1", n)
+	}
+	after := store.List(RoleParticipation)[0].Participation
+	if after.RedPacketCooldownUntil != "" || after.LastRedPacketStatus != "" {
+		t.Fatalf("cooldown not cleared: %+v", after)
+	}
+	if !after.RedPacketAPIEnabled {
+		t.Fatal("API switch should re-enable after clearing risk cooldown")
+	}
+}
+
 func TestReconcileParticipationStatsZerosAccountsWithoutRecords(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {
@@ -385,6 +418,68 @@ func TestRecordMonitoringRequestTracksLocalCounters(t *testing.T) {
 	persisted := reloaded.List(RoleMonitoring)[0].Monitoring
 	if persisted == nil || persisted.TotalRequestCount != 2 || persisted.TodayRequestCount != 2 {
 		t.Fatalf("batched monitoring counters were not persisted: %+v", persisted)
+	}
+}
+
+func TestMonitoringCooldownIsVisibleWithoutTouchingCookieHealth(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.UpsertAuthenticatedCookie("sessionid_ss=cooling", "限流账号", "10087", "sec-10087", RoleMonitoring); err != nil {
+		t.Fatal(err)
+	}
+	accountID := store.List(RoleMonitoring)[0].ID
+	// Establish valid monitoring CK health from a successful request first.
+	store.RecordMonitoringRequest(accountID, nil)
+	if got := store.List(RoleMonitoring)[0].Monitoring.CookieStatus; got != cookieStatusValid {
+		t.Fatalf("a successful request should prove monitoring CK health, got %q", got)
+	}
+
+	until := time.Now().Add(2 * time.Minute)
+	store.RecordMonitoringCooldown(accountID, until, MonitorCooldownRateLimited, "接口返回限流，已暂停该监测账号的请求")
+	profile := store.List(RoleMonitoring)[0].Monitoring
+	if !ActiveMonitorCooldown(profile.MonitorCooldownUntil, time.Now()) {
+		t.Fatalf("cooldown window was not persisted: %+v", profile)
+	}
+	if profile.MonitorCooldownReason != MonitorCooldownRateLimited || profile.LastUseStatus != "cooling" {
+		t.Fatalf("cooldown reason/status not recorded: %+v", profile)
+	}
+	// A rate-limited request is not proof the session is dead: monitoring CK
+	// health must stay untouched so the row never asks for a needless rebind.
+	if profile.CookieStatus != cookieStatusValid {
+		t.Fatalf("a request cooldown must not degrade monitoring CK health, got %q", profile.CookieStatus)
+	}
+
+	// A later success clears the window on its own.
+	store.RecordMonitoringRequest(accountID, nil)
+	if profile := store.List(RoleMonitoring)[0].Monitoring; profile.MonitorCooldownUntil != "" || profile.MonitorCooldownReason != "" {
+		t.Fatalf("a successful request must clear the cooldown: %+v", profile)
+	}
+
+	// Stopping monitoring drops every window, so no countdown outlives its pool.
+	store.RecordMonitoringCooldown(accountID, until, MonitorCooldownAuth, "接口拒绝了该监测会话，已暂停该账号的请求")
+	if cleared := store.ClearAllMonitoringCooldowns(); cleared != 1 {
+		t.Fatalf("expected one cleared cooldown, got %d", cleared)
+	}
+	if profile := store.List(RoleMonitoring)[0].Monitoring; profile.MonitorCooldownUntil != "" || profile.LastUseStatus == "cooling" {
+		t.Fatalf("stop did not clear the cooldown: %+v", profile)
+	}
+}
+
+func TestActiveMonitorCooldownIgnoresExpiredAndInvalidWindows(t *testing.T) {
+	now := time.Now()
+	if ActiveMonitorCooldown("", now) {
+		t.Fatal("an empty window is not an active cooldown")
+	}
+	if ActiveMonitorCooldown("not-a-timestamp", now) {
+		t.Fatal("an unparseable window must not read as cooling")
+	}
+	if ActiveMonitorCooldown(now.Add(-time.Second).Format(time.RFC3339Nano), now) {
+		t.Fatal("an expired window must not read as cooling")
+	}
+	if !ActiveMonitorCooldown(now.Add(time.Minute).Format(time.RFC3339Nano), now) {
+		t.Fatal("a future window must read as cooling")
 	}
 }
 

@@ -5,7 +5,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -34,9 +34,36 @@ struct EngineRuntime {
     // last safe Douyin location here so remounting the same stable instance
     // restores its page instead of always jumping back to the home page.
     browser_locations: Mutex<HashMap<String, String>>,
+    // Instance records are disposable: closing a card and creating it again for
+    // the same account yields a new instance id. Mirror the last safe location
+    // per account, and remember which account owns a mounted instance, so a
+    // recreated card resumes that page instead of reloading the heavy home feed.
+    browser_account_locations: Mutex<HashMap<String, String>>,
+    browser_instance_accounts: Mutex<HashMap<String, String>>,
+    // A card whose document rendered before the injected cookies landed keeps
+    // showing Douyin's anonymous shell. Throttle the self-healing reload so a
+    // recurring adaptive check cannot reload the page on every tick, and keep
+    // the first observation so a session Douyin keeps rejecting can eventually
+    // be reported instead of being retried forever behind a healthy badge.
+    browser_anonymous_healed_at: Mutex<HashMap<String, Instant>>,
+    browser_anonymous_since: Mutex<HashMap<String, Instant>>,
+    // A reloading page alternates between “still empty” and “anonymous shell”,
+    // so a single clean observation must not reset the first-seen timer or the
+    // escalation below could never be reached. Require a quiet period instead.
+    browser_anonymous_last_at: Mutex<HashMap<String, Instant>>,
+    // Douyin's explicit login dialog is authoritative, but a card can paint one
+    // transient frame while a fresh session restores. Remember when the wall
+    // first appeared so a persistent one becomes CK expiry instead of being
+    // deferred forever by a re-assert that keeps re-arming the inject grace.
+    browser_login_wall_since: Mutex<HashMap<String, Instant>>,
     // Closing a child WKWebView is asynchronous at the WebKit/Tauri boundary.
     // Keep a native tombstone so overlapping layout, scroll, and modal cleanup
     // requests cannot reuse or close the same invalidating handle twice.
+    // First undetermined render observation and last recovery for a card whose
+    // Douyin document never finishes painting, tracked separately from the
+    // anonymous-shell timers because neither signal implies the other.
+    browser_stalled_render_since: Mutex<HashMap<String, Instant>>,
+    browser_stalled_render_healed_at: Mutex<HashMap<String, Instant>>,
     browser_webviews_closing: Mutex<HashSet<String>>,
     browser_red_packet_contexts: Mutex<HashSet<String>>,
     browser_cookie_synced_at: Mutex<HashMap<String, Instant>>,
@@ -55,6 +82,14 @@ impl Default for EngineRuntime {
             native_secret: Uuid::new_v4().to_string(),
             pending: Mutex::new(HashMap::new()),
             browser_locations: Mutex::new(HashMap::new()),
+            browser_account_locations: Mutex::new(HashMap::new()),
+            browser_instance_accounts: Mutex::new(HashMap::new()),
+            browser_anonymous_healed_at: Mutex::new(HashMap::new()),
+            browser_anonymous_since: Mutex::new(HashMap::new()),
+            browser_anonymous_last_at: Mutex::new(HashMap::new()),
+            browser_login_wall_since: Mutex::new(HashMap::new()),
+            browser_stalled_render_since: Mutex::new(HashMap::new()),
+            browser_stalled_render_healed_at: Mutex::new(HashMap::new()),
             browser_webviews_closing: Mutex::new(HashSet::new()),
             browser_red_packet_contexts: Mutex::new(HashSet::new()),
             browser_cookie_synced_at: Mutex::new(HashMap::new()),
@@ -583,6 +618,8 @@ struct NativePageParticipationResult {
     context_missing: bool,
     login_expired: bool,
     challenge_blocked: bool,
+    /// Safe join diagnostics (no token values): msToken/a_bogus flags, room/box.
+    diag: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -615,6 +652,7 @@ impl NativePageParticipationResult {
             context_missing: true,
             login_expired: false,
             challenge_blocked: false,
+            diag: String::new(),
         }
     }
 
@@ -628,28 +666,22 @@ impl NativePageParticipationResult {
             context_missing: false,
             login_expired: true,
             challenge_blocked: false,
+            diag: String::new(),
         }
     }
 }
 
 const DOUYIN_CHROME_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-// Capture real page-signed luckybox traffic (join/rush/receive). DY-KIRO's
-// verified succeed:true path came from the page's own XHR after a DOM click,
-// not from a synthetic empty-form fetch. Receive remains the personal draw
-// result path; join/rush capture lets native participation reuse the page's
-// real response when the user-visible red-packet control is clicked.
+// Capture real page-signed luckybox traffic (join/rush/receive). Receive is the
+// personal draw-result path; join/rush capture is diagnostic only, since native
+// participation issues its own pure-API join and never synthesizes a DOM click.
 const RED_PACKET_RECEIVE_CAPTURE_SCRIPT: &str = r#"(() => {
   // Re-install after SPA navigations so fetch/XHR hooks stay outside bdms.
   // Queues are preserved on window so a re-hook does not drop recent joins.
   const receiveQueue = window.__fubaoReceiveQueue || (window.__fubaoReceiveQueue = []);
   const actionQueue = window.__fubaoActionQueue || (window.__fubaoActionQueue = []);
   const scalar = (value) => value === undefined || value === null ? '' : String(value);
-  if (window.__fubaoRedPacketReceiveCaptureInstalled) {
-    // Keep take helpers bound to the shared queues.
-    return;
-  }
-  window.__fubaoRedPacketReceiveCaptureInstalled = true;
   const idsFromURL = (url) => {
     try {
       const parsed = new URL(String(url || ''), location.href);
@@ -692,8 +724,65 @@ const RED_PACKET_RECEIVE_CAPTURE_SCRIPT: &str = r#"(() => {
       while (receiveQueue.length > 24) receiveQueue.shift();
     } catch (_) {}
   };
+  // Live identity sniffed from real page traffic (succeed:true captures always
+  // carry room_id + sec_anchor_id + user_unique_id from the SPA session).
+  const liveIdentity = window.__fubaoLiveIdentity || (window.__fubaoLiveIdentity = {});
+  const rememberLiveIdentity = (url, bodyText) => {
+    try {
+      const path = String(url || '');
+      if (!/live\.douyin\.com\/webcast\//.test(path) && !/\/webcast\//.test(path)) return;
+      const parsed = new URL(path, location.href);
+      const take = (key, value, minLen) => {
+        const text = String(value == null ? '' : value).trim();
+        if (!text) return;
+        if (minLen && text.length < minLen) return;
+        liveIdentity[key] = text;
+        liveIdentity.saved_at = Date.now();
+      };
+      const takeParam = (key, minLen) => take(key, parsed.searchParams.get(key), minLen);
+      takeParam('room_id', 10);
+      takeParam('anchor_id', 5);
+      takeParam('anchor_id_str', 5);
+      takeParam('sec_anchor_id', 10);
+      takeParam('user_id', 5);
+      takeParam('sec_user_id', 10);
+      takeParam('user_unique_id', 5);
+      takeParam('msToken', 8);
+      // room/web/enter body shape (matches Go ProbeLive):
+      // data.enter_room_id + data.data[0].id_str (array), not data.room.
+      if (bodyText && /\/webcast\/(?:room\/web\/enter|room\/enter|im\/fetch)/.test(path)) {
+        try {
+          const payload = JSON.parse(String(bodyText));
+          const data = payload && payload.data && typeof payload.data === 'object' ? payload.data : payload;
+          take('room_id', data && data.enter_room_id, 10);
+          let room = null;
+          if (data && Array.isArray(data.data) && data.data[0] && typeof data.data[0] === 'object') {
+            room = data.data[0];
+          } else if (data && data.room && typeof data.room === 'object') {
+            room = data.room;
+          }
+          if (room) {
+            take('room_id', room.id_str || room.id || room.room_id, 10);
+            const owner = room.owner || room.anchor || {};
+            take('anchor_id', owner.id_str || owner.id, 5);
+            take('anchor_id_str', owner.id_str || owner.id, 5);
+            take('sec_anchor_id', owner.sec_uid || owner.sec_user_id, 10);
+          }
+          if (data && data.user && typeof data.user === 'object') {
+            take('user_id', data.user.id_str || data.user.id, 5);
+            take('user_unique_id', data.user_unique_id || data.user.user_unique_id, 5);
+          }
+          take('user_unique_id', data && data.user_unique_id, 5);
+        } catch (_) {}
+      }
+    } catch (_) {}
+  };
+  // Always read window.__fubaoLiveIdentity — never a closed-over snapshot that
+  // can diverge after enter-probe writes a refreshed object.
+  window.__fubaoGetLiveIdentity = () => Object.assign({}, window.__fubaoLiveIdentity || liveIdentity);
   const rememberAction = (url, status, text) => {
     try {
+      rememberLiveIdentity(url);
       const path = String(url || '');
       let endpoint = '';
       if (/\/webcast\/luckybox\/join(?:\/|$|\?)/.test(path)) endpoint = 'join';
@@ -711,6 +800,8 @@ const RED_PACKET_RECEIVE_CAPTURE_SCRIPT: &str = r#"(() => {
       while (actionQueue.length > 24) actionQueue.shift();
     } catch (_) {}
   };
+  // Always rebind take/clear helpers so already-mounted WebViews pick up fixes
+  // without requiring a full page reload (hooks themselves stay one-shot).
   window.__fubaoTakeRedPacketReceiveResult = (boxId, packetId) => {
     const wanted = new Set([scalar(boxId).trim(), scalar(packetId).trim()].filter(Boolean));
     let index = -1;
@@ -720,41 +811,98 @@ const RED_PACKET_RECEIVE_CAPTURE_SCRIPT: &str = r#"(() => {
     if (index < 0 && receiveQueue.length === 1) index = 0;
     return index < 0 ? null : receiveQueue.splice(index, 1)[0] || null;
   };
-  window.__fubaoTakeRedPacketJoinResult = (boxId, packetId, maxAgeMs) => {
+  // afterTs: only accept captures saved at/after this time (ms). Used so the
+  // page-click fallback never re-accepts our own earlier synthetic soft-denies.
+  // preferSuccess: when several post-click items match, pick succeed:true first.
+  window.__fubaoTakeRedPacketJoinResult = (boxId, packetId, maxAgeMs, afterTs, preferSuccess) => {
     const wanted = new Set([scalar(boxId).trim(), scalar(packetId).trim()].filter(Boolean));
     const cutoff = Date.now() - Math.max(500, Number(maxAgeMs || 3500));
-    let index = -1;
+    const minTs = Math.max(cutoff, Number(afterTs || 0) || 0);
+    let bestIndex = -1;
+    let bestScore = -1;
     for (let i = actionQueue.length - 1; i >= 0; i -= 1) {
       const item = actionQueue[i];
-      if (!item || Number(item.saved_at || 0) < cutoff) continue;
-      if (wanted.size === 0 || item.ids.some((id) => wanted.has(id))) { index = i; break; }
-    }
-    return index < 0 ? null : actionQueue.splice(index, 1)[0] || null;
-  };
-  try {
-    if (!window.__fubaoFetchHooked) {
-      const originalFetch = window.fetch;
-      if (typeof originalFetch === 'function') {
-        window.__fubaoFetchHooked = true;
-        window.__fubaoOriginalFetch = originalFetch;
-        window.fetch = function(input, init) {
-          const request = input && typeof input === 'object' ? input : null;
-          const url = scalar(request && request.url || input);
-          // Call through current page fetch chain (bdms may wrap further later).
-          return originalFetch.call(this, input, init).then((response) => {
-            if (/\/webcast\/luckybox\/(?:receive|join|rush)(?:\/|$|\?)/.test(url)) {
-              try {
-                response.clone().text().then((text) => {
-                  rememberReceive(url, response.status, text);
-                  rememberAction(url, response.status, text);
-                });
-              } catch (_) {}
-            }
-            return response;
-          });
-        };
+      if (!item || Number(item.saved_at || 0) < minTs) continue;
+      if (wanted.size > 0 && !item.ids.some((id) => wanted.has(id))) continue;
+      let score = 10 + Math.min(9, i); // newer slightly preferred among equals
+      if (preferSuccess) {
+        try {
+          const parsed = JSON.parse(String(item.body || ''));
+          const data = parsed && parsed.data && typeof parsed.data === 'object' ? parsed.data : {};
+          if (data.succeed === true || data.succeeded === true || data.joined === true ||
+            data.has_joined === true || data.rush_too_much) score = 1000 + i;
+          else if (data.succeed === false) score = 20 + i;
+        } catch (_) {}
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestIndex = i;
       }
     }
+    return bestIndex < 0 ? null : actionQueue.splice(bestIndex, 1)[0] || null;
+  };
+  window.__fubaoClearRedPacketJoinResults = (boxId, packetId) => {
+    const wanted = new Set([scalar(boxId).trim(), scalar(packetId).trim()].filter(Boolean));
+    if (!wanted.size) {
+      actionQueue.length = 0;
+      return;
+    }
+    for (let i = actionQueue.length - 1; i >= 0; i -= 1) {
+      const item = actionQueue[i];
+      if (!item || !Array.isArray(item.ids)) continue;
+      if (item.ids.some((id) => wanted.has(id))) actionQueue.splice(i, 1);
+    }
+  };
+  // Stash remember* on window so a later rebind can keep one hook implementation.
+  window.__fubaoRememberReceive = rememberReceive;
+  window.__fubaoRememberAction = rememberAction;
+  // Install (or re-install) fetch capture so the base is the *current* window.fetch
+  // (ideally already wrapped by bdms). Freezing originalFetch to the first native
+  // fetch permanently caused join to skip a_bogus injection → succeed=false.
+  window.__fubaoEnsureFetchHook = () => {
+    try {
+      if (typeof window.fetch !== 'function') return;
+      // Already outermost and base is set — still refresh base if a newer wrapper
+      // sits under us is impossible; instead re-wrap only when not our hook.
+      if (window.fetch && window.fetch.__fubaoHook) return;
+      const base = window.fetch.bind(window);
+      const hook = function(input, init) {
+        const request = input && typeof input === 'object' ? input : null;
+        const url = scalar(request && request.url || input);
+        try { rememberLiveIdentity(url); } catch (_) {}
+        return base(input, init).then((response) => {
+          try { rememberLiveIdentity(response && response.url || url); } catch (_) {}
+          const finalURL = String(response && response.url || url);
+          const needBody =
+            /\/webcast\/luckybox\/(?:receive|join|rush)(?:\/|$|\?)/.test(url) ||
+            /\/webcast\/luckybox\/(?:receive|join|rush)(?:\/|$|\?)/.test(finalURL) ||
+            /\/webcast\/(?:room\/web\/enter|room\/enter|im\/fetch)/.test(url) ||
+            /\/webcast\/(?:room\/web\/enter|room\/enter|im\/fetch)/.test(finalURL);
+          if (needBody) {
+            try {
+              response.clone().text().then((text) => {
+                try { rememberLiveIdentity(finalURL, text); } catch (_) {}
+                try { window.__fubaoRememberReceive && window.__fubaoRememberReceive(finalURL, response.status, text); } catch (_) {}
+                try { window.__fubaoRememberAction && window.__fubaoRememberAction(finalURL, response.status, text); } catch (_) {}
+              });
+            } catch (_) {}
+          }
+          return response;
+        });
+      };
+      hook.__fubaoHook = true;
+      window.__fubaoFetchBase = base;
+      window.fetch = hook;
+      window.__fubaoFetchHooked = true;
+    } catch (_) {}
+  };
+  if (window.__fubaoRedPacketReceiveCaptureInstalled) {
+    try { window.__fubaoEnsureFetchHook(); } catch (_) {}
+    return;
+  }
+  window.__fubaoRedPacketReceiveCaptureInstalled = true;
+  try {
+    window.__fubaoEnsureFetchHook();
   } catch (_) {}
   try {
     const XHR = window.XMLHttpRequest;
@@ -767,13 +915,15 @@ const RED_PACKET_RECEIVE_CAPTURE_SCRIPT: &str = r#"(() => {
         return open.apply(this, arguments);
       };
       XHR.prototype.send = function() {
+        try { rememberLiveIdentity(this.__fubaoLuckyboxURL); } catch (_) {}
         this.addEventListener('load', () => {
-          const url = scalar(this.__fubaoLuckyboxURL);
+          const url = scalar(this.__fubaoLuckyboxURL || this.responseURL);
+          let body = '';
+          try { body = this.responseText || ''; } catch (_) {}
+          try { rememberLiveIdentity(url, body); } catch (_) {}
           if (/\/webcast\/luckybox\/(?:receive|join|rush)(?:\/|$|\?)/.test(url)) {
-            let body = '';
-            try { body = this.responseText || ''; } catch (_) {}
-            rememberReceive(url, this.status, body);
-            rememberAction(url, this.status, body);
+            try { window.__fubaoRememberReceive && window.__fubaoRememberReceive(url, this.status, body); } catch (_) {}
+            try { window.__fubaoRememberAction && window.__fubaoRememberAction(url, this.status, body); } catch (_) {}
           }
         });
         return send.apply(this, arguments);
@@ -1094,7 +1244,23 @@ async fn bootstrap_browser_account_session(
         // Douyin document exists. Scan-login cards previously failed when we
         // only pre-seeded from about:blank and then let the anonymous SPA win.
         // Sequence: seed → open Douyin → re-assert → hard reload with cookies.
-        // Never clear the jar here (that wiped valid store sessions).
+        //
+        // A recreated instance reuses the account-keyed data store, so the jar
+        // can still hold the previous anonymous session whose host-scoped rows
+        // outrank the parent-domain rows written below. Clear only when the jar
+        // cannot already prove this store session — clearing unconditionally
+        // wiped valid scan-login sessions.
+        let stale_jar = read_douyin_cookie(webview).ok().is_some_and(|current| {
+            !current.trim().is_empty() && !login_cookie_snapshot_usable(raw_cookie, &current)
+        });
+        if stale_jar {
+            if cfg!(debug_assertions) {
+                eprintln!(
+                    "[embedded-browser] macOS clearing residual jar instance={instance_id}"
+                );
+            }
+            clear_douyin_session_cookies(webview).await;
+        }
         let _ = inject_douyin_cookie(webview, raw_cookie);
         webview
             .navigate(target_url.clone())
@@ -1114,32 +1280,41 @@ async fn bootstrap_browser_account_session(
         }
         // Hard reload so the SPA boots with the jar we just wrote (critical for
         // scan-login accounts whose create WebView used a different data store).
-        webview
-            .navigate(target_url.clone())
-            .map_err(|error| format!("重新加载已注入登录态的抖音页面失败：{error}"))?;
-        tokio::time::sleep(Duration::from_millis(900)).await;
-        let _ = inject_douyin_cookie(webview, raw_cookie);
-        tokio::time::sleep(Duration::from_millis(220)).await;
-        if inject_douyin_cookie_and_confirm(webview, raw_cookie)
-            .await
-            .is_ok()
-        {
-            if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
-                injected.insert(instance_id.to_string(), Instant::now());
+        // A second full www.douyin.com load dominates the mount cost, so skip it
+        // when the first load already rendered an authenticated document.
+        if !douyin_render_is_authenticated(webview).await {
+            webview
+                .navigate(target_url.clone())
+                .map_err(|error| format!("重新加载已注入登录态的抖音页面失败：{error}"))?;
+            tokio::time::sleep(Duration::from_millis(900)).await;
+            let _ = inject_douyin_cookie(webview, raw_cookie);
+            tokio::time::sleep(Duration::from_millis(220)).await;
+            if inject_douyin_cookie_and_confirm(webview, raw_cookie)
+                .await
+                .is_ok()
+            {
+                if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
+                    injected.insert(instance_id.to_string(), Instant::now());
+                }
+            } else if cfg!(debug_assertions) {
+                eprintln!(
+                    "[embedded-browser] macOS final cookie confirm failed instance={instance_id}"
+                );
             }
+            let _ = inject_douyin_cookie(webview, raw_cookie);
         } else if cfg!(debug_assertions) {
             eprintln!(
-                "[embedded-browser] macOS final cookie confirm failed instance={instance_id}"
+                "[embedded-browser] macOS first load authenticated, skipping reload instance={instance_id}"
             );
         }
-        let _ = inject_douyin_cookie(webview, raw_cookie);
-        // If a login wall is still up, clear SPA storage (not the cookie jar)
-        // and hard-reload with store cookies. Douyin often keeps an anonymous
-        // shell in localStorage even after HttpOnly session rows are present.
-        if matches!(
-            inspect_douyin_login(webview).await.map(|s| s.state),
-            Ok(BrowserLoginState::LoggedOut)
-        ) {
+        // If a login wall is still up, or Douyin rendered its anonymous shell
+        // before the cookies landed, clear SPA storage (not the cookie jar) and
+        // hard-reload with store cookies. Douyin often keeps an anonymous shell
+        // in localStorage even after HttpOnly session rows are present.
+        let stalled_render = inspect_douyin_login(webview).await.ok().is_some_and(|s| {
+            matches!(s.state, BrowserLoginState::LoggedOut) || s.anonymous_render
+        });
+        if stalled_render {
             if cfg!(debug_assertions) {
                 eprintln!(
                     "[embedded-browser] macOS login-wall recovery clear-storage+reload instance={instance_id}"
@@ -1444,8 +1619,9 @@ mod cookie_tests {
     use super::{
         begin_browser_webview_close, browser_location_matches_live_room,
         browser_login_cookie_is_safe_to_persist, browser_new_window_target,
-        browser_webview_is_closing, canonical_cookie_values, login_cookie_snapshot_matches,
-        login_cookie_values, remember_browser_location, EngineRuntime, Url,
+        browser_restore_location, browser_webview_is_closing, canonical_cookie_values,
+        login_cookie_snapshot_matches, login_cookie_values, remember_browser_instance_account,
+        remember_browser_location, EngineRuntime, Url,
     };
 
     #[test]
@@ -1540,6 +1716,31 @@ mod cookie_tests {
     }
 
     #[test]
+    fn recreated_instance_restores_the_account_location_instead_of_the_home_feed() {
+        let runtime = EngineRuntime::default();
+        let room_url = "https://live.douyin.com/123456789"
+            .parse::<Url>()
+            .expect("test URL must parse");
+
+        remember_browser_instance_account(&runtime, "instance-old", "account-1");
+        remember_browser_location(&runtime, "instance-old", &room_url);
+
+        // Deleting the card and creating it again yields a new instance id.
+        remember_browser_instance_account(&runtime, "instance-new", "account-1");
+        assert_eq!(
+            browser_restore_location(&runtime, "instance-new").as_str(),
+            room_url.as_str()
+        );
+
+        // A different account must never inherit another account's page.
+        remember_browser_instance_account(&runtime, "instance-other", "account-2");
+        assert_eq!(
+            browser_restore_location(&runtime, "instance-other").as_str(),
+            "https://www.douyin.com/"
+        );
+    }
+
+    #[test]
     fn browser_popup_navigation_stays_on_safe_douyin_https_targets() {
         let live_room = "https://live.douyin.com/123456789?from=homepage"
             .parse::<Url>()
@@ -1574,6 +1775,19 @@ enum BrowserLoginState {
 struct BrowserLoginSnapshot {
     raw_cookie: Option<String>,
     state: BrowserLoginState,
+    /// Douyin rendered its anonymous shell (a visible top-bar 登录 entry) even
+    /// though the jar may already hold login cookies. That is a stale document
+    /// which loaded before the cookies landed, not CK expiry, so it must drive
+    /// a bounded reload instead of a credential verdict.
+    anonymous_render: bool,
+    /// The document is rendered far enough to be meaningful and carries no login
+    /// entry. Only this counts as evidence that a session actually took: a page
+    /// mid-hydration also has no login entry yet and must stay undetermined.
+    clean_render: bool,
+    /// Compact render facts (readyState, body length, header, host) behind the
+    /// verdict. Undetermined has several causes that need different handling, so
+    /// keep them observable without letting them influence any CK decision.
+    render_diagnostics: Option<String>,
 }
 
 async fn inspect_douyin_login(webview: &tauri::Webview) -> Result<BrowserLoginSnapshot, String> {
@@ -1584,7 +1798,14 @@ async fn inspect_douyin_login(webview: &tauri::Webview) -> Result<BrowserLoginSn
     webview
         .eval(
             r#"(() => {
+              // innerText is layout-dependent: a hidden or zero-sized child
+              // WebView returns '' for a fully loaded document. Keep it for the
+              // login-wall verdict, where "not rendered" must stay inconclusive
+              // rather than becoming CK expiry, and measure readiness against
+              // textContent so a card that was ever hidden cannot get stuck
+              // permanently undetermined.
               const text = document.body?.innerText || '';
+              const documentText = document.body?.textContent || '';
               // Only the dedicated login wall is authoritative. A lone visible
               // “登录” control appears during SPA transitions and secondary
               // prompts; treating it as logout was wiping freshly imported CK
@@ -1599,9 +1820,74 @@ async fn inspect_douyin_login(webview: &tauri::Webview) -> Result<BrowserLoginSn
                 ((text.includes('扫码登录') || text.includes('验证码登录')) &&
                   (text.includes('登录后即可') || text.includes('登录后观看') ||
                     text.includes('立即登录') || text.includes('短信登录')));
-              const ready = document.readyState !== 'loading' && Boolean(document.body);
+              // Live SPA after navigate often has document.readyState=complete
+              // while body is still the previous www feed / empty shell. Prefer
+              // hostname-aware readiness so we do not mis-label mid-nav as ready.
+              const host = String(location.hostname || '');
+              const path = String(location.pathname || '');
+              const onLiveHost = host === 'live.douyin.com' || host.endsWith('.live.douyin.com');
+              const bodyLen = String(text || '').trim().length;
+              const documentLen = String(documentText || '').trim().length;
+              const ready = document.readyState !== 'loading' && Boolean(document.body) &&
+                (onLiveHost ? documentLen > 40 || path.length > 1 : documentLen > 20);
               const state = loginWall ? 'out' : ready ? 'ready' : 'unknown';
-              document.cookie = `fubao_login_probe=${state}; Path=/; Secure; SameSite=None; Max-Age=5`;
+              // A visible login affordance means this document was rendered for
+              // an anonymous visitor. Reported separately from the verdict above
+              // so it can trigger a reload without touching CK health. Douyin
+              // renders its login entry as a plain div with obfuscated classes
+              // and no data-e2e hook, so scan divs/spans too and require the
+              // element to be on screen; `#login-panel-new` is the stable id of
+              // the inline logged-out panel.
+              const onScreen = (node) => {
+                const rect = node.getBoundingClientRect();
+                return rect.width > 8 && rect.height > 8 &&
+                  rect.top < window.innerHeight && rect.bottom > 0 &&
+                  rect.left < window.innerWidth && rect.right > 0;
+              };
+              const anonymousShell = (() => {
+                try {
+                  const panel = document.querySelector('#login-panel-new');
+                  if (panel && onScreen(panel)) return true;
+                  const nodes = document.querySelectorAll(
+                    'button, [role="button"], a, div, span'
+                  );
+                  let scanned = 0;
+                  for (const node of nodes) {
+                    if (scanned++ > 4000) break;
+                    const label = String(node.textContent || '').trim();
+                    if (label !== '登录' && label !== '登录抖音' && label !== '立即登录') continue;
+                    if (onScreen(node)) return true;
+                  }
+                  return false;
+                } catch (_) {
+                  return false;
+                }
+              })();
+              // “No login entry” only means something while the header that
+               // hosts it is both hydrated and actually on screen. The feed body
+              // paints before that header, and scrolling the feed moves the
+              // login entry out of view — judging either as authenticated is how
+              // an anonymous card kept reading as healthy.
+              const headerReady = (() => {
+                try {
+                  const search = document.querySelector('input[placeholder*="搜索"]');
+                  return Boolean(search) && onScreen(search);
+                } catch (_) {
+                  return false;
+                }
+              })();
+              const marker = `${state}${
+                anonymousShell ? '-anon' : headerReady && bodyLen > 200 ? '-auth' : ''
+              }`;
+              document.cookie = `fubao_login_probe=${marker}; Path=/; Secure; SameSite=None; Max-Age=5`;
+              // Separate channel so the verdict parsing above stays suffix-based.
+              // An undetermined render has several very different causes (skeleton
+              // that never paints, mid-navigation document, unreadable jar) and
+              // they need different handling, so record which one it was.
+              const diag = `rs.${document.readyState}~bl.${bodyLen}~tl.${documentLen}~hdr.${
+                headerReady ? 1 : 0
+              }~h.${host.replace(/[^a-z.]/g, '')}`;
+              document.cookie = `fubao_login_diag=${diag}; Path=/; Secure; SameSite=None; Max-Age=5`;
             })();"#,
         )
         .map_err(|error| format!("检查浏览器登录页面失败：{error}"))?;
@@ -1614,19 +1900,79 @@ async fn inspect_douyin_login(webview: &tauri::Webview) -> Result<BrowserLoginSn
         .iter()
         .find(|cookie| cookie.name() == "fubao_login_probe")
         .map(|cookie| cookie.value().to_string());
+    let render_diagnostics = cookies
+        .iter()
+        .find(|cookie| cookie.name() == "fubao_login_diag")
+        .map(|cookie| cookie.value().to_string());
     let raw_cookie = read_douyin_cookie(webview).ok();
-    let _ = webview
-        .eval("document.cookie='fubao_login_probe=; Path=/; Secure; SameSite=None; Max-Age=0'");
+    let _ = webview.eval(
+        "document.cookie='fubao_login_probe=; Path=/; Secure; SameSite=None; Max-Age=0';\
+         document.cookie='fubao_login_diag=; Path=/; Secure; SameSite=None; Max-Age=0'",
+    );
     // Login wall is LoggedOut even when injected cookies remain in the jar.
     // Windows WebView2 often keeps store tokens after a rejected session; that
     // must still surface as CK expiry outside the bootstrap grace window.
-    let state = match probe.as_deref() {
+    // When the probe cookie is lost (SameSite/path races after live navigate)
+    // but login cookies are readable and no login wall was reported, treat as
+    // LoggedIn — otherwise every red-packet prepare toasted “尚未完成加载”.
+    let jar_logged_in = raw_cookie.as_ref().is_some_and(|value| !value.trim().is_empty());
+    let anonymous_render = probe.as_deref().is_some_and(|value| value.ends_with("-anon"));
+    let clean_render = probe.as_deref().is_some_and(|value| value.ends_with("-auth"));
+    let probe_state = probe.as_deref().map(|value| {
+        value
+            .strip_suffix("-anon")
+            .or_else(|| value.strip_suffix("-auth"))
+            .unwrap_or(value)
+    });
+    let state = match probe_state {
         Some("out") => BrowserLoginState::LoggedOut,
-        Some("ready") if raw_cookie.is_some() => BrowserLoginState::LoggedIn,
+        Some("ready") if jar_logged_in => BrowserLoginState::LoggedIn,
         Some("ready") => BrowserLoginState::Unknown,
+        Some("unknown") if jar_logged_in => BrowserLoginState::Unknown,
+        _ if jar_logged_in => BrowserLoginState::LoggedIn,
         _ => BrowserLoginState::Unknown,
     };
-    Ok(BrowserLoginSnapshot { raw_cookie, state })
+    Ok(BrowserLoginSnapshot {
+        raw_cookie,
+        state,
+        anonymous_render,
+        clean_render,
+        render_diagnostics,
+    })
+}
+
+/// True only when the current document is both a confirmed login and free of
+/// Douyin's anonymous shell. Used to decide whether another full page load is
+/// still needed, so a healthy first load does not pay for a redundant reload.
+#[cfg(not(target_os = "windows"))]
+async fn douyin_render_is_authenticated(webview: &tauri::Webview) -> bool {
+    inspect_douyin_login(webview)
+        .await
+        .ok()
+        .is_some_and(|snapshot| {
+            matches!(snapshot.state, BrowserLoginState::LoggedIn) && !snapshot.anonymous_render
+        })
+}
+
+/// Wait after live-room navigation until login is definitive or the deadline.
+/// SPA transitions commonly report Unknown for several seconds even when the
+/// jar already holds a valid session.
+async fn wait_for_douyin_login_ready(
+    webview: &tauri::Webview,
+    max_wait: Duration,
+) -> Result<BrowserLoginSnapshot, String> {
+    let deadline = Instant::now() + max_wait;
+    let mut last = inspect_douyin_login(webview).await?;
+    while Instant::now() < deadline {
+        match last.state {
+            BrowserLoginState::LoggedIn | BrowserLoginState::LoggedOut => return Ok(last),
+            BrowserLoginState::Unknown => {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                last = inspect_douyin_login(webview).await?;
+            }
+        }
+    }
+    Ok(last)
 }
 
 /// Browser snapshots may miss HttpOnly login cookies briefly after inject or
@@ -1668,6 +2014,7 @@ async fn read_authenticated_douyin_cookie(webview: &tauri::Webview) -> Result<St
             Ok(BrowserLoginSnapshot {
                 raw_cookie: Some(raw_cookie),
                 state: BrowserLoginState::LoggedIn,
+                ..
             }) => {
                 // Prefer the longest snapshot once LoggedIn — later ticks often
                 // add auxiliary cookies that the first tick omitted.
@@ -2180,39 +2527,190 @@ async fn execute_page_participation(
             if (!found.anchor_id) {{
               try {{
                 const html = String(document.documentElement && document.documentElement.innerHTML || '').slice(0, 250000);
-                const match = html.match(/"(?:owner_user_id|anchor_id|anchor_id_str|sec_anchor_id)"\\s*:\\s*"?(\\d{{6,}})"?/);
+                const match = html.match(/"(?:owner_user_id|anchor_id|anchor_id_str)"\\s*:\\s*"?(\\d{{6,}})"?/);
                 if (match && match[1]) found.anchor_id = match[1];
               }} catch (_) {{}}
             }}
+            // sec_anchor_id is MS4w... (not digits). Digit-only regex always missed it.
+            if (!found.sec_anchor_id) {{
+              try {{
+                const html = String(document.documentElement && document.documentElement.innerHTML || '').slice(0, 400000);
+                let m = html.match(/"sec_anchor_id"\\s*:\\s*"([^"]{{12,}})"/);
+                if (!m) m = html.match(/"sec_uid"\\s*:\\s*"(MS4w[^"]{{8,}})"/);
+                if (m && m[1]) found.sec_anchor_id = m[1];
+              }} catch (_) {{}}
+            }}
+            if (!found.sec_anchor_id) {{
+              try {{
+                const walkSec = (node, depth) => {{
+                  if (!node || depth > 8) return '';
+                  if (Array.isArray(node)) {{
+                    for (const item of node) {{
+                      const foundSec = walkSec(item, depth + 1);
+                      if (foundSec) return foundSec;
+                    }}
+                    return '';
+                  }}
+                  if (typeof node !== 'object') return '';
+                  for (const key of ['sec_anchor_id', 'sec_uid', 'secUid', 'sec_user_id']) {{
+                    const value = String(node[key] || '').trim();
+                    if (value.length >= 12 && (value.indexOf('MS4w') === 0 || value.length > 20)) return value;
+                  }}
+                  for (const nestKey of ['owner', 'anchor', 'author', 'user', 'room_owner', 'roomOwner', 'data', 'room', 'roomInfo']) {{
+                    const nest = node[nestKey];
+                    if (nest && typeof nest === 'object') {{
+                      const foundSec = walkSec(nest, depth + 1);
+                      if (foundSec) return foundSec;
+                    }}
+                  }}
+                  return '';
+                }};
+                for (const id of ['RENDER_DATA', '__NEXT_DATA__', 'SIGI_STATE']) {{
+                  const el = document.getElementById(id) || document.querySelector(`script#${{id}}`);
+                  if (!el || !el.textContent) continue;
+                  let raw = el.textContent;
+                  try {{ raw = decodeURIComponent(raw); }} catch (_) {{}}
+                  const parsed = JSON.parse(raw);
+                  const sec = walkSec(parsed, 0);
+                  if (sec) {{ found.sec_anchor_id = sec; break; }}
+                }}
+              }} catch (_) {{}}
+            }}
+            if (!found.device_id) {{
+              try {{
+                const html = String(document.documentElement && document.documentElement.innerHTML || '').slice(0, 400000);
+                const m = html.match(/"device_id"\\s*:\\s*"?(\\d{{6,}})"?/);
+                if (m && m[1]) found.device_id = m[1];
+              }} catch (_) {{}}
+            }}
+            if (!found.user_unique_id) {{
+              try {{
+                const html = String(document.documentElement && document.documentElement.innerHTML || '').slice(0, 400000);
+                const m = html.match(/"user_unique_id"\\s*:\\s*"?(\\d{{6,}})"?/);
+                if (m && m[1]) found.user_unique_id = m[1];
+              }} catch (_) {{}}
+            }}
+            // Real live-page join uses s_v_web_id as verifyFp/fp when dedicated keys absent.
+            if (found.s_v_web_id) {{
+              if (!found.verifyFp) found.verifyFp = found.s_v_web_id;
+              if (!found.fp) found.fp = found.s_v_web_id;
+            }}
+            if (found.verifyFp && !found.fp) found.fp = found.verifyFp;
+            if (found.fp && !found.verifyFp) found.verifyFp = found.fp;
+            try {{
+              const live = typeof window.__fubaoGetLiveIdentity === 'function' ? window.__fubaoGetLiveIdentity() : (window.__fubaoLiveIdentity || {{}});
+              for (const key of ['room_id', 'anchor_id', 'anchor_id_str', 'sec_anchor_id', 'user_id', 'sec_user_id', 'user_unique_id', 'msToken', 'device_id', 'verifyFp', 'fp', 's_v_web_id']) {{
+                if (!found[key] && live[key]) found[key] = live[key];
+              }}
+            }} catch (_) {{}}
             return found;
           }};
-          const requestURL = (endpoint) => {{
-            let url = new URL('https://live.douyin.com/webcast/luckybox/join/');
+          // pageRoomID: only what the live SPA is using right now (no task fallback).
+          // join_diag showed pageRoom=0 while msToken/a_bogus=1 — stale task room_id
+          // then causes succeed=false. Prefer live identity from hooked traffic.
+          const pageRoomID = () => {{
             try {{
-              // Prefer a same-room luckybox/webcast template so browser fingerprint
-              // query keys match what this live page already used successfully.
+              const live = typeof window.__fubaoGetLiveIdentity === 'function' ? window.__fubaoGetLiveIdentity() : (window.__fubaoLiveIdentity || {{}});
+              const rid = String(live.room_id || '').trim();
+              if (looksNumericID(rid) && rid.length >= 10) return rid;
+            }} catch (_) {{}}
+            try {{
               const entries = performance.getEntriesByType('resource').slice().reverse();
-              let best = null;
-              let scoreBest = -1;
-              const wantRoom = String(task.actual_room_id || '').trim();
               for (const entry of entries) {{
                 try {{
                   const candidate = new URL(String(entry.name || ''), location.href);
-                  if (candidate.hostname !== 'live.douyin.com' || !candidate.pathname.startsWith('/webcast/')) continue;
-                  let score = 1;
-                  if (candidate.pathname.indexOf('luckybox') >= 0) score += 4;
-                  if (wantRoom && candidate.searchParams.get('room_id') === wantRoom) score += 5;
-                  if (candidate.searchParams.get('aid')) score += 1;
-                  if (score > scoreBest) {{ scoreBest = score; best = candidate; }}
-                  if (score >= 10) break;
+                  if (!/douyin\\.com$/i.test(candidate.hostname)) continue;
+                  if (!candidate.pathname.includes('/webcast/')) continue;
+                  const rid = String(candidate.searchParams.get('room_id') || '').trim();
+                  if (looksNumericID(rid) && rid.length >= 10) return rid;
                 }} catch (_) {{}}
               }}
-              if (best) url = best;
+            }} catch (_) {{}}
+            try {{
+              for (const id of ['RENDER_DATA', '__NEXT_DATA__', 'SIGI_STATE']) {{
+                const el = document.getElementById(id) || document.querySelector(`script#${{id}}`);
+                if (!el || !el.textContent) continue;
+                let text = el.textContent;
+                try {{ text = decodeURIComponent(text); }} catch (_) {{}}
+                const parsed = JSON.parse(text);
+                const walk = (node, depth) => {{
+                  if (!node || depth > 8) return '';
+                  if (Array.isArray(node)) {{
+                    for (const item of node) {{
+                      const found = walk(item, depth + 1);
+                      if (found) return found;
+                    }}
+                    return '';
+                  }}
+                  if (typeof node !== 'object') return '';
+                  for (const key of ['room_id', 'roomId', 'enter_room_id', 'enterRoomId', 'id_str', 'idStr']) {{
+                    const value = pickNumeric(node[key]);
+                    if (value && value.length >= 10) return value;
+                  }}
+                  for (const nestKey of ['room', 'roomInfo', 'room_info', 'data', 'roomStore']) {{
+                    const nest = node[nestKey];
+                    if (nest && typeof nest === 'object') {{
+                      const found = walk(nest, depth + 1);
+                      if (found) return found;
+                    }}
+                  }}
+                  return '';
+                }};
+                const found = walk(parsed, 0);
+                if (found) return found;
+              }}
+            }} catch (_) {{}}
+            try {{
+              const html = String(document.documentElement && document.documentElement.innerHTML || '').slice(0, 400000);
+              const match = html.match(/"(?:room_id|enter_room_id)"\\s*:\\s*"?(\\d{{10,}})"?/);
+              if (match && match[1]) return match[1];
+            }} catch (_) {{}}
+            return '';
+          }};
+          // Page-sniffed live room_id when available, else the task room. Never
+          // block the join on the sniffed value: it is often unavailable in the
+          // embedded WebView, and the verified succeed:true path used the task room.
+          const liveRoomID = () => pageRoomID() || String(task.actual_room_id || '').trim();
+          const pickWebcastTemplate = () => {{
+            try {{
+              const entries = performance.getEntriesByType('resource').slice().reverse();
+              let fallback = null;
+              for (const entry of entries) {{
+                try {{
+                  const candidate = new URL(String(entry.name || ''), location.href);
+                  if (candidate.hostname !== 'live.douyin.com') continue;
+                  if (!candidate.pathname.startsWith('/webcast/')) continue;
+                  const path = candidate.pathname;
+                  // Prefer room enter / im / rank — avoid box list pollution templates.
+                  if (/\/webcast\/room\//.test(path) || /\/webcast\/im\//.test(path) ||
+                      /\/webcast\/ranklist\//.test(path) || /\/webcast\/gift\//.test(path)) {{
+                    return candidate;
+                  }}
+                  if (!fallback && !/\/luckybox\/box\/list/.test(path) && !/\/lottery\//.test(path)) {{
+                    fallback = candidate;
+                  }}
+                }} catch (_) {{}}
+              }}
+              return fallback;
+            }} catch (_) {{
+              return null;
+            }}
+          }};
+          // Clone a real same-room webcast request as the template so the join
+          // carries exactly the session/fingerprint query keys this live page has
+          // already used successfully, then override the join fields. Strip only
+          // signatures and list cursors: bdms re-signs msToken/a_bogus on send, so
+          // never attach a sniffed msToken here — a token that does not match the
+          // signature is a soft-deny cause.
+          const requestURL = (endpoint) => {{
+            let url = new URL(`https://live.douyin.com/webcast/luckybox/${{endpoint}}/`);
+            try {{
+              const template = pickWebcastTemplate();
+              if (template) url = new URL(template.toString());
             }} catch (_) {{}}
             url.protocol = 'https:';
             url.hostname = 'live.douyin.com';
             url.pathname = `/webcast/luckybox/${{endpoint}}/`;
-            // Drop stale signatures so page bdms/fetch hooks can re-sign.
             for (const key of [
               'msToken', 'a_bogus', 'X-Bogus', '__ac_signature', '__ac_nonce',
               'cursor', 'count', 'offset', 'fetch_time', 'last_id', 'room_ids',
@@ -2222,8 +2720,12 @@ async fn execute_page_participation(
             }}
             const identity = pageIdentity();
             const runtime = detectRuntimeFingerprint();
-            const userId = String(task.user_id || identity.user_id || '').trim();
-            const secUserId = String(task.sec_uid || identity.sec_user_id || '').trim();
+            let live = {{}};
+            try {{
+              live = typeof window.__fubaoGetLiveIdentity === 'function' ? window.__fubaoGetLiveIdentity() : (window.__fubaoLiveIdentity || {{}});
+            }} catch (_) {{}}
+            const userId = String(task.user_id || identity.user_id || live.user_id || '').trim();
+            const secUserId = String(task.sec_uid || identity.sec_user_id || live.sec_user_id || '').trim();
             // Match real live-page join captures: enter_from=link_share, no
             // web_rid/box_type on join, and empty pc_client_version is fine.
             const values = {{
@@ -2252,19 +2754,20 @@ async fn execute_page_participation(
               version_name: '17.4.0',
               action_type: 'click',
               is_ad: '0',
-              room_id: task.actual_room_id,
+              room_id: liveRoomID(),
               box_id: task.box_id,
               user_id: userId,
               sec_user_id: secUserId,
-              user_unique_id: identity.user_unique_id || '',
+              user_unique_id: live.user_unique_id || identity.user_unique_id || '',
               user_agent: navigator.userAgent || ''
             }};
-            const anchor = String(task.anchor_id || identity.anchor_id || '').trim();
+            const anchor = String(task.anchor_id || identity.anchor_id || live.anchor_id || live.anchor_id_str || '').trim();
             if (anchor) {{
               values.anchor_id = anchor;
               values.anchor_id_str = anchor;
             }}
-            if (identity.sec_anchor_id) values.sec_anchor_id = identity.sec_anchor_id;
+            const secAnchor = String(live.sec_anchor_id || identity.sec_anchor_id || '').trim();
+            if (secAnchor) values.sec_anchor_id = secAnchor;
             // receive keeps optional room-entry fingerprint keys when present.
             if (endpoint === 'receive') {{
               if (task.web_rid) values.web_rid = task.web_rid;
@@ -2283,14 +2786,17 @@ async fn execute_page_participation(
             }}
             return url;
           }};
-          // Real page join POSTs JSON body {{box_id, room_id, anchor_id}}.
           const requestBody = (endpoint) => {{
             if (endpoint === 'receive') return '';
             const body = {{
               box_id: String(task.box_id || ''),
-              room_id: String(task.actual_room_id || '')
+              room_id: String(liveRoomID() || task.actual_room_id || '')
             }};
-            const anchor = String(task.anchor_id || pageIdentity().anchor_id || '').trim();
+            let live = {{}};
+            try {{
+              live = typeof window.__fubaoGetLiveIdentity === 'function' ? window.__fubaoGetLiveIdentity() : (window.__fubaoLiveIdentity || {{}});
+            }} catch (_) {{}}
+            const anchor = String(task.anchor_id || pageIdentity().anchor_id || live.anchor_id || '').trim();
             if (anchor) body.anchor_id = anchor;
             return JSON.stringify(body);
           }};
@@ -2316,26 +2822,32 @@ async fn execute_page_participation(
               return {{endpoint: 'receive', status: Number(item.status || 200), text: String(item.body)}};
             }} catch (_) {{ return null; }}
           }};
-          const takeCapturedJoin = (maxAgeMs) => {{
+          // Pull room_id / user_unique_id from any webcast traffic the SPA already sent.
+          const harvestSessionIdentity = () => {{
             try {{
-              if (typeof window.__fubaoTakeRedPacketJoinResult !== 'function') return null;
-              const item = window.__fubaoTakeRedPacketJoinResult(task.box_id, task.packet_id, maxAgeMs);
-              if (!item || !item.body) return null;
-              return {{
-                endpoint: String(item.endpoint || 'join'),
-                status: Number(item.status || 200),
-                text: String(item.body)
+              const live = window.__fubaoLiveIdentity || (window.__fubaoLiveIdentity = {{}});
+              const take = (key, value, minLen) => {{
+                const raw = String(value == null ? '' : value).trim();
+                if (!raw) return;
+                if (minLen && raw.length < minLen) return;
+                if (!live[key]) live[key] = raw;
               }};
-            }} catch (_) {{ return null; }}
-          }};
-          const waitCapturedJoin = async (timeoutMs) => {{
-            const deadline = Date.now() + Math.max(400, Number(timeoutMs || 2200));
-            while (Date.now() < deadline) {{
-              const captured = takeCapturedJoin(timeoutMs + 500);
-              if (captured) return captured;
-              await new Promise((resolve) => setTimeout(resolve, 120));
-            }}
-            return null;
+              const entries = performance.getEntriesByType('resource').slice().reverse();
+              for (const entry of entries.slice(0, 80)) {{
+                try {{
+                  const candidate = new URL(String(entry.name || ''), location.href);
+                  if (!/douyin\\.com$/i.test(candidate.hostname)) continue;
+                  if (!candidate.pathname.includes('/webcast/')) continue;
+                  take('room_id', candidate.searchParams.get('room_id'), 10);
+                  take('user_unique_id', candidate.searchParams.get('user_unique_id'), 5);
+                  take('sec_anchor_id', candidate.searchParams.get('sec_anchor_id'), 10);
+                  take('anchor_id', candidate.searchParams.get('anchor_id'), 5);
+                  take('msToken', candidate.searchParams.get('msToken'), 8);
+                }} catch (_) {{}}
+              }}
+              live.saved_at = Date.now();
+              window.__fubaoLiveIdentity = live;
+            }} catch (_) {{}}
           }};
           const clickResultSurface = () => {{
             try {{
@@ -2358,132 +2870,80 @@ async fn execute_page_participation(
               return true;
             }} catch (_) {{ return false; }}
           }};
-          const clickJoinSurface = () => {{
-            try {{
-              const packetIds = new Set([String(task.box_id || ''), String(task.packet_id || '')].filter(Boolean));
-              const visible = (element) => {{
-                const style = window.getComputedStyle(element);
-                const rect = element.getBoundingClientRect();
-                return style.display !== 'none' && style.visibility !== 'hidden' &&
-                  Number(style.opacity || 1) > 0.05 && rect.width > 4 && rect.height > 4;
-              }};
-              const actionText = /^(抢红包|领红包|领取红包|立即领取|开红包|拆红包|拆开红包|抢|开|领|领取|拆|拆开)$/;
-              // Never use CSS4 case-insensitive attribute flags (` i`): WKWebView
-              // can surface them as JS ReferenceError "Can't find variable: i".
-              const candidates = Array.from(document.querySelectorAll('button,[role="button"],a,div,span,[class*="button"],[class*="btn"],[class*="Button"],[class*="Btn"]'))
-                .map((element) => {{
-                  const own = String(element.innerText || element.textContent || '').replace(/\s+/g, ' ').trim();
-                  let parent = element;
-                  let context = own;
-                  for (let depth = 0; depth < 5 && parent; depth += 1, parent = parent.parentElement) {{
-                    context += ` ${{String(parent.innerText || '').slice(0, 500)}}`;
-                    for (const key of ['data-box-id', 'data-boxid', 'data-activity-id', 'data-packet-id', 'data-red-packet-id']) {{
-                      const value = String(parent.getAttribute && parent.getAttribute(key) || '').trim();
-                      if (value) context += ` ${{value}}`;
-                    }}
-                  }}
-                  const lowered = context.toLowerCase();
-                  if (!visible(element) || !actionText.test(own) || /福袋|抽奖|lottery/.test(lowered)) return null;
-                  const matchedId = Array.from(packetIds).some((id) => id && context.includes(id));
-                  const hasRedPacket = /红包|luckybox|red[ _-]?packet|钻石红包|礼物红包/i.test(context);
-                  if (!hasRedPacket && !matchedId) return null;
-                  return {{element, score: (matchedId ? 100 : 0) + (hasRedPacket ? 20 : 0)}};
-                }})
-                .filter(Boolean)
-                .sort((left, right) => right.score - left.score);
-              const candidate = candidates[0];
-              if (!candidate) return false;
-              try {{ candidate.element.scrollIntoView({{block: 'center', inline: 'center'}}); }} catch (_) {{}}
-              for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {{
-                try {{ candidate.element.dispatchEvent(new MouseEvent(type, {{bubbles: true, cancelable: true, view: window}})); }} catch (_) {{}}
-              }}
-              try {{ if (typeof candidate.element.click === 'function') candidate.element.click(); }} catch (_) {{}}
-              return true;
-            }} catch (_) {{ return false; }}
-          }};
-          const clickPacketSurface = () => {{
-            try {{
-              const packetIds = [String(task.box_id || ''), String(task.packet_id || '')].filter(Boolean);
-              const visible = (element) => {{
-                const style = window.getComputedStyle(element);
-                const rect = element.getBoundingClientRect();
-                return style.display !== 'none' && style.visibility !== 'hidden' &&
-                  Number(style.opacity || 1) > 0.05 && rect.width > 12 && rect.height > 12;
-              }};
-              const candidates = Array.from(document.querySelectorAll('div,section,li,[role="dialog"],[class*="packet"],[class*="Packet"],[class*="lucky"],[class*="Lucky"]'))
-                .map((element) => {{
-                  if (!visible(element)) return null;
-                  const context = String(element.innerText || '').replace(/\s+/g, ' ').slice(0, 700);
-                  const descriptor = String(element.className || '') + ' ' + String(element.getAttribute('data-e2e') || '');
-                  if (/福袋|抽奖|lottery/.test(context + descriptor)) return null;
-                  const hasId = packetIds.some((id) => id && (context.includes(id) || descriptor.includes(id)));
-                  const hasPacketCopy = /钻石红包|礼物红包|红包/.test(context) && /(?:共|总)\s*\d+\s*(?:钻|份)/.test(context);
-                  if (!hasId && !hasPacketCopy) return null;
-                  const rect = element.getBoundingClientRect();
-                  if (rect.width > 520 || rect.height > 420) return null;
-                  return {{element, score: (hasId ? 100 : 0) + (hasPacketCopy ? 20 : 0) + Math.min(10, rect.width / 1000)}};
-                }})
-                .filter(Boolean)
-                .sort((left, right) => right.score - left.score);
-              const candidate = candidates[0];
-              if (!candidate) return false;
-              try {{ candidate.element.scrollIntoView({{block: 'center', inline: 'center'}}); }} catch (_) {{}}
-              candidate.element.click();
-              return true;
-            }} catch (_) {{ return false; }}
-          }};
           const send = async (endpoint) => {{
-            // Prefer page fetch first so bdms.js (if present) can re-sign the URL.
-            // Bound waits so hung network cannot starve finish().
+            // Page fetch only for join, so bdms.js re-signs the URL (msToken +
+            // a_bogus). The XHR fallback is reserved for receive: it bypasses the
+            // fetch hook, so every join it ever sent was soft-denied, and re-sending
+            // the same join is exactly the double-request shape that earns
+            // rush_spam. Bound both so a hung request cannot outlive the rush window.
+            try {{
+              if (typeof window.__fubaoEnsureFetchHook === 'function') window.__fubaoEnsureFetchHook();
+            }} catch (_) {{}}
             const bodyText = requestBody(endpoint);
-            const urlText = requestURL(endpoint).toString();
+            let urlText = requestURL(endpoint).toString();
             const contentType = endpoint === 'receive'
               ? 'application/x-www-form-urlencoded'
               : 'application/json';
-            const requestTimeoutMs = endpoint === 'receive' ? 7000 : 7000;
+            const requestTimeoutMs = 6000;
             let status = 0;
             let text = '';
-            // 1) fetch (bdms-friendly)
-            try {{
+            let transport = 'none';
+            const headers = {{
+              'accept': 'application/json, text/plain, */*',
+              'content-type': contentType
+            }};
+            const doFetch = async (url) => {{
               const controller = typeof AbortController === 'function' ? new AbortController() : null;
               const timer = controller ? setTimeout(() => controller.abort(), requestTimeoutMs) : 0;
-              const response = await fetch(urlText, {{
-                method: 'POST', credentials: 'include', cache: 'no-store',
-                headers: {{'accept': 'application/json, text/plain, */*', 'content-type': contentType}},
-                body: bodyText,
-                referrer: 'https://live.douyin.com/' + String(task.web_rid || ''),
-                referrerPolicy: 'strict-origin-when-cross-origin',
-                signal: controller ? controller.signal : undefined
-              }});
-              if (timer) clearTimeout(timer);
-              status = response.status;
-              text = await response.text();
-            }} catch (_) {{
-              status = 0;
-              text = '';
-            }}
-            // 2) XHR fallback (some rooms only sign XHR)
-            if ((!text || status === 0) && typeof XMLHttpRequest === 'function') {{
+              try {{
+                const response = await window.fetch(url, {{
+                  method: 'POST', credentials: 'include', cache: 'no-store',
+                  headers,
+                  body: bodyText,
+                  referrer: `https://live.douyin.com/${{task.web_rid}}`,
+                  referrerPolicy: 'strict-origin-when-cross-origin',
+                  mode: 'cors',
+                  signal: controller ? controller.signal : undefined
+                }});
+                status = response.status;
+                text = await response.text();
+                transport = 'fetch';
+                try {{
+                  const finalURL = String(response && response.url || url);
+                  if (finalURL && finalURL.indexOf('http') === 0) urlText = finalURL;
+                }} catch (_) {{}}
+              }} finally {{
+                if (timer) clearTimeout(timer);
+              }}
+            }};
+            const doXHR = async (url) => {{
+              if (typeof XMLHttpRequest !== 'function') return;
               await new Promise((resolve) => {{
-                let settled = false;
-                const done = () => {{ if (!settled) {{ settled = true; resolve(); }} }};
                 try {{
                   const xhr = new XMLHttpRequest();
-                  xhr.open('POST', urlText, true);
-                  xhr.timeout = requestTimeoutMs;
+                  xhr.open('POST', url, true);
                   xhr.withCredentials = true;
                   xhr.setRequestHeader('Accept', 'application/json, text/plain, */*');
                   xhr.setRequestHeader('Content-Type', contentType);
-                  xhr.onload = () => {{ status = xhr.status; text = String(xhr.responseText || ''); done(); }};
-                  xhr.onerror = () => {{ status = 0; text = ''; done(); }};
-                  xhr.ontimeout = () => {{ status = 0; text = ''; done(); }};
-                  xhr.onabort = () => {{ status = 0; text = ''; done(); }};
-                  setTimeout(() => {{ try {{ xhr.abort(); }} catch (_) {{}} done(); }}, requestTimeoutMs + 200);
+                  xhr.timeout = requestTimeoutMs;
+                  xhr.onload = () => {{
+                    status = xhr.status;
+                    text = String(xhr.responseText || '');
+                    transport = 'xhr';
+                    try {{ if (xhr.responseURL) urlText = String(xhr.responseURL); }} catch (_) {{}}
+                    resolve();
+                  }};
+                  xhr.onerror = () => {{ status = 0; text = ''; resolve(); }};
+                  xhr.ontimeout = () => {{ status = 0; text = ''; resolve(); }};
+                  xhr.onabort = () => {{ status = 0; text = ''; resolve(); }};
+                  setTimeout(() => {{ try {{ xhr.abort(); }} catch (_) {{}} resolve(); }}, requestTimeoutMs + 200);
                   xhr.send(bodyText);
-                }} catch (_) {{ done(); }}
+                }} catch (_) {{ resolve(); }}
               }});
-            }}
-            if (endpoint === 'receive' && text) {{
+            }};
+            try {{ await doFetch(urlText); }} catch (_) {{ status = 0; text = ''; }}
+            if ((!text || status === 0) && endpoint === 'receive') {{ await doXHR(urlText); }}
+            if (endpoint === 'receive') {{
               try {{
                 const parsed = JSON.parse(text);
                 const infos = parsed && parsed.data && parsed.data.receive_info;
@@ -2502,114 +2962,101 @@ async fn execute_page_participation(
                 text = JSON.stringify({{status_code: parsed.status_code, status_msg: parsed.status_msg, data: {{receive_info: reduced}}}});
               }} catch (error) {{}}
             }}
-            return {{endpoint, status, text}};
+            let diag = '';
+            try {{
+              const u = new URL(urlText);
+              const hasTemplate = Boolean(pickWebcastTemplate());
+              diag = [
+                `msToken=${{u.searchParams.get('msToken') ? 1 : 0}}`,
+                `a_bogus=${{u.searchParams.get('a_bogus') ? 1 : 0}}`,
+                `pageRoom=${{pageRoomID() ? 1 : 0}}`,
+                `roomSrc=${{pageRoomID() ? 'page' : (String(task.actual_room_id || '').trim() ? 'task' : 'none')}}`,
+                `tpl=${{hasTemplate ? 1 : 0}}`,
+                `room=${{u.searchParams.get('room_id') || ''}}`,
+                `box=${{u.searchParams.get('box_id') || ''}}`,
+                `anchor=${{u.searchParams.get('anchor_id') || ''}}`,
+                `sec_anchor=${{u.searchParams.get('sec_anchor_id') ? 1 : 0}}`,
+                `uid=${{u.searchParams.get('user_id') || ''}}`,
+                `vfp=${{u.searchParams.get('verifyFp') || u.searchParams.get('fp') || u.searchParams.get('s_v_web_id') ? 1 : 0}}`,
+                `did=${{u.searchParams.get('device_id') ? 1 : 0}}`,
+                `uuniq=${{u.searchParams.get('user_unique_id') ? 1 : 0}}`,
+                `sv=${{u.searchParams.get('s_v_web_id') ? 1 : 0}}`,
+                `bv=${{u.searchParams.get('browser_version') || ''}}`,
+                `bdms=${{window.bdms || window.byted_acrawler ? 1 : 0}}`,
+                `xport=${{transport}}`
+              ].join(' ');
+            }} catch (_) {{ diag = 'diag_parse_fail'; }}
+            return {{endpoint, status, text, diag, url_has_abogus: /[?&]a_bogus=/.test(urlText)}};
           }};
           (async () => {{
-            let finished = false;
-            const finishOnce = (result) => {{
-              if (finished) return;
-              finished = true;
-              finish(result);
-            }};
             try {{
               if (location.hostname !== 'live.douyin.com' || location.pathname.replace(/^\/+|\/+$/g, '') !== String(task.web_rid)) {{
-                finishOnce({{endpoint: 'page', http_status: 0, body: '', error: '浏览器实例未进入目标直播间', attempts: 0, context_missing: true}});
+                finish({{endpoint: 'page', http_status: 0, body: '', error: '浏览器实例未进入目标直播间', attempts: 0, context_missing: true}});
                 return;
               }}
               if (detectsVisibleChallenge()) {{
-                finishOnce({{endpoint: 'page', http_status: 0, body: '', error: '验证码/安全验证拦截，已暂停接收新任务', attempts: 0, context_missing: false, login_expired: false, challenge_blocked: true}});
+                finish({{endpoint: 'page', http_status: 0, body: '', error: '验证码/安全验证拦截，已暂停接收新任务', attempts: 0, context_missing: false, login_expired: false, challenge_blocked: true}});
                 return;
               }}
               if (task.action === 'receive') {{
                 const captured = takeCapturedReceive();
                 if (captured) {{
-                  finishOnce({{endpoint: captured.endpoint, http_status: captured.status, body: captured.text, error: '', attempts: 1, context_missing: false, login_expired: false, challenge_blocked: false}});
+                  finish({{endpoint: captured.endpoint, http_status: captured.status, body: captured.text, error: '', attempts: 1, context_missing: false, login_expired: false, challenge_blocked: false}});
                   return;
                 }}
               }}
-              // Pure API join is the primary path. Wait briefly while SPA settles.
-              // Keep this budget small so soft-deny retries still fit under the
-              // native cookie-poll timeout (~15–20s).
+              // Keep this pre-join budget very small. Go admits the account only
+              // inside the final-countdown window, so every second spent here is
+              // taken straight out of the packet's remaining rush time. Do not
+              // gate on page-sniffed room_id: it is frequently unavailable in the
+              // embedded WebView and waiting for it burned the whole window.
               if (task.action !== 'receive') {{
                 const readyDeadline = Date.now() + 1600;
                 while (Date.now() < readyDeadline) {{
-                  const head = String(document.body && document.body.innerText || '').slice(0, 500);
+                  harvestSessionIdentity();
+                  const head = String(document.body && document.body.innerText || '').slice(0, 400);
                   const stillEntering = /正在进入直播间|加载中|连接中/.test(head);
                   let hasWebcast = false;
                   try {{
-                    // Use plain string match — a previous regex literal with
-                    // over-escaped slashes threw SyntaxError and aborted the
-                    // entire page join script (every attempt timed out as page).
+                    // Plain string match — a regex literal with over-escaped
+                    // slashes once threw SyntaxError and aborted the whole script.
                     hasWebcast = performance.getEntriesByType('resource').some((entry) =>
                       String(entry.name || '').includes('live.douyin.com/webcast/')
                     );
                   }} catch (_) {{}}
+                  if (hasWebcast) {{
+                    try {{ if (typeof window.__fubaoEnsureFetchHook === 'function') window.__fubaoEnsureFetchHook(); }} catch (_) {{}}
+                  }}
                   if (!stillEntering && (hasWebcast || pageIdentity().anchor_id || task.anchor_id)) break;
                   await new Promise((resolve) => setTimeout(resolve, 100));
                 }}
+                harvestSessionIdentity();
               }}
-              const softDeny = (text) => {{
-                try {{
-                  const parsed = JSON.parse(String(text || ''));
-                  if (Number(parsed.status_code ?? -1) !== 0) return false;
-                  const data = parsed.data && typeof parsed.data === 'object' ? parsed.data : {{}};
-                  if (data.succeed === true || data.succeeded === true || data.joined === true ||
-                    data.has_joined === true || data.hasJoined === true || data.success === true ||
-                    data.is_success === true || data.isSuccess === true || data.rush_too_much) return false;
-                  return data.succeed === false;
-                }} catch (_) {{ return false; }}
-              }};
+              // Pure API join, one request. No DOM click fallback: a synthetic
+              // click after our own join makes the page issue a second request
+              // for the same event, which Douyin answers with rush_spam.
               const action = task.action === 'receive' ? 'receive' : 'join';
-              // Give the live SPA a brief moment to install bdms before join.
-              if (action === 'join') {{
-                const bdmsDeadline = Date.now() + 1200;
-                while (Date.now() < bdmsDeadline) {{
-                  if (window.bdms || window.__bdms || window.byted_acrawler || document.querySelector('script[src*="bdms"]')) break;
-                  await new Promise((resolve) => setTimeout(resolve, 100));
-                }}
-              }}
-              let response = await send(action);
-              let attempts = 1;
-              if (action === 'join' && softDeny(response.text)) {{
-                // Soft-deny: re-sniff identity, retry signed API once, then fall
-                // back to real page click so bdms signs a genuine join request.
-                for (let step = 0; step < 8; step += 1) {{
-                  const identity = pageIdentity();
-                  if (identity.anchor_id && (identity.device_id || identity.fp || identity.s_v_web_id)) break;
-                  await new Promise((resolve) => setTimeout(resolve, 120));
-                }}
-                response = await send('join');
-                attempts = 2;
-                if (softDeny(response.text) || !String(response.text || '').trim()) {{
-                  try {{ clickPacketSurface(); }} catch (_) {{}}
-                  await new Promise((resolve) => setTimeout(resolve, 280));
-                  try {{ clickJoinSurface(); }} catch (_) {{}}
-                  await new Promise((resolve) => setTimeout(resolve, 200));
-                  try {{ clickJoinSurface(); }} catch (_) {{}}
-                  const captured = await waitCapturedJoin(4200);
-                  if (captured) {{
-                    response = {{endpoint: captured.endpoint || 'join', status: captured.status, text: captured.text}};
-                    attempts = 3;
-                  }} else {{
-                    // Last synthetic attempt after DOM wake-up (panel may unlock join).
-                    response = await send('join');
-                    attempts = 4;
-                  }}
-                }}
-              }}
+              const response = await send(action);
+              const attempts = 1;
               if (action === 'receive' && /"receive_info"\s*:\s*\[\s*\]/.test(response.text || '')) {{
+                // Keep the page-native path alive: if the result panel is
+                // already present, opening it causes Douyin to issue its own
+                // signed receive request. The capture hook above then returns
+                // the definitive personal result on the next poll.
                 clickResultSurface();
                 await new Promise((resolve) => setTimeout(resolve, 700));
                 const captured = takeCapturedReceive();
                 if (captured) {{
-                  finishOnce({{endpoint: captured.endpoint, http_status: captured.status, body: captured.text, error: '', attempts: 1, context_missing: false, login_expired: false, challenge_blocked: false}});
+                  finish({{endpoint: captured.endpoint, http_status: captured.status, body: captured.text, error: '', attempts: 1, context_missing: false, login_expired: false, challenge_blocked: false, diag: ''}});
                   return;
                 }}
               }}
-              // Empty text after timed-out XHR/fetch is a page-layer timeout,
-              // not a successful join soft-deny.
+              // An unanswered fetch leaves empty text with status 0. Whether the
+              // join reached Douyin is genuinely unknown, so report a page-layer
+              // timeout: never a soft-deny, and never a second join for the same
+              // packet just to obtain a readable response.
               if (!String(response.text || '').trim() && Number(response.status || 0) === 0) {{
-                finishOnce({{
+                finish({{
                   endpoint: action,
                   http_status: 0,
                   body: '',
@@ -2617,25 +3064,27 @@ async fn execute_page_participation(
                   attempts,
                   context_missing: false,
                   login_expired: false,
-                  challenge_blocked: false
+                  challenge_blocked: false,
+                  diag: String(response.diag || '')
                 }});
                 return;
               }}
               const challengeBlocked = detectsResponseChallenge(response.text);
-              finishOnce({{
-                endpoint: response.endpoint || action,
+              finish({{
+                endpoint: response.endpoint,
                 http_status: response.status,
                 body: String(response.text || '').slice(0, 1200),
                 error: challengeBlocked ? '验证码/安全验证拦截，已暂停接收新任务' : '',
                 attempts,
                 context_missing: false,
                 login_expired: false,
-                challenge_blocked: challengeBlocked
+                challenge_blocked: challengeBlocked,
+                diag: String(response.diag || '')
               }});
             }} catch (error) {{
               const message = String(error && (error.message || error) || '直播页面红包请求失败');
               const challengeBlocked = detectsResponseChallenge(message);
-              finishOnce({{endpoint: 'page', http_status: 0, body: '', error: challengeBlocked ? '验证码/安全验证拦截，已暂停接收新任务' : message, attempts: 1, context_missing: false, login_expired: false, challenge_blocked: challengeBlocked}});
+              finish({{endpoint: 'page', http_status: 0, body: '', error: challengeBlocked ? '验证码/安全验证拦截，已暂停接收新任务' : message, attempts: 1, context_missing: false, login_expired: false, challenge_blocked: challengeBlocked}});
             }}
           }})();
         }})();"#,
@@ -2653,6 +3102,7 @@ async fn execute_page_participation(
             context_missing: false,
             login_expired: false,
             challenge_blocked: false,
+            diag: String::new(),
         };
     }
     // Prefer window storage (reliable). Cookie hex is a small backup only.
@@ -2712,6 +3162,7 @@ async fn execute_page_participation(
         context_missing: false,
         login_expired: false,
         challenge_blocked: false,
+        diag: String::new(),
     }
 }
 
@@ -2749,6 +3200,11 @@ fn native_page_result_from_value(value: Value) -> NativePageParticipationResult 
             .get("challenge_blocked")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        diag: value
+            .get("diag")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
     }
 }
 
@@ -2785,6 +3241,44 @@ async fn eval_json_value(webview: &tauri::Webview, script: &str) -> Option<Value
     serde_json::from_str(trimmed).ok()
 }
 
+/// Seconds left before the packet's draw deadline, derived from the packet's own
+/// `send_time + delay_time` exactly like the Go engine's authoritative rule.
+/// Returns `None` when the packet carries no usable timing, so a missing field
+/// can never be read as "already expired".
+fn page_participation_remaining_seconds(task: &NativePageParticipationTask) -> Option<f64> {
+    let send: f64 = task.send_time.as_deref()?.trim().parse().ok()?;
+    let delay: f64 = task.delay_time.as_deref()?.trim().parse().ok()?;
+    if send <= 0.0 || delay < 0.0 {
+        return None;
+    }
+    let mut seconds = send;
+    while seconds > 1e12 {
+        seconds /= 1000.0;
+    }
+    // Millisecond timestamps are ~1e12; second timestamps are ~1e9.
+    if seconds > 1e11 {
+        seconds /= 1000.0;
+    }
+    // Placeholder or truncated send_time values must not collapse the window
+    // into 1970 and make every packet look expired.
+    if seconds < 1_577_836_800.0 {
+        return None;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs_f64();
+    Some(seconds + delay - now)
+}
+
+/// A join whose draw window already closed must never be sent: it can only earn
+/// a soft-deny while still exposing the account to risk control. `receive` stays
+/// allowed after the deadline because the personal draw result exists only then.
+fn page_participation_window_closed(task: &NativePageParticipationTask) -> bool {
+    task.action.trim() == "join"
+        && page_participation_remaining_seconds(task).is_some_and(|remaining| remaining <= 0.0)
+}
+
 async fn handle_page_participation_task(
     app: tauri::AppHandle,
     runtime: Arc<EngineRuntime>,
@@ -2796,6 +3290,11 @@ async fn handle_page_participation_task(
         || task.box_id.trim().is_empty()
     {
         NativePageParticipationResult::context_missing("红包参与任务缺少直播间参数")
+    } else if page_participation_window_closed(&task) {
+        // Reuse the no-request path so the durable reservation is released
+        // instead of persisting a misleading 参与失败 row, and skip the live-room
+        // navigation entirely for a packet that can no longer be joined.
+        NativePageParticipationResult::context_missing("红包已过期，未发送参与请求")
     } else if let Some(webview) =
         browser_webview_for_instance(&app, runtime.as_ref(), &task.instance_id)
     {
@@ -2807,12 +3306,33 @@ async fn handle_page_participation_task(
         )
         .await
         {
-            Ok(()) => match inspect_douyin_login(&webview).await {
+            // Tight budget on the participation path: the account is admitted
+            // only inside the packet's final-countdown window, so a long login
+            // readiness wait here spends the rush time itself. The user-initiated
+            // prepare path keeps the generous wait.
+            Ok(()) => match wait_for_douyin_login_ready(&webview, Duration::from_millis(1_200))
+                .await
+            {
                 Ok(snapshot) if snapshot.state == BrowserLoginState::LoggedOut => {
                     NativePageParticipationResult::login_expired("CK 已失效：直播页面要求重新登录")
                 }
-                Ok(snapshot) if snapshot.state == BrowserLoginState::LoggedIn => {
-                    execute_page_participation(&webview, &task).await
+                Ok(snapshot)
+                    if snapshot.state == BrowserLoginState::LoggedIn
+                        || snapshot
+                            .raw_cookie
+                            .as_ref()
+                            .is_some_and(|value| !value.trim().is_empty()) =>
+                {
+                    // Navigation plus the login-readiness wait are the largest
+                    // slice of the countdown window, so re-check the deadline
+                    // here rather than trusting the admission decision.
+                    if page_participation_window_closed(&task) {
+                        NativePageParticipationResult::context_missing(
+                            "红包已过期，未发送参与请求",
+                        )
+                    } else {
+                        execute_page_participation(&webview, &task).await
+                    }
                 }
                 Ok(_) => NativePageParticipationResult::context_missing(
                     "直播页面尚未完成加载，请稍后重试",
@@ -2824,18 +3344,44 @@ async fn handle_page_participation_task(
     } else {
         NativePageParticipationResult::context_missing("浏览器实例页面未挂载，请先点击卡片红包图标")
     };
-    if cfg!(debug_assertions) {
-        eprintln!(
-            "[redpacket-page] task={} instance={} endpoint={} http={} attempts={} context_missing={} login_expired={} error={}",
-            task.task_id.chars().take(8).collect::<String>(),
-            task.instance_id,
-            result.endpoint,
-            result.http_status,
-            result.attempts,
-            result.context_missing,
-            result.login_expired,
-            if result.error.is_empty() { "none" } else { "present" },
-        );
+    // Always log safe join diagnostics so soft-deny without a_bogus is visible.
+    let diag_line = format!(
+        "[redpacket-page] task={} account={} endpoint={} http={} attempts={} context_missing={} login_expired={} error={} diag={} body_head={}",
+        task.task_id.chars().take(8).collect::<String>(),
+        task.account_id.chars().take(8).collect::<String>(),
+        result.endpoint,
+        result.http_status,
+        result.attempts,
+        result.context_missing,
+        result.login_expired,
+        if result.error.is_empty() {
+            "none"
+        } else {
+            result.error.as_str()
+        },
+        if result.diag.is_empty() {
+            "none"
+        } else {
+            result.diag.as_str()
+        },
+        result.body.chars().take(160).collect::<String>().replace('\n', " "),
+    );
+    eprintln!("{diag_line}");
+    // Persist to app data so we can inspect after soft-deny without hunting stderr.
+    if let Ok(dir) = app.path().app_data_dir() {
+        let path = dir.join("data").join("join_diag.log");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            use std::io::Write;
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let _ = writeln!(file, "ts={ts} {diag_line}");
+        }
     }
     let challenge_blocked = result.challenge_blocked;
     let challenge_instance_id = task.instance_id.clone();
@@ -3364,6 +3910,74 @@ fn schedule_browser_webview_reveal(
     });
 }
 
+/// Recovers a card whose Douyin document stays undetermined: rendered far enough
+/// to answer script, yet never painting a header or a login entry. Douyin's own
+/// skeleton can persist indefinitely in that state, and because the probe is
+/// deliberately three-state, neither the anonymous heal nor the login-wall path
+/// ever touches it — the card would sit on a gray skeleton forever. Reload it at
+/// most once per throttle window and never publish a CK verdict from it.
+async fn heal_stalled_browser_render(
+    runtime: &Arc<EngineRuntime>,
+    webview: &tauri::Webview,
+    credential: &NativeBrowserCredential,
+    instance_id: &str,
+) {
+    // A prepared participation context owns this document; its signed request
+    // template cannot survive a reload. Room discovery can retry, a rush cannot.
+    let participating = runtime
+        .browser_red_packet_contexts
+        .lock()
+        .map(|contexts| contexts.contains(instance_id))
+        .unwrap_or(false);
+    if participating {
+        return;
+    }
+    let stalled_for = runtime
+        .browser_stalled_render_since
+        .lock()
+        .ok()
+        .map(|mut since| {
+            since
+                .entry(instance_id.to_string())
+                .or_insert_with(Instant::now)
+                .elapsed()
+        })
+        .unwrap_or_default();
+    if stalled_for < Duration::from_secs(90) {
+        return;
+    }
+    let heal_due = runtime
+        .browser_stalled_render_healed_at
+        .lock()
+        .ok()
+        .and_then(|healed| healed.get(instance_id).copied())
+        .map_or(true, |last| last.elapsed() >= Duration::from_secs(180));
+    if !heal_due {
+        return;
+    }
+    if let Ok(mut healed) = runtime.browser_stalled_render_healed_at.lock() {
+        healed.insert(instance_id.to_string(), Instant::now());
+    }
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "[embedded-browser] stalled render heal instance={instance_id} stalled_for={}s",
+            stalled_for.as_secs()
+        );
+    }
+    let _ = inject_douyin_cookie_and_confirm(webview, &credential.cookie).await;
+    let _ = inject_douyin_cookie(webview, &credential.cookie);
+    if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
+        injected.insert(instance_id.to_string(), Instant::now());
+    }
+    let _ = webview.eval(
+        r#"(() => {
+          try { localStorage.clear(); } catch (_) {}
+          try { sessionStorage.clear(); } catch (_) {}
+          try { location.reload(); } catch (_) {}
+        })();"#,
+    );
+}
+
 fn is_safe_douyin_location(url: &Url) -> bool {
     url.scheme() == "https"
         && url
@@ -3375,6 +3989,25 @@ fn browser_new_window_target(url: &Url) -> Option<Url> {
     is_safe_douyin_location(url).then(|| url.clone())
 }
 
+/// Record which account owns a mounted instance so its last safe location can
+/// survive the instance record being deleted and created again.
+fn remember_browser_instance_account(runtime: &EngineRuntime, instance_id: &str, account_id: &str) {
+    if account_id.trim().is_empty() {
+        return;
+    }
+    if let Ok(mut owners) = runtime.browser_instance_accounts.lock() {
+        owners.insert(instance_id.to_owned(), account_id.trim().to_owned());
+    }
+}
+
+fn browser_instance_account(runtime: &EngineRuntime, instance_id: &str) -> Option<String> {
+    runtime
+        .browser_instance_accounts
+        .lock()
+        .ok()
+        .and_then(|owners| owners.get(instance_id).cloned())
+}
+
 fn remember_browser_location(runtime: &EngineRuntime, instance_id: &str, url: &Url) {
     if !is_safe_douyin_location(url) {
         return;
@@ -3382,14 +4015,28 @@ fn remember_browser_location(runtime: &EngineRuntime, instance_id: &str, url: &U
     if let Ok(mut locations) = runtime.browser_locations.lock() {
         locations.insert(instance_id.to_owned(), url.as_str().to_owned());
     }
+    if let Some(account_id) = browser_instance_account(runtime, instance_id) {
+        if let Ok(mut locations) = runtime.browser_account_locations.lock() {
+            locations.insert(account_id, url.as_str().to_owned());
+        }
+    }
 }
 
 fn browser_restore_location(runtime: &EngineRuntime, instance_id: &str) -> Url {
-    runtime
+    let remembered = runtime
         .browser_locations
         .lock()
         .ok()
         .and_then(|locations| locations.get(instance_id).cloned())
+        .or_else(|| {
+            let account_id = browser_instance_account(runtime, instance_id)?;
+            runtime
+                .browser_account_locations
+                .lock()
+                .ok()
+                .and_then(|locations| locations.get(&account_id).cloned())
+        });
+    remembered
         .and_then(|location| location.parse::<Url>().ok())
         .filter(is_safe_douyin_location)
         .unwrap_or_else(|| {
@@ -3478,6 +4125,9 @@ async fn ensure_browser_webview(
     let new_window_label = label.clone();
     let page_runtime = runtime.clone();
     let page_instance_id = instance_id.to_string();
+    // Register ownership before resolving the landing page so a card recreated
+    // for this account can resume its last location instead of the home feed.
+    remember_browser_instance_account(&runtime, instance_id, &credential.account_id);
     let restore_url = browser_restore_location(&runtime, &instance_id);
     let restore_url_text = restore_url.to_string();
     let mut builder = WebviewBuilder::new(label.clone(), WebviewUrl::External(blank_url))
@@ -3887,21 +4537,26 @@ async fn prepare_browser_red_packet_context(
     };
     navigate_browser_to_live_room(&webview, runtime.inner().as_ref(), &instance_id, &web_rid)
         .await?;
-    let mut snapshot = inspect_douyin_login(&webview).await?;
-    // A freshly-created hidden WebView may have committed the live-room URL
-    // before Douyin's SPA has exposed its login state. Give it a bounded native
-    // readiness window instead of incorrectly consuming the scheduled run.
-    for _ in 0..8 {
-        if snapshot.state != BrowserLoginState::Unknown {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(750)).await;
-        snapshot = inspect_douyin_login(&webview).await?;
-    }
+    // After www.douyin.com → live.douyin.com navigation the SPA commonly sits
+    // in Unknown for several seconds even with a valid jar. Wait longer so the
+    // red-packet icon does not immediately toast “尚未完成加载”.
+    let snapshot = wait_for_douyin_login_ready(&webview, Duration::from_secs(18)).await?;
     match snapshot.state {
         BrowserLoginState::LoggedIn => {}
         BrowserLoginState::LoggedOut => return Err("当前实例尚未登录，请先重新绑定 CK".into()),
-        BrowserLoginState::Unknown => return Err("直播页面尚未完成加载，请稍后重试".into()),
+        BrowserLoginState::Unknown => {
+            // Last chance: if login cookies are present, allow prepare. Join
+            // itself will still re-check; a false Unknown must not block start.
+            if snapshot.raw_cookie.as_ref().is_some_and(|c| !c.trim().is_empty()) {
+                if cfg!(debug_assertions) {
+                    eprintln!(
+                        "[redpacket-prepare] accept jar-present Unknown as ready instance={instance_id}"
+                    );
+                }
+            } else {
+                return Err("直播页面尚未完成加载，请稍后重试".into());
+            }
+        }
     }
     let runtime = runtime.inner().clone();
     if let Err(error) = native_engine_request(
@@ -4240,8 +4895,130 @@ async fn sync_browser_account_cookie(
                 snapshot = BrowserLoginSnapshot {
                     raw_cookie: Some(current),
                     state: BrowserLoginState::Unknown,
+                    anonymous_render: snapshot.anonymous_render,
+                    clean_render: snapshot.clean_render,
+                    render_diagnostics: snapshot.render_diagnostics,
                 };
             }
+        }
+    }
+    // Only a rendered, login-free page ends a wall episode. Clearing it on any
+    // non-wall frame would let a mid-reload frame reset the timer forever.
+    if snapshot.state == BrowserLoginState::LoggedIn && snapshot.clean_render {
+        if let Ok(mut since) = runtime.browser_login_wall_since.lock() {
+            since.remove(&instance_id);
+        }
+    }
+    // Douyin can render its anonymous shell when the document loaded before the
+    // injected cookies landed. The jar still holds the store session, so this is
+    // a stale render rather than CK expiry. Reload it (throttled) and report
+    // Unknown meanwhile: claiming a healthy login here is exactly what hid a
+    // visibly logged-out card behind “浏览器实例登录状态正常”. Explicit actions
+    // keep their existing verdict so a user-initiated open is never blocked.
+    if !snapshot.anonymous_render {
+        let last_anonymous = runtime
+            .browser_anonymous_last_at
+            .lock()
+            .ok()
+            .and_then(|last| last.get(&instance_id).copied());
+        // Leaving the anonymous state needs positive evidence — a fully rendered
+        // page without a login entry — sustained past the quiet period. An
+        // undetermined frame keeps the history untouched, because a reloading
+        // document has no login entry yet and would otherwise read as recovery.
+        let recovered = last_anonymous
+            .is_none_or(|last| snapshot.clean_render && last.elapsed() >= Duration::from_secs(120));
+        if recovered {
+            if let Ok(mut since) = runtime.browser_anonymous_since.lock() {
+                since.remove(&instance_id);
+            }
+            if let Ok(mut last) = runtime.browser_anonymous_last_at.lock() {
+                last.remove(&instance_id);
+            }
+            if let Ok(mut healed) = runtime.browser_anonymous_healed_at.lock() {
+                healed.remove(&instance_id);
+            }
+        } else if !require_logged_in {
+            // An anonymous history is still outstanding. Publishing a healthy
+            // login here is what let a visibly logged-out card keep reporting
+            // CK 正常 between two anonymous frames.
+            return Ok(false);
+        }
+    } else if !require_logged_in
+        && !within_injection_grace
+        // A definitive login wall must reach the verdict logic below. Healing it
+        // here would swallow the one page signal Douyin gives us that is strong
+        // enough to expire a credential.
+        && snapshot.state != BrowserLoginState::LoggedOut
+    {
+        let jar_has_store_login = snapshot
+            .raw_cookie
+            .as_deref()
+            .is_some_and(|current| login_cookie_snapshot_usable(&credential.cookie, current));
+        if jar_has_store_login {
+            // A prepared participation context owns this page: the live room was
+            // navigated and its signed request template lives in that document.
+            // Clearing SPA storage and reloading underneath it destroys exactly
+            // the context the running task depends on, which surfaces as
+            // “浏览器实例未进入目标直播间”. An anonymous frame during participation is
+            // for the participation path itself to resolve, not for this poller.
+            let participating = runtime
+                .browser_red_packet_contexts
+                .lock()
+                .map(|contexts| contexts.contains(&instance_id))
+                .unwrap_or(false);
+            if participating {
+                return Ok(false);
+            }
+            let anonymous_for = runtime
+                .browser_anonymous_since
+                .lock()
+                .ok()
+                .map(|mut since| {
+                    since
+                        .entry(instance_id.clone())
+                        .or_insert_with(Instant::now)
+                        .elapsed()
+                })
+                .unwrap_or_default();
+            if let Ok(mut last) = runtime.browser_anonymous_last_at.lock() {
+                last.insert(instance_id.clone(), Instant::now());
+            }
+            let heal_due = runtime
+                .browser_anonymous_healed_at
+                .lock()
+                .ok()
+                .and_then(|healed| healed.get(&instance_id).copied())
+                .map_or(true, |last| last.elapsed() >= Duration::from_secs(180));
+            if heal_due {
+                if let Ok(mut healed) = runtime.browser_anonymous_healed_at.lock() {
+                    healed.insert(instance_id.clone(), Instant::now());
+                }
+                if cfg!(debug_assertions) {
+                    eprintln!(
+                        "[embedded-browser] anonymous render heal instance={instance_id} anonymous_for={}s",
+                        anonymous_for.as_secs()
+                    );
+                }
+                let _ = inject_douyin_cookie_and_confirm(&webview, &credential.cookie).await;
+                let _ = inject_douyin_cookie(&webview, &credential.cookie);
+                if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
+                    injected.insert(instance_id.clone(), Instant::now());
+                }
+                let _ = webview.eval(
+                    r#"(() => {
+                      try { localStorage.clear(); } catch (_) {}
+                      try { sessionStorage.clear(); } catch (_) {}
+                      try { location.reload(); } catch (_) {}
+                    })();"#,
+                );
+            }
+            // Deliberately no CK verdict here. This DOM signal is reliable enough
+            // to trigger a reload, but not to expire a credential: the card page
+            // is small, scrollable, and intermittently shows Douyin's own login
+            // panel, so it cannot distinguish “session rejected” from “header not
+            // painted”. An authenticated business request is the only evidence
+            // allowed to expire CK.
+            return Ok(false);
         }
     }
     let mut cookie_persisted = false;
@@ -4296,9 +5073,22 @@ async fn sync_browser_account_cookie(
     }
     if snapshot.state == BrowserLoginState::Unknown {
         if cfg!(debug_assertions) {
-            eprintln!("[embedded-browser] login-state unknown instance={instance_id}");
+            eprintln!(
+                "[embedded-browser] login-state unknown instance={instance_id} render={} jar={}",
+                snapshot.render_diagnostics.as_deref().unwrap_or("none"),
+                snapshot.raw_cookie.as_deref().map_or(0, str::len),
+            );
+        }
+        if !require_logged_in && !within_injection_grace {
+            heal_stalled_browser_render(&runtime, &webview, &credential, &instance_id).await;
         }
         return Ok(false);
+    }
+    if let Ok(mut since) = runtime.browser_stalled_render_since.lock() {
+        since.remove(&instance_id);
+    }
+    if let Ok(mut healed) = runtime.browser_stalled_render_healed_at.lock() {
+        healed.remove(&instance_id);
     }
     if require_logged_in && snapshot.state != BrowserLoginState::LoggedIn {
         // Explicit open failures must not permanently expire a still-valid
@@ -4335,18 +5125,49 @@ async fn sync_browser_account_cookie(
         let store_has_login = !login_cookie_values(&credential.cookie).is_empty();
         let jar_has_login = !login_cookie_values(jar).is_empty()
             || login_cookie_snapshot_usable(&credential.cookie, jar);
-        if store_has_login && jar_has_login {
-            if cfg!(debug_assertions) {
+        // An already-expired account needs no deferral: the verdict it would
+        // reach is the one it already carries.
+        if store_has_login && jar_has_login && credential.cookie_status != "expired" {
+            // Give one re-assert per wall episode, then accept the verdict. The
+            // previous unbounded deferral also re-armed the inject grace on every
+            // pass, so an account Douyin had permanently rejected could never be
+            // reported and its card kept offering no way out.
+            let mut first_frame = false;
+            let wall_for = runtime
+                .browser_login_wall_since
+                .lock()
+                .ok()
+                .map(|mut since| {
+                    let entry = since.entry(instance_id.clone()).or_insert_with(|| {
+                        first_frame = true;
+                        Instant::now()
+                    });
+                    entry.elapsed()
+                })
+                .unwrap_or_default();
+            if wall_for < Duration::from_secs(90) {
+                if cfg!(debug_assertions) {
+                    eprintln!(
+                        "[embedded-browser] login-state defer expire instance={instance_id} reason=login-cookies-present wall_for={}s",
+                        wall_for.as_secs()
+                    );
+                }
+                if first_frame {
+                    let _ = inject_douyin_cookie(&webview, &credential.cookie);
+                    if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
+                        injected.insert(instance_id.clone(), Instant::now());
+                    }
+                }
+                return Ok(false);
+            }
+            // Expired instances keep the fast 5s cadence, so log the verdict only
+            // when it is actually a transition.
+            if cfg!(debug_assertions) && credential.cookie_status != "expired" {
                 eprintln!(
-                    "[embedded-browser] login-state defer expire instance={instance_id} reason=login-cookies-present"
+                    "[embedded-browser] login-state expire instance={instance_id} reason=persistent-login-wall wall_for={}s",
+                    wall_for.as_secs()
                 );
             }
-            // Soft re-assert store cookies; do not flip account to expired.
-            let _ = inject_douyin_cookie(&webview, &credential.cookie);
-            if let Ok(mut injected) = runtime.browser_cookie_injected_at.lock() {
-                injected.insert(instance_id.clone(), Instant::now());
-            }
-            return Ok(false);
         }
         if store_has_login && !jar_has_login {
             // Jar lost login rows — re-inject instead of expiring a fresh scan CK.
@@ -4362,6 +5183,14 @@ async fn sync_browser_account_cookie(
             }
             return Ok(false);
         }
+    }
+    // Clearing an expired badge needs authoritative proof, not a DOM frame. A
+    // client restart renders www.douyin.com before Douyin paints its login
+    // dialog, so a page probe momentarily looks signed in and used to promote a
+    // session the follow-live interface was still rejecting with `20003`. The
+    // authoritative probe and an explicit rebind remain able to clear it.
+    if desired_status == "valid" && credential.cookie_status == "expired" && !cookie_persisted {
+        return Ok(false);
     }
     if !cookie_persisted && credential.cookie_status == desired_status {
         if cfg!(debug_assertions) {
@@ -4402,6 +5231,17 @@ async fn sync_browser_following_live(
     if instance_id.is_empty() {
         return Err("浏览器实例参数无效".into());
     }
+    // Followed-live discovery evaluates its request inside the same account
+    // document a participation task runs in. Room discovery can be retried at
+    // any time; a red-packet rush window cannot, so never compete for it.
+    if runtime
+        .browser_red_packet_contexts
+        .lock()
+        .map(|contexts| contexts.contains(&instance_id))
+        .unwrap_or(false)
+    {
+        return Err("该实例正在参与红包，稍后再读取关注直播".into());
+    }
     let label = browser_webview_label(&instance_id, window.label());
     let webview = app
         .get_webview(&label)
@@ -4435,6 +5275,49 @@ async fn sync_browser_following_live(
             },
         );
     }
+    let runtime = runtime.inner().clone();
+    // This is an authenticated business request, so its verdict outranks every
+    // DOM heuristic: `20003` is Douyin rejecting the session, `0` proves it took.
+    // Publish it so a page that merely looks signed in cannot keep an account
+    // marked valid, nor a stale expired badge survive a working session.
+    if page_result.status_code == 0 || page_result.status_code == 20003 {
+        let logged_in = page_result.status_code == 0;
+        let known = native_engine_request(
+            runtime.clone(),
+            "browser.native_credential",
+            json!({
+                "instance_id": instance_id,
+                "secret": runtime.native_secret,
+            }),
+        )
+        .await
+        .ok()
+        .and_then(|value| serde_json::from_value::<NativeBrowserCredential>(value).ok());
+        let desired = if logged_in { "valid" } else { "expired" };
+        if let Some(known) = known.filter(|known| known.cookie_status != desired) {
+            if cfg!(debug_assertions) {
+                eprintln!(
+                    "[following-live-page] login-state authoritative instance={instance_id} status={} -> {desired}",
+                    page_result.status_code
+                );
+            }
+            let _ = native_engine_request(
+                runtime.clone(),
+                "account.native_set_browser_login_state",
+                json!({
+                    "account_id": known.account_id,
+                    "logged_in": logged_in,
+                    "secret": runtime.native_secret,
+                }),
+            )
+            .await;
+        }
+        if logged_in {
+            if let Ok(mut since) = runtime.browser_login_wall_since.lock() {
+                since.remove(&instance_id);
+            }
+        }
+    }
     if page_result.status_code != 0 {
         let detail = page_result.status_msg.trim();
         let message = if page_result.status_code == 20003 {
@@ -4447,7 +5330,6 @@ async fn sync_browser_following_live(
         return Err(message);
     }
 
-    let runtime = runtime.inner().clone();
     native_engine_request(
         runtime.clone(),
         "browser.native_following_live",

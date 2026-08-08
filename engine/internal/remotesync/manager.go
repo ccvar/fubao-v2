@@ -665,7 +665,8 @@ func redPacketItem(event redpacket.Event) (syncprotocol.BatchItem, bool, error) 
 		SendTime: nativeNumericValue(event.SendTime, 32), DelayTime: nativeNumericValue(event.DelayTime, 32),
 		RoomName:     event.RoomName,
 		StreamerName: event.StreamerName, Title: event.Title, Prize: event.Prize,
-		Source: event.Source, DetectedAt: event.DetectedAt, DrawAt: event.DrawAt,
+		Condition: event.Condition,
+		Source:    event.Source, DetectedAt: event.DetectedAt, DrawAt: event.DrawAt,
 		ExpiresAt: event.ExpiresAt, ParticipantCount: event.ParticipantCount,
 		TotalDiamonds: event.TotalDiamonds, ShareCount: event.ShareCount,
 	}
@@ -845,7 +846,8 @@ func (m *Manager) pullType(ctx context.Context, roomStore *rooms.Store, redPacke
 					AnchorID: item.AnchorID, BoxType: item.BoxType, SendTime: item.SendTime, DelayTime: item.DelayTime,
 					RoomName:     item.RoomName,
 					StreamerName: item.StreamerName, Title: item.Title, Prize: item.Prize,
-					Source: item.Source, DetectedAt: item.DetectedAt, DrawAt: item.DrawAt,
+					Condition: item.Condition,
+					Source:    item.Source, DetectedAt: item.DetectedAt, DrawAt: item.DrawAt,
 					ExpiresAt: item.ExpiresAt, ParticipantCount: item.ParticipantCount,
 					TotalDiamonds: item.TotalDiamonds, ShareCount: item.ShareCount,
 				})

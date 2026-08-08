@@ -111,6 +111,7 @@ type RedPacket struct {
 	StreamerName     string  `json:"streamer_name,omitempty"`
 	Title            string  `json:"title,omitempty"`
 	Prize            string  `json:"prize,omitempty"`
+	Condition        string  `json:"condition,omitempty"`
 	Source           string  `json:"source,omitempty"`
 	DetectedAt       string  `json:"detected_at"`
 	DrawAt           string  `json:"draw_at,omitempty"`

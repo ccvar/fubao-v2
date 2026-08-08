@@ -245,6 +245,7 @@ func (s *Store) RecordParticipationBatchResult(scheduleID, mode string, started,
 		}
 		if activity := s.activities[task.ID]; activity != nil && (activity.Kind == "participation_started" || activity.Kind == "participation_task_completed") {
 			delete(s.activities, task.ID)
+			delete(s.participationRuns, task.ID)
 		}
 	}
 	if scheduleID = strings.TrimSpace(scheduleID); scheduleID != "" {
@@ -255,7 +256,14 @@ func (s *Store) RecordParticipationBatchResult(scheduleID, mode string, started,
 		}
 	}
 	activity := s.addActivityLocked("participation_batch_executed", "", message, time.Now())
+	s.participationRuns[activity.ID] = activity
 	activity.Title = label
+	activity.Mode = mode
+	if strings.TrimSpace(scheduleID) == "" {
+		activity.Mode = "immediate"
+	}
+	activity.StartedCount = maxInt(started, 0)
+	activity.SkippedCount = maxInt(skipped, 0)
 	activity.TaskIDs = map[string]string{}
 	seen := make(map[string]struct{}, len(accountIDs))
 	for _, accountID := range accountIDs {
@@ -271,6 +279,12 @@ func (s *Store) RecordParticipationBatchResult(scheduleID, mode string, started,
 		if task := s.participationTasks[accountID]; task != nil && task.ID != "" {
 			activity.TaskIDs[accountID] = task.ID
 			task.BatchActivityID = activity.ID
+			// The batch starts when its first native account task starts, not
+			// after every browser context has finished preparing and this result
+			// RPC finally arrives.
+			if task.StartedAt != "" && (activity.CreatedAt == "" || task.StartedAt < activity.CreatedAt) {
+				activity.CreatedAt = task.StartedAt
+			}
 			if task.Active {
 				activity.Active = true
 			}
@@ -278,6 +292,10 @@ func (s *Store) RecordParticipationBatchResult(scheduleID, mode string, started,
 	}
 	if len(activity.AccountIDs) > 0 && !activity.Active {
 		s.finalizeParticipationBatchActivityLocked(activity.ID, false, time.Now())
+	} else if len(activity.AccountIDs) == 0 {
+		// A fully skipped/empty dispatch is still a terminal task-run row, but
+		// keep the established recent-activity dispatch wording intact.
+		activity.FinishedAt = time.Now().Format(time.RFC3339Nano)
 	}
 	return s.saveLocked()
 }
@@ -301,6 +319,7 @@ func (s *Store) StopParticipationBatch(activityID string) ([]string, error) {
 			task.EndReason = "批次手动停止"
 		}
 	}
+	activity.EndReason = "批次手动停止"
 	s.finalizeParticipationBatchActivityLocked(activity.ID, true, stoppedAt)
 	if err := s.saveLocked(); err != nil {
 		return nil, err
@@ -336,6 +355,7 @@ func (s *Store) migrateLegacyBatchActivitiesLocked() bool {
 				}
 				batch.AccountIDs = append(batch.AccountIDs, accountID)
 				delete(s.activities, task.ID)
+				delete(s.participationRuns, task.ID)
 				batch.Active = true
 				migrated = true
 			}

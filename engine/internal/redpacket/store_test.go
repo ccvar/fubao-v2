@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -313,7 +315,8 @@ func TestMonitoringSettingsPersistAndHotSwapProbeWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 	defaults := store.GetMonitoringSettings()
-	if defaults.GlobalRequestIntervalMS != 80 || defaults.AccountRequestIntervalMS != 750 ||
+	// Zero is 自动: the machine-wide pace is derived from the account fleet.
+	if defaults.GlobalRequestIntervalMS != 0 || defaults.AccountRequestIntervalMS != 750 ||
 		defaults.GlobalConcurrency != 32 || defaults.AccountConcurrency != 3 || defaults.ProbeConcurrency != 64 {
 		t.Fatalf("unexpected monitoring defaults: %+v", defaults)
 	}
@@ -366,9 +369,17 @@ func TestMonitoringSettingsClampUnsafeValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if settings.GlobalRequestIntervalMS != 40 || settings.AccountRequestIntervalMS != 250 ||
+	if settings.GlobalRequestIntervalMS != minGlobalRequestIntervalMS || settings.AccountRequestIntervalMS != 250 ||
 		settings.GlobalConcurrency != maxGlobalConcurrency || settings.AccountConcurrency != maxAccountConcurrency || settings.ProbeConcurrency != maxProbeConcurrency {
 		t.Fatalf("unsafe settings were not clamped: %+v", settings)
+	}
+	// A negative pace is not a clamp target: it means 自动.
+	auto, err := store.SetMonitoringSettings(MonitoringSettings{GlobalRequestIntervalMS: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auto.GlobalRequestIntervalMS != 0 {
+		t.Fatalf("negative global pace should fall back to 自动, got %d", auto.GlobalRequestIntervalMS)
 	}
 }
 
@@ -583,6 +594,81 @@ func TestParticipationTaskCompletionActivityAndOverviewPersist(t *testing.T) {
 	}
 }
 
+func TestParticipationTaskRunsPersistSuccessFailureAndWinTotals(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordParticipationStarted("run-account", "任务账号"); err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		id      string
+		status  string
+		joined  bool
+		won     bool
+		award   string
+		attempt int
+	}{
+		{id: "run-success", status: "not_won", joined: true, attempt: 2},
+		{id: "run-failure", status: "failed", attempt: 1},
+		{id: "run-win", status: "won", joined: true, won: true, award: "3钻", attempt: 2},
+	}
+	for _, item := range cases {
+		event := Event{ID: item.id, RoomID: "room", WebRID: "123456", JoinBoxID: "box-" + item.id, Title: "钻石红包"}
+		if reserved, reserveErr := store.ReserveParticipation(event, "run-account", "任务账号"); reserveErr != nil || !reserved {
+			t.Fatalf("reserve %s: reserved=%v err=%v", item.id, reserved, reserveErr)
+		}
+		if err := store.CompleteParticipation(event.ID, "run-account", "join", item.status, item.status, item.attempt, item.joined, item.won, item.award, 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.FinishParticipationTask("run-account", "本次任务达到上限"); err != nil {
+		t.Fatal(err)
+	}
+
+	assertRun := func(label string, runs []ParticipationTaskRun) {
+		t.Helper()
+		if len(runs) != 1 {
+			t.Fatalf("%s: unexpected runs: %+v", label, runs)
+		}
+		run := runs[0]
+		if run.Mode != "manual" || run.ModeLabel != "单账号启动" || run.Status != "completed" || run.AccountCount != 1 {
+			t.Fatalf("%s: unexpected task identity: %+v", label, run)
+		}
+		if run.StartedAt == "" || run.EndedAt == "" || len(run.TaskIDs) != 1 {
+			t.Fatalf("%s: missing task timing/filter identity: %+v", label, run)
+		}
+		if run.SuccessCount != 2 || run.FailureCount != 1 || run.WinCount != 1 || run.WinDiamonds != 3 {
+			t.Fatalf("%s: unexpected task totals: %+v", label, run)
+		}
+		if len(run.AccountSummaries) != 1 || run.AccountSummaries[0].FailureCount != 1 {
+			t.Fatalf("%s: unexpected account summary: %+v", label, run.AccountSummaries)
+		}
+	}
+	assertRun("live", store.ParticipationTaskRuns())
+
+	// Recent activity intentionally retains only 100 rows. Task history has its
+	// own archive, so unrelated later activity must not evict this run on disk.
+	store.mu.Lock()
+	base := time.Now().Add(time.Minute)
+	for index := 0; index < 130; index++ {
+		store.addActivityLocked("unrelated", "", fmt.Sprintf("普通活动 %d", index), base.Add(time.Duration(index)*time.Second))
+	}
+	if err := store.saveLocked(); err != nil {
+		store.mu.Unlock()
+		t.Fatal(err)
+	}
+	store.mu.Unlock()
+
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertRun("reloaded", reloaded.ParticipationTaskRuns())
+}
+
 func TestParticipationOverviewAndAccountStatsExcludeNonSuccess(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {
@@ -795,6 +881,10 @@ func TestParticipationBatchCompletesAsOneAggregatedActivity(t *testing.T) {
 	}
 	if len(activities[0].AccountSummaries) != 2 || activities[0].JoinCount != 2 || activities[0].WinCount != 2 || activities[0].WinDiamonds != 8 {
 		t.Fatalf("unexpected aggregated account details: %+v", activities[0])
+	}
+	runs := store.ParticipationTaskRuns()
+	if len(runs) != 1 || runs[0].Mode != "immediate" || runs[0].AccountCount != 2 || runs[0].Status != "completed" || runs[0].SuccessCount != 2 || len(runs[0].TaskIDs) != 2 {
+		t.Fatalf("batch must remain one task-run row: %+v", runs)
 	}
 }
 
@@ -1456,6 +1546,201 @@ func TestPollOnceDoesNotClaimConnectedWhenLiveProbeFails(t *testing.T) {
 	}
 }
 
+func TestProbeBackoffLadderWidensInconclusiveRoomsAndResetsOnEvidence(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncRooms([]rooms.Room{{ID: "dead", WebRID: "987654", Enabled: true}}); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.monitors["room_dead"].Status = "running"
+	store.mu.Unlock()
+
+	// A deleted or mistyped room id answers "unknown" forever. At the flat
+	// unknown cadence thousands of these consume the whole request budget.
+	source := &fakeMonitorSource{probe: LiveProbe{Status: "unknown"}}
+	want := []time.Duration{
+		unknownProbeInterval,
+		2 * unknownProbeInterval,
+		4 * unknownProbeInterval,
+		8 * unknownProbeInterval,
+	}
+	for round, expected := range want {
+		if got := store.pollOnce(context.Background(), "room_dead", source); got != expected {
+			t.Fatalf("unknown round %d waited %s, want %s", round+1, got, expected)
+		}
+	}
+	if monitor, _ := store.Get("room_dead"); monitor.ProbeBackoffStreak != len(want) {
+		t.Fatalf("backoff streak did not advance: %d", monitor.ProbeBackoffStreak)
+	}
+
+	// A definitive offline result is real evidence and must restore the normal
+	// cadence immediately.
+	source.probe = LiveProbe{Status: "offline"}
+	if got := store.pollOnce(context.Background(), "room_dead", source); got != offlineProbeInterval {
+		t.Fatalf("offline result should use the offline cadence, got %s", got)
+	}
+	monitor, _ := store.Get("room_dead")
+	if monitor.ProbeBackoffStreak != 0 {
+		t.Fatalf("a definitive result must clear the backoff streak, got %d", monitor.ProbeBackoffStreak)
+	}
+	// And going live must never be delayed by an earlier inconclusive streak.
+	source.probe = LiveProbe{Status: "live", ActualRoomID: "42"}
+	if got := store.pollOnce(context.Background(), "room_dead", source); got != livePacketInterval {
+		t.Fatalf("live result should use the live cadence, got %s", got)
+	}
+}
+
+func TestProbeBackoffLadderIsBoundedAndSkipsPoolCooldown(t *testing.T) {
+	if got := probeBackoffInterval(unknownProbeInterval, maxUnknownProbeInterval, 1); got != unknownProbeInterval {
+		t.Fatalf("first inconclusive probe must keep the short cadence, got %s", got)
+	}
+	if got := probeBackoffInterval(unknownProbeInterval, maxUnknownProbeInterval, 99); got != maxUnknownProbeInterval {
+		t.Fatalf("unknown ladder is not capped: %s", got)
+	}
+	if got := probeBackoffInterval(unknownProbeInterval, maxErrorProbeInterval, 99); got != maxErrorProbeInterval {
+		t.Fatalf("error ladder is not capped: %s", got)
+	}
+
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SyncRooms([]rooms.Room{{ID: "cooling", WebRID: "987654", Enabled: true}}); err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.monitors["room_cooling"].Status = "running"
+	store.mu.Unlock()
+	// A cooling account pool is not the room's fault: the pool's own retry hint
+	// paces that case, so it must not widen this room's ladder.
+	source := &fakeMonitorSource{probeErr: errMonitoringAccountCooling}
+	for i := 0; i < 3; i++ {
+		if got := store.pollOnce(context.Background(), "room_cooling", source); got != unknownProbeInterval {
+			t.Fatalf("account cooldown should not widen the room ladder, got %s", got)
+		}
+	}
+	if monitor, _ := store.Get("room_cooling"); monitor.ProbeBackoffStreak != 0 {
+		t.Fatalf("pool cooldown must not count against the room: %d", monitor.ProbeBackoffStreak)
+	}
+}
+
+func TestPoolRetryDelayUsesTheCooldownHint(t *testing.T) {
+	if got := poolRetryDelay(errors.New("boom")); got != time.Second {
+		t.Fatalf("unhinted failures keep the one-second retry, got %s", got)
+	}
+	if got := poolRetryDelay(&poolUnavailableError{retryAfter: 90 * time.Second}); got != 30*time.Second {
+		t.Fatalf("retry hint must be capped at 30s, got %s", got)
+	}
+	// The whole point: when every account is cooling for minutes, thousands of
+	// rooms must not re-enter the scheduler once per second.
+	if got := poolRetryDelay(&poolUnavailableError{retryAfter: 8 * time.Second}); got != 8*time.Second {
+		t.Fatalf("retry hint was ignored, got %s", got)
+	}
+}
+
+func TestPersistFlushDelayGrowsWithTheMonitorStore(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if got := store.persistFlushDelayLocked(); got != 3*time.Second {
+		t.Fatalf("small stores keep the responsive flush window, got %s", got)
+	}
+	for i := 0; i < 6663; i++ {
+		id := fmt.Sprintf("room_%05d", i)
+		store.monitors[id] = &Monitor{ID: id}
+	}
+	if got := store.persistFlushDelayLocked(); got != 12*time.Second {
+		t.Fatalf("6663 monitors should coalesce further, got %s", got)
+	}
+	for i := 6663; i < 60000; i++ {
+		id := fmt.Sprintf("room_%05d", i)
+		store.monitors[id] = &Monitor{ID: id}
+	}
+	if got := store.persistFlushDelayLocked(); got != 30*time.Second {
+		t.Fatalf("flush window is not capped, got %s", got)
+	}
+}
+
+func TestLegacyFixedGlobalPaceMigratesToAuto(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate a store written before version 19: the fixed 80ms pace capped
+	// the whole machine at ~12.5 请求/秒 regardless of the account fleet.
+	store.mu.Lock()
+	store.monitoringSettings.GlobalRequestIntervalMS = legacyFixedGlobalRequestIntervalMS
+	if err := store.saveLocked(); err != nil {
+		store.mu.Unlock()
+		t.Fatal(err)
+	}
+	store.mu.Unlock()
+	if err := rewriteStoreVersion(dataDir, 18); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.GetMonitoringSettings().GlobalRequestIntervalMS; got != 0 {
+		t.Fatalf("legacy fixed pace was not migrated to 自动, got %d", got)
+	}
+}
+
+func TestExplicitlyTunedGlobalPaceSurvivesMigration(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.monitoringSettings.GlobalRequestIntervalMS = 250
+	if err := store.saveLocked(); err != nil {
+		store.mu.Unlock()
+		t.Fatal(err)
+	}
+	store.mu.Unlock()
+	if err := rewriteStoreVersion(dataDir, 18); err != nil {
+		t.Fatal(err)
+	}
+
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := reloaded.GetMonitoringSettings().GlobalRequestIntervalMS; got != 250 {
+		t.Fatalf("a deliberately configured pace must not be migrated, got %d", got)
+	}
+}
+
+// rewriteStoreVersion rolls the persisted schema version back so migrations can
+// be exercised against a store the current code just wrote.
+func rewriteStoreVersion(dataDir string, version int) error {
+	path := filepath.Join(dataDir, "red_packet_monitors.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return err
+	}
+	payload["version"] = version
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, encoded, 0o600)
+}
+
 func TestMonitorStaggerDelayIsStableAndBounded(t *testing.T) {
 	first := monitorStaggerDelay("room-1")
 	if first != monitorStaggerDelay("room-1") {
@@ -1505,20 +1790,60 @@ func TestBulkMonitoringUsesFollowingThenImportedThenCenterTiers(t *testing.T) {
 
 func TestBulkMonitoringPriorityBurstAllowsLowerTiers(t *testing.T) {
 	now := time.Now()
-	queues := [3]bulkMonitorHeap{
+	var queues bulkQueueSet
+	queues[bulkTierIdle] = [bulkSourceCount]bulkMonitorHeap{
 		{{id: "follow", due: now}},
 		{{id: "imported", due: now}},
 		{{id: "center", due: now}},
 	}
-	if rank, ok := nextReadyBulkQueue(queues, now, 0); !ok || rank != 0 {
-		t.Fatalf("first ready slot should prefer following tier, rank=%d ready=%v", rank, ok)
+	var burst [bulkTierCount]int
+	if tier, rank, ok := nextReadyBulkQueue(&queues, now, &burst, 0); !ok || tier != bulkTierIdle || rank != 0 {
+		t.Fatalf("first ready slot should prefer following tier, tier=%d rank=%d ready=%v", tier, rank, ok)
 	}
-	if rank, ok := nextReadyBulkQueue(queues, now, bulkPriorityBurst); !ok || rank != 1 {
-		t.Fatalf("priority burst should yield to imported tier, rank=%d ready=%v", rank, ok)
+	burst[bulkTierIdle] = bulkPriorityBurst
+	if tier, rank, ok := nextReadyBulkQueue(&queues, now, &burst, 0); !ok || tier != bulkTierIdle || rank != 1 {
+		t.Fatalf("priority burst should yield to imported tier, tier=%d rank=%d ready=%v", tier, rank, ok)
 	}
-	queues[1] = nil
-	if rank, ok := nextReadyBulkQueue(queues, now, bulkPriorityBurst); !ok || rank != 2 {
-		t.Fatalf("priority burst should yield to center tier when imports are absent, rank=%d ready=%v", rank, ok)
+	queues[bulkTierIdle][1] = nil
+	if tier, rank, ok := nextReadyBulkQueue(&queues, now, &burst, 0); !ok || tier != bulkTierIdle || rank != 2 {
+		t.Fatalf("priority burst should yield to center tier when imports are absent, tier=%d rank=%d ready=%v", tier, rank, ok)
+	}
+}
+
+func TestBulkMonitoringPrefersLiveRoomsOverOverdueIdleRooms(t *testing.T) {
+	now := time.Now()
+	var queues bulkQueueSet
+	// The idle center-library room is overdue by ten minutes and the live room
+	// is only just due: pure due-time ordering would always pick the idle one.
+	queues[bulkTierIdle][2] = bulkMonitorHeap{{id: "idle-overdue", due: now.Add(-10 * time.Minute)}}
+	queues[bulkTierLive][0] = bulkMonitorHeap{{id: "live-follow", due: now}}
+	var burst [bulkTierCount]int
+	tier, rank, ok := nextReadyBulkQueue(&queues, now, &burst, 0)
+	if !ok || tier != bulkTierLive || rank != 0 {
+		t.Fatalf("a ready live room must outrank an overdue idle room, tier=%d rank=%d ready=%v", tier, rank, ok)
+	}
+	// The preference is bounded so idle rooms keep being probed.
+	tier, _, ok = nextReadyBulkQueue(&queues, now, &burst, bulkLiveBurst)
+	if !ok || tier != bulkTierIdle {
+		t.Fatalf("live burst must yield a slot to the idle tier, tier=%d ready=%v", tier, ok)
+	}
+}
+
+func TestMonitorQueueRanksUseConfirmedLiveOnly(t *testing.T) {
+	for _, testCase := range []struct {
+		liveStatus string
+		wantTier   int
+	}{
+		{"live", bulkTierLive},
+		{"offline", bulkTierIdle},
+		{"unknown", bulkTierIdle},
+		{"error", bulkTierIdle},
+	} {
+		tier, rank := monitorQueueRanks(&Monitor{Source: "following-live", LiveStatus: testCase.liveStatus})
+		if tier != testCase.wantTier || rank != 0 {
+			t.Fatalf("live_status=%q ranked tier=%d rank=%d, want tier=%d rank=0",
+				testCase.liveStatus, tier, rank, testCase.wantTier)
+		}
 	}
 }
 
@@ -1561,7 +1886,57 @@ func TestLargeMonitorStoreUsesBoundedExpandedProbeWindow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cap(store.probeSlots) != defaultProbeSlots || defaultBulkWorkers != 64 {
-		t.Fatalf("unexpected large-monitor bounds: slots=%d workers=%d", cap(store.probeSlots), defaultBulkWorkers)
+	// The bulk worker pool follows the probe window rather than a separate
+	// fixed constant, so the two must always start out in agreement.
+	if cap(store.probeSlots) != defaultProbeSlots || store.bulkWorkerTarget.Load() != int64(defaultProbeSlots) {
+		t.Fatalf("unexpected large-monitor bounds: slots=%d workers=%d",
+			cap(store.probeSlots), store.bulkWorkerTarget.Load())
+	}
+	if _, err := store.SetMonitoringSettings(MonitoringSettings{ProbeConcurrency: 256}); err != nil {
+		t.Fatal(err)
+	}
+	if cap(store.probeSlots) != 256 || store.bulkWorkerTarget.Load() != 256 {
+		t.Fatalf("probe window change did not resize the bulk worker target: slots=%d workers=%d",
+			cap(store.probeSlots), store.bulkWorkerTarget.Load())
+	}
+}
+
+func TestAnnotateFailedWithWalletWinKeepsFailedStatus(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordParticipationStarted("acc-1", "账号A"); err != nil {
+		t.Fatal(err)
+	}
+	event := Event{ID: "evt-fail-win", WebRID: "123456", ActualRoomID: "7001", JoinBoxID: "box-1", Title: "钻石红包"}
+	ok, err := store.ReserveParticipation(event, "acc-1", "账号A")
+	if err != nil || !ok {
+		t.Fatalf("reserve: ok=%v err=%v", ok, err)
+	}
+	if err := store.CompleteParticipation(event.ID, "acc-1", "join", "failed", "参与失败", 1, false, false, "", 0); err != nil {
+		t.Fatal(err)
+	}
+	newWin, err := store.AnnotateFailedWithWalletWin(event.ID, "acc-1", "2钻", 2)
+	if err != nil || !newWin {
+		t.Fatalf("annotate: newWin=%v err=%v", newWin, err)
+	}
+	record := store.participations[participationRecordID("acc-1", event.ID)]
+	if record == nil {
+		t.Fatal("missing record")
+	}
+	if record.Status != "failed" || !record.Won || record.Award != "2钻" {
+		t.Fatalf("unexpected record: %+v", record)
+	}
+	if !strings.Contains(record.Message, "参与失败") || !strings.Contains(record.Message, "已中2钻") {
+		t.Fatalf("message: %q", record.Message)
+	}
+	if !participationIsConfirmedWin(record) || !participationIsSuccessfulJoin(record) {
+		t.Fatalf("wallet win on failed must count as confirmed win/join")
+	}
+	// second call is idempotent
+	newWin, err = store.AnnotateFailedWithWalletWin(event.ID, "acc-1", "2钻", 2)
+	if err != nil || newWin {
+		t.Fatalf("second annotate should not re-count: newWin=%v err=%v", newWin, err)
 	}
 }
