@@ -20,7 +20,11 @@ import (
 	"fubao.ccvar.com/engine/internal/rooms"
 )
 
-const protocolVersion = 1
+const (
+	protocolVersion                 = 1
+	remoteSyncSnapshotInterval      = 10 * time.Second
+	remoteSyncRedPacketPullInterval = 2 * time.Second
+)
 
 type request struct {
 	Version int             `json:"v"`
@@ -2215,21 +2219,39 @@ func runRemoteSyncSnapshots(ctx context.Context, manager *remotesync.Manager, ro
 	if manager == nil || roomStore == nil || redPacketStore == nil {
 		return
 	}
-	syncSnapshot := func() {
-		_ = manager.SyncSnapshot(roomStore.List(), redPacketStore.List(), redPacketStore.EventsAll())
+	pull := func(scope remotesync.PullScope) {
+		if scope == remotesync.PullNone {
+			return
+		}
 		pullCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		_ = manager.PullOnceScoped(pullCtx, roomStore, redPacketStore, remoteSyncPullScope(licenseManager))
+		_ = manager.PullOnceScoped(pullCtx, roomStore, redPacketStore, scope)
 		cancel()
 	}
-	syncSnapshot()
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
+	fullSync := func() {
+		// Receive first so a large local room snapshot can never delay a packet
+		// that is already waiting in the center library.
+		pull(remoteSyncPullScope(licenseManager))
+		_ = manager.SyncSnapshot(roomStore.List(), redPacketStore.List(), redPacketStore.EventsAll())
+	}
+	pullRedPackets := func() {
+		if remoteSyncPullScope(licenseManager) == remotesync.PullNone {
+			return
+		}
+		pull(remotesync.PullRedPackets)
+	}
+	fullSync()
+	snapshotTicker := time.NewTicker(remoteSyncSnapshotInterval)
+	redPacketTicker := time.NewTicker(remoteSyncRedPacketPullInterval)
+	defer snapshotTicker.Stop()
+	defer redPacketTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			syncSnapshot()
+		case <-snapshotTicker.C:
+			fullSync()
+		case <-redPacketTicker.C:
+			pullRedPackets()
 		}
 	}
 }

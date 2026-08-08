@@ -17,6 +17,7 @@
     win_diamonds: number;
     end_reason?: string;
     task_ids: string[];
+    account_summaries?: Array<{ account_id: string }>;
   };
 
   type ParticipationTaskRunGroup = {
@@ -24,6 +25,7 @@
     started_at: string;
     runs: ParticipationTaskRun[];
     task_count: number;
+    account_count: number;
     success_count: number;
     win_count: number;
     win_diamonds: number;
@@ -149,7 +151,7 @@
       <strong>{runDateContext(group.started_at, clock)} · {runDate(group.started_at)}</strong>
     </span>
     <span class="participation-run-group-summary">
-      {group.task_count} 个任务 · {group.success_count} 次参与 · {group.win_count} 次中奖 / {formatDiamonds(group.win_diamonds)} 钻
+      {group.task_count} 个任务 · {group.account_count} 个账号 · {group.success_count} 次参与 · {group.win_count} 次中奖 / {formatDiamonds(group.win_diamonds)} 钻
     </span>
   </button>
   <div class="participation-run-group-body" hidden={!expanded}>

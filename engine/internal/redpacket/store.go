@@ -370,9 +370,15 @@ type ParticipationSettings struct {
 // runtime capacity, which is computed from live CPU/memory pressure.
 const maxBatchConcurrency = 64
 
-// defaultPrepareTimeoutSeconds is deliberately well under the native manual
-// wait: inside a batch the alternative to waiting is simply the next account.
-const defaultPrepareTimeoutSeconds = 10
+// defaultPrepareTimeoutSeconds must stay at the native manual wait. Shortening
+// it to 10s made every subsequent join go out unsigned (`msToken=0 a_bogus=0`
+// in join_diag) and therefore bare soft-denied: prepare returns the last login
+// snapshot when its deadline expires rather than failing, so a shorter deadline
+// simply registers a context whose document has not finished hydrating — and
+// bdms.js has not installed the fetch hook that re-signs webcast requests.
+// Trading page-ready time for rotation throughput is only safe once readiness
+// means "bdms.js is live", not "the deadline expired".
+const defaultPrepareTimeoutSeconds = 18
 
 // MonitoringSettings are safe, persisted throughput controls for the native
 // room-monitor pipeline. They contain no account credentials or request data.

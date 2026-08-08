@@ -1253,12 +1253,65 @@ label.browser-column-control[data-tooltip]:focus-within {
 .title-line .topbar-participation-runtime {
   height: 18px;
   min-height: 18px;
-  gap: 5px;
+  gap: 2px;
   margin-left: 2px;
-  padding: 0 5px;
+  padding: 0 2px 0 5px;
   border-radius: 5px;
   font-size: 8.5px;
   line-height: 18px;
+}
+
+.topbar-participation-runtime-main {
+  display: inline-flex;
+  height: 16px;
+  min-height: 16px;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: inherit;
+  box-shadow: none;
+  font: inherit;
+  line-height: inherit;
+  white-space: nowrap;
+}
+
+.topbar-participation-runtime-main:hover,
+.topbar-participation-runtime-main:focus-visible {
+  outline: 0;
+  background: transparent;
+  color: #3f6f61;
+}
+
+.topbar-participation-stop {
+  display: grid;
+  width: 15px;
+  height: 15px;
+  min-height: 15px;
+  flex: 0 0 15px;
+  margin-left: 1px;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: #b56a5e;
+  box-shadow: none;
+}
+
+.topbar-participation-stop:hover:not(:disabled),
+.topbar-participation-stop:focus-visible {
+  outline: 0;
+  background: #fae8e4;
+  color: #b8473b;
+}
+
+.topbar-participation-stop:disabled {
+  cursor: default;
+  opacity: .5;
 }
 
 .title-line .topbar-participation-runtime .browser-participation-runtime-state {
@@ -2213,26 +2266,26 @@ label.browser-column-control[data-tooltip]:focus-within {
 
 .browser-account-row {
   display: grid;
-  grid-template-columns: 20px minmax(0, 1fr) auto;
-  min-height: 38px;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  min-height: 26px;
   align-items: center;
-  gap: 6px;
-  padding: 7px 12px;
+  gap: 4px;
+  padding: 3px 9px;
 }
 
 .browser-account-row .simple-icon {
-  width: 20px;
-  height: 20px;
-  border-radius: 6px;
+  width: 18px;
+  height: 18px;
+  border-radius: 5px;
 }
 
 .browser-account-row .browser-account-title h2 {
   display: flex;
-  height: 24px;
+  height: 20px;
   min-width: 0;
   align-items: center;
-  gap: 7px;
-  font-size: 13px;
+  gap: 5px;
+  font-size: 12.5px;
   line-height: 1;
 }
 
@@ -2246,7 +2299,7 @@ label.browser-column-control[data-tooltip]:focus-within {
   flex: 0 1 auto;
   overflow: hidden;
   color: #aaa59c;
-  font-size: 9.5px;
+  font-size: 9px;
   font-weight: 450;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -2322,7 +2375,7 @@ label.browser-column-control[data-tooltip]:focus-within {
 
 .browser-card-actions {
   display: flex;
-  height: 24px;
+  height: 20px;
   min-width: 0;
   align-items: center;
   gap: 1px;
@@ -2341,9 +2394,9 @@ label.browser-column-control[data-tooltip]:focus-within {
 .browser-following-live-button {
   position: relative;
   display: inline-flex;
-  height: 20px;
+  height: 18px;
   max-width: 38px;
-  min-height: 20px;
+  min-height: 18px;
   align-items: center;
   gap: 3px;
   margin-right: 2px;
@@ -2376,15 +2429,16 @@ label.browser-column-control[data-tooltip]:focus-within {
 .browser-account-row .browser-open-button,
 .browser-account-row .browser-close-button,
 .browser-account-row .browser-red-packet-button,
-.browser-account-row .browser-chrome-repair-button {
+.browser-account-row .browser-chrome-repair-button,
+.browser-account-row .browser-action-menu-trigger {
   position: relative;
-  width: 24px;
-  height: 24px;
+  width: 20px;
+  height: 20px;
   grid-column: auto;
-  min-height: 24px;
+  min-height: 20px;
   padding: 0;
   border: 0;
-  border-radius: 6px;
+  border-radius: 5px;
   background: transparent;
   box-shadow: none;
   color: #746f67;
@@ -2397,7 +2451,10 @@ label.browser-column-control[data-tooltip]:focus-within {
 .browser-account-row .browser-red-packet-button:hover:not(:disabled),
 .browser-account-row .browser-red-packet-button:focus-visible,
 .browser-account-row .browser-chrome-repair-button:hover:not(:disabled),
-.browser-account-row .browser-chrome-repair-button:focus-visible {
+.browser-account-row .browser-chrome-repair-button:focus-visible,
+.browser-account-row .browser-action-menu-trigger:hover:not(:disabled),
+.browser-account-row .browser-action-menu-trigger:focus-visible,
+.browser-account-row .browser-action-menu-trigger.open {
   background: #efede9;
   color: #302e2a;
 }
@@ -2443,9 +2500,70 @@ label.browser-column-control[data-tooltip]:focus-within {
 .browser-account-row .browser-open-button:disabled,
 .browser-account-row .browser-close-button:disabled,
 .browser-account-row .browser-red-packet-button:disabled,
-.browser-account-row .browser-chrome-repair-button:disabled {
+.browser-account-row .browser-chrome-repair-button:disabled,
+.browser-account-row .browser-action-menu-trigger:disabled {
   cursor: default;
   opacity: .48;
+}
+
+.browser-card-action-anchor {
+  position: relative;
+  z-index: 12;
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+}
+
+.browser-card-action-menu {
+  right: -2px;
+  bottom: calc(100% + 3px);
+  z-index: 80;
+  min-width: 134px;
+  padding: 3px;
+  border-radius: 7px;
+  box-shadow: 0 7px 20px rgb(45 39 31 / 13%), 0 1px 5px rgb(45 39 31 / 7%);
+}
+
+.browser-card-action-menu .browser-card-action-menu-item {
+  min-height: 25px;
+  gap: 6px;
+  padding-inline: 6px;
+  border-radius: 5px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.browser-card-action-menu-item > svg {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 13px;
+  color: #777169;
+}
+
+.browser-card-action-menu-item > span {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+}
+
+.browser-card-action-menu-item.chrome > svg {
+  color: #527896;
+}
+
+.browser-card-action-menu-item.danger > svg {
+  color: #b65a4d;
+}
+
+.browser-card-action-menu-item.danger:hover:not(:disabled),
+.browser-card-action-menu-item.danger:focus-visible {
+  outline: 0;
+  background: #fae9e5;
+  color: #a84337;
+}
+
+.browser-action-menu-trigger.open::before,
+.browser-action-menu-trigger.open::after {
+  display: none !important;
 }
 
 .following-live-modal {

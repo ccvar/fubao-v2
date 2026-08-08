@@ -3,12 +3,72 @@ package accounts
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// Two stores over one data directory is exactly the "dev build running beside
+// the installed app" case: both engines resolve the same DefaultDataDir. With a
+// fixed `<file>.tmp` sibling their byte streams interleave and the rename then
+// publishes a corrupt file — the whole account store, cookies included.
+func TestConcurrentWritersNeverPublishACorruptStore(t *testing.T) {
+	dataDir := t.TempDir()
+	first, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 24; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			store := first
+			if index%2 == 1 {
+				store = second
+			}
+			_, _, upsertErr := store.UpsertAuthenticatedCookie(
+				fmt.Sprintf("sessionid_ss=writer-%02d", index),
+				fmt.Sprintf("并发账号 %02d", index),
+				fmt.Sprintf("1000%02d", index),
+				fmt.Sprintf("sec-1000%02d", index),
+				RoleMonitoring,
+			)
+			if upsertErr != nil {
+				t.Errorf("concurrent upsert failed: %v", upsertErr)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Whichever writer won the last rename, the published file must always be
+	// complete and parseable.
+	reloaded, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatalf("concurrent writers published a corrupt store: %v", err)
+	}
+	if len(reloaded.List(RoleMonitoring)) == 0 {
+		t.Fatal("concurrent writers published an empty store")
+	}
+
+	// Every failure path removes its own temp file, so none may survive.
+	leftovers, err := filepath.Glob(filepath.Join(dataDir, "accounts.json.tmp*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("temp files leaked: %v", leftovers)
+	}
+}
 
 func TestMigrateAndShareRoles(t *testing.T) {
 	legacyDir := t.TempDir()

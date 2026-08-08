@@ -4678,20 +4678,21 @@ async fn prepare_browser_red_packet_context(
 }
 
 #[tauri::command]
-/// Returns a finished participation instance to the Douyin home page.
+/// Points a finished participation instance's landing-page memory back at the
+/// Douyin home page.
 ///
 /// A live room is the heaviest page this app ever hosts — video plus gift
-/// animations — and it is also the page the landing-page memory would restore
-/// on the next mount. Leaving a finished account parked there keeps paying for
-/// a stream nobody is watching and makes a later remount resume a stale room.
-/// The remembered location is rewritten even when the surface is already gone,
-/// which is the case in a rotation where the WebView is closed right after.
+/// animations — and it is also what the landing-page memory would restore on
+/// the next mount, so a finished account would otherwise resume a stale room.
 ///
-/// Only safe to call once the participation context has ended: navigating away
-/// destroys the signed-request template a running task depends on.
+/// This deliberately only rewrites the remembered location and does **not**
+/// navigate the live document. The `bdms.js` fetch hook that re-signs webcast
+/// requests lives in the `live.douyin.com` document; navigating away destroys
+/// it while the cached request template and the registered context survive, so
+/// a join dispatched in that window goes out unsigned and is bare soft-denied.
+/// The card is closed or reused shortly afterwards anyway, and the next mount
+/// then lands on the light home feed — which was the whole point.
 async fn reset_browser_landing_page(
-    app: tauri::AppHandle,
-    window: tauri::Window,
     runtime: tauri::State<'_, Arc<EngineRuntime>>,
     instance_id: String,
 ) -> Result<(), String> {
@@ -4704,15 +4705,6 @@ async fn reset_browser_landing_page(
         .parse()
         .map_err(|error| format!("解析抖音首页地址失败：{error}"))?;
     remember_browser_location(&runtime, &instance_id, &target);
-    let label = browser_webview_label(&instance_id, window.label());
-    if browser_webview_is_closing(runtime.as_ref(), &label) {
-        return Ok(());
-    }
-    if let Some(webview) = app.get_webview(&label) {
-        webview
-            .navigate(target)
-            .map_err(|error| format!("返回抖音首页失败：{error}"))?;
-    }
     Ok(())
 }
 

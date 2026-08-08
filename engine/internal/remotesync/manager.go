@@ -1075,19 +1075,29 @@ func (m *Manager) saveOutboxLocked() error {
 }
 
 func writePrivateFile(path string, content []byte) error {
-	tempPath := path + ".tmp"
-	if err := os.WriteFile(tempPath, content, 0o600); err != nil {
+	// A writer-unique temp name. A fixed sibling name is shared by every
+	// process using this data directory — a dev build running beside the
+	// installed app writes the exact same path, the two byte streams interleave
+	// and the rename then publishes a corrupt file.
+	temp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	// A no-op once the rename has consumed the path; guarantees no leftover
+	// temp file on any failure path.
+	defer func() { _ = os.Remove(tempPath) }()
+	if _, err := temp.Write(content); err != nil {
+		_ = temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
 		return err
 	}
 	if err := os.Chmod(tempPath, 0o600); err != nil {
-		_ = os.Remove(tempPath)
 		return err
 	}
-	if err := os.Rename(tempPath, path); err != nil {
-		_ = os.Remove(tempPath)
-		return err
-	}
-	return nil
+	return os.Rename(tempPath, path)
 }
 
 func makeItem(itemType syncprotocol.ItemType, key, occurredAt string, payload any) (syncprotocol.BatchItem, error) {

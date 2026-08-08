@@ -231,16 +231,29 @@ func (s *Store) saveLocked() error {
 	if err != nil {
 		return fmt.Errorf("序列化浏览器实例失败: %w", err)
 	}
-	tempPath := s.path + ".tmp"
-	if err := os.WriteFile(tempPath, payload, 0o600); err != nil {
+	// A writer-unique temp name. A fixed sibling name is shared by every
+	// process using this data directory — a dev build running beside the
+	// installed app writes the exact same path, the two byte streams interleave
+	// and the rename then publishes a corrupt file.
+	temp, err := os.CreateTemp(filepath.Dir(s.path), filepath.Base(s.path)+".tmp-")
+	if err != nil {
+		return fmt.Errorf("创建浏览器实例临时文件失败: %w", err)
+	}
+	tempPath := temp.Name()
+	// A no-op once the rename has consumed the path; guarantees no leftover
+	// temp file on any failure path.
+	defer func() { _ = os.Remove(tempPath) }()
+	if _, err := temp.Write(payload); err != nil {
+		_ = temp.Close()
 		return fmt.Errorf("写入浏览器实例失败: %w", err)
 	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("关闭浏览器实例临时文件失败: %w", err)
+	}
 	if err := os.Chmod(tempPath, 0o600); err != nil {
-		_ = os.Remove(tempPath)
 		return fmt.Errorf("设置浏览器实例文件权限失败: %w", err)
 	}
 	if err := os.Rename(tempPath, s.path); err != nil {
-		_ = os.Remove(tempPath)
 		return fmt.Errorf("保存浏览器实例失败: %w", err)
 	}
 	return nil

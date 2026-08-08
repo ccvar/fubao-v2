@@ -42,6 +42,7 @@
     ShieldCheckIcon as ShieldCheck,
     SidebarSimpleIcon as SidebarSimple,
     SlidersHorizontalIcon as SlidersHorizontal,
+    StopIcon as Stop,
     TerminalWindowIcon as TerminalWindow,
     TrashIcon as Trash,
     UploadSimpleIcon as UploadSimple,
@@ -450,6 +451,7 @@
 	win_diamonds: number;
 	end_reason?: string;
 	task_ids: string[];
+	account_summaries?: Array<{ account_id: string }>;
   };
 
   type ParticipationTaskRunGroup = {
@@ -457,6 +459,7 @@
 	started_at: string;
 	runs: ParticipationTaskRun[];
 	task_count: number;
+	account_count: number;
 	success_count: number;
 	win_count: number;
 	win_diamonds: number;
@@ -683,7 +686,7 @@
 	follow_policy: "follow_priority",
 	// 0 = 自动：按 Go 引擎实时算出的浏览器运行建议上限决定同时参与的实例数。
 	batch_concurrency: 0,
-	prepare_timeout_seconds: 10,
+	prepare_timeout_seconds: 18,
   };
   let participationTaskMenuOpen = false;
   let participationScheduleModalOpen = false;
@@ -755,6 +758,7 @@
   let settingsModalScrollbarTrack: HTMLDivElement | null = null;
   let sidebarActivityDetailID = "";
   let stoppingSidebarActivityID = "";
+  let participationStopConfirmActivity: SidebarActivity | null = null;
   $: licenseDaysRemaining = getLicenseDaysRemaining(licenseStatus.expires_at);
   let query = "";
   let searchOpen = false;
@@ -776,6 +780,7 @@
   let browserCreating = false;
   let browserOpeningId = "";
   let browserClosingId = "";
+  let browserActionMenuId = "";
   let browserRedPacketPreparingIds: string[] = [];
   let browserRedPacketContextIds: string[] = [];
   let browserParticipationContexts: Record<string, BrowserParticipationContext> = {};
@@ -799,6 +804,13 @@
   const browserWebviewMountConcurrency = 2;
   const browserRuntimeLeaseSyncedAt = new Map<string, number>();
   const browserRuntimeLeaseIntervalMs = 5000;
+  // Floor for an instance that has no lease yet. Short enough to admit promptly
+  // once capacity frees up, long enough that a burst of geometry syncs cannot
+  // become a burst of engine RPCs.
+  const browserRuntimeLeaseRetryMs = 1500;
+  // One outstanding acquire per instance. Without this the fire-and-forget
+  // refresh can stack several in flight for the same card.
+  const browserRuntimeLeaseInFlight = new Set<string>();
   let browserWebviewErrors: Record<string, string> = {};
   let browserWebviewSyncFrame = 0;
   let browserViewSettled = false;
@@ -1547,15 +1559,16 @@
   }
 
   async function stopSidebarParticipationBatch(activityID: string, accountIDs: string[]) {
-	if (!isTauriDesktop() || stoppingSidebarActivityID) return;
+	if (!isTauriDesktop() || stoppingSidebarActivityID) return false;
 	stoppingSidebarActivityID = activityID;
 	// Stopping the batch must also cancel any queued rotation, otherwise the
 	// next tick would keep admitting accounts the user just stopped.
 	resetParticipationRotation();
 	try {
-		await engineRequest<{ account_ids: string[] }>("activity.stop_participation_batch", { activity_id: activityID });
+		const result = await engineRequest<{ account_ids: string[] }>("activity.stop_participation_batch", { activity_id: activityID });
+		const stoppedAccountIDs = result.account_ids?.length ? result.account_ids : accountIDs;
 		const instanceIDs = browserInstances
-			.filter((instance) => accountIDs.includes(instance.account_id))
+			.filter((instance) => stoppedAccountIDs.includes(instance.account_id))
 			.map((instance) => instance.id);
 		await Promise.all(instanceIDs.map(async (instanceId) => {
 			await invoke<void>("stop_browser_red_packet_context", { instanceId }).catch(() => undefined);
@@ -1563,12 +1576,67 @@
 		}));
 		browserRedPacketContextIds = browserRedPacketContextIds.filter((instanceID) => !instanceIDs.includes(instanceID));
 		await Promise.all([loadAccounts(false), loadBrowserParticipationContexts(), loadSidebarActivities()]);
-		showToast(`已停止本批次 ${accountIDs.length} 个账号的后续红包参与`);
+		showToast(`已停止本批次 ${stoppedAccountIDs.length} 个账号的后续红包参与`);
+		return true;
 	} catch (error) {
 		showToast(error instanceof Error ? error.message : String(error));
+		return false;
 	} finally {
 		stoppingSidebarActivityID = "";
 	}
+  }
+
+  function activeParticipationBatchActivity() {
+	const activeBatches = sidebarActivities.filter(
+		(activity) => activity.kind === "participation_batch_executed" && activity.active,
+	);
+	return activeBatches.find((activity) => activity.id === participationRotationBatchActivityID) || activeBatches[0] || null;
+  }
+
+  async function requestStopParticipationBatch(activity: SidebarActivity, event?: MouseEvent) {
+	event?.stopPropagation();
+	if (stoppingSidebarActivityID || participationStopConfirmActivity) return;
+	participationStopConfirmActivity = activity;
+	browserLayoutRevision += 1;
+	await queueBrowserNativeLayout(hideEmbeddedBrowsers);
+  }
+
+  async function requestStopActiveParticipationBatch(event?: MouseEvent) {
+	event?.stopPropagation();
+	if (stoppingSidebarActivityID || participationStopConfirmActivity) return;
+	let activity = activeParticipationBatchActivity();
+	if (!activity) {
+		await loadSidebarActivities();
+		activity = activeParticipationBatchActivity();
+	}
+	if (!activity) {
+		showToast("暂未找到可停止的整批参与任务");
+		return;
+	}
+	await requestStopParticipationBatch(activity);
+  }
+
+  async function closeParticipationStopConfirm() {
+	if (stoppingSidebarActivityID) return;
+	participationStopConfirmActivity = null;
+	browserLayoutRevision += 1;
+	const revision = browserLayoutRevision;
+	await tick();
+	await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+	await queueBrowserNativeLayout(() => syncEmbeddedBrowsers(revision));
+  }
+
+  async function confirmStopActiveParticipationBatch() {
+	const activity = participationStopConfirmActivity;
+	if (!activity || stoppingSidebarActivityID) return;
+	const stopped = await stopSidebarParticipationBatch(activity.id, activity.account_ids ?? []);
+	if (!stopped) return;
+	participationStopConfirmActivity = null;
+	browserLayoutRevision += 1;
+	const revision = browserLayoutRevision;
+	await tick();
+	await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+	await queueBrowserNativeLayout(() => syncEmbeddedBrowsers(revision));
   }
 
   async function openParticipationSettings() {
@@ -1709,7 +1777,7 @@
 			: "follow_priority" as ParticipationFollowPolicy,
 		// 0 保持"自动"，不参与钳制。
 		batch_concurrency: normalizedParticipationSetting(participationSettings.batch_concurrency, 64),
-		prepare_timeout_seconds: Math.max(4, normalizedParticipationSetting(participationSettings.prepare_timeout_seconds || 10, 60)),
+		prepare_timeout_seconds: Math.max(4, normalizedParticipationSetting(participationSettings.prepare_timeout_seconds || 18, 60)),
 	};
 	if (!isTauriDesktop()) {
 		participationSettings = next;
@@ -2891,6 +2959,7 @@
       browserViewSettled = false;
     }
     if (leavingBrowsers) {
+      browserActionMenuId = "";
       void queueBrowserNativeLayout(hideEmbeddedBrowsers);
     }
     activeView = key;
@@ -3035,9 +3104,17 @@
   }
 
   function browserRuntimeLeaseIsStale(instance: BrowserInstance) {
-    if (instance.runtime_state !== "running") return true;
     const syncedAt = browserRuntimeLeaseSyncedAt.get(instance.id) ?? 0;
-    return Date.now() - syncedAt >= browserRuntimeLeaseIntervalMs;
+    const elapsed = Date.now() - syncedAt;
+    // An instance without a lease still has to respect a floor. Every acquire
+    // goes to the engine's strictly sequential RPC loop, while
+    // syncEmbeddedBrowsers is driven by scroll, intersection, reactive updates
+    // and the reconciler — many times a second. Returning true unconditionally
+    // here turned each of those into an RPC, buried the loop, and starved the
+    // mount path's own acquire until it hit the frontend timeout: no lease was
+    // ever established and the header sat at "0 个运行".
+    if (instance.runtime_state !== "running") return elapsed >= browserRuntimeLeaseRetryMs;
+    return elapsed >= browserRuntimeLeaseIntervalMs;
   }
 
   function browserMountIsVisible(element: HTMLElement) {
@@ -3143,6 +3220,7 @@
     if (
       isExternalChromeInstance(instance) ||
       isChromeRepairRunning(instance) ||
+      browserActionMenuId === instance.id ||
       browserIndependentWindowIds.includes(instance.id) ||
       participationRotationSuspended(instance.id) ||
       browserWebviewMountingIds.includes(instance.id) ||
@@ -3154,6 +3232,7 @@
 	  participationSettingsModalOpen ||
 	  participationScheduleModalOpen ||
 	  Boolean(sidebarActivityDetailID) ||
+	  Boolean(participationStopConfirmActivity) ||
       !browserMountIsVisible(element)
     ) {
       return;
@@ -3184,7 +3263,7 @@
       // Keep that native instance alive but hidden so returning still resumes
       // the exact in-memory page. Filters and viewport exits continue to
       // release it below because they are resource-management boundaries.
-      if (activeView !== "browsers" || instanceModalOpen || licenseModalOpen || updateModalOpen || participationSettingsModalOpen || participationScheduleModalOpen || sidebarActivityDetailID) {
+      if (activeView !== "browsers" || browserActionMenuId === instance.id || instanceModalOpen || licenseModalOpen || updateModalOpen || participationSettingsModalOpen || participationScheduleModalOpen || sidebarActivityDetailID || participationStopConfirmActivity) {
         if (!browserWebviewMountedIds.includes(instance.id)) {
           browserWebviewMountedIds = [...browserWebviewMountedIds, instance.id];
         }
@@ -3246,6 +3325,8 @@
   // delay geometry. A failed or slow lease refresh says nothing about the
   // mounted WebView: keep it and retry on a later tick.
   async function refreshBrowserRuntimeLease(instance: BrowserInstance) {
+    if (browserRuntimeLeaseInFlight.has(instance.id)) return;
+    browserRuntimeLeaseInFlight.add(instance.id);
     try {
       const admission = await engineRequest<BrowserAdmission>("browser.runtime.acquire", {
         instance_id: instance.id,
@@ -3256,9 +3337,12 @@
         await releaseEmbeddedBrowser({ ...instance, runtime_state: "running" });
       }
     } catch {
-      // Allow an immediate retry on the next tick rather than waiting out the
-      // throttle after a transient engine failure.
-      browserRuntimeLeaseSyncedAt.delete(instance.id);
+      // Keep the throttle the caller already set. A slow or failing engine is
+      // exactly when a retry storm does the most damage, and this refresh is no
+      // longer serialized behind the native layout queue, so nothing else
+      // limits it. The stale check retries after the short floor.
+    } finally {
+      browserRuntimeLeaseInFlight.delete(instance.id);
     }
   }
 
@@ -3269,6 +3353,7 @@
       followingLiveModalInstance ||
       sidebarActivityDetailID ||
       browserPendingClose ||
+      participationStopConfirmActivity ||
       expectedRevision !== browserLayoutRevision
     ) return;
     await tick();
@@ -3277,6 +3362,7 @@
       followingLiveModalInstance ||
       sidebarActivityDetailID ||
       browserPendingClose ||
+      participationStopConfirmActivity ||
       expectedRevision !== browserLayoutRevision
     ) return;
     const visibleIds = new Set(visibleBrowserInstances.map((instance) => instance.id));
@@ -3298,6 +3384,10 @@
           if (browserWebviewMountedIds.includes(instance.id)) await hideEmbeddedBrowser(instance.id);
           return;
         }
+        if (browserActionMenuId === instance.id) {
+          if (browserWebviewMountedIds.includes(instance.id)) await hideEmbeddedBrowser(instance.id);
+          return;
+        }
         if (
           activeView !== "browsers" ||
           !browserViewSettled ||
@@ -3306,7 +3396,8 @@
           updateModalOpen ||
 		  participationSettingsModalOpen ||
 		  participationScheduleModalOpen ||
-		  sidebarActivityDetailID
+		  sidebarActivityDetailID ||
+		  participationStopConfirmActivity
         ) {
           if (
             browserWebviewMountedIds.includes(instance.id) ||
@@ -3837,6 +3928,9 @@
     const target = event.target as HTMLElement;
     if (!target.closest(".nav-context-menu")) {
       navContextMenu = null;
+    }
+    if (!target.closest(".browser-card-action-anchor")) {
+      void closeBrowserActionMenu();
     }
     if (!target.closest(".menu-anchor")) {
       statusMenuOpen = false;
@@ -4828,6 +4922,7 @@
 
   function groupParticipationTaskRuns(runs: ParticipationTaskRun[]) {
 	const groups = new Map<string, ParticipationTaskRunGroup>();
+	const accountIDsByGroup = new Map<string, Set<string>>();
 	for (const run of runs) {
 	  const key = participationRunDateKey(run.started_at);
 	  const current = groups.get(key) || {
@@ -4835,12 +4930,20 @@
 		started_at: run.started_at,
 		runs: [],
 		task_count: 0,
+		account_count: 0,
 		success_count: 0,
 		win_count: 0,
 		win_diamonds: 0,
 	  };
 	  current.runs.push(run);
 	  current.task_count += 1;
+	  const accountIDs = accountIDsByGroup.get(key) || new Set<string>();
+	  for (const summary of run.account_summaries ?? []) {
+		const accountID = String(summary.account_id || "").trim();
+		if (accountID) accountIDs.add(accountID);
+	  }
+	  accountIDsByGroup.set(key, accountIDs);
+	  current.account_count = accountIDs.size || Math.max(current.account_count, Math.max(0, Number(run.account_count) || 0));
 	  current.success_count += Math.max(0, Number(run.success_count) || 0);
 	  current.win_count += Math.max(0, Number(run.win_count) || 0);
 	  current.win_diamonds += Math.max(0, Number(run.win_diamonds) || 0);
@@ -5668,6 +5771,49 @@
     browserPendingClose = instance;
   }
 
+  async function closeBrowserActionMenu(restoreSurface = true) {
+    if (!browserActionMenuId) return;
+    browserActionMenuId = "";
+    browserLayoutRevision += 1;
+    const revision = browserLayoutRevision;
+    if (!restoreSurface) return;
+    await tick();
+    await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+    await queueBrowserNativeLayout(() => syncEmbeddedBrowsers(revision));
+  }
+
+  async function toggleBrowserActionMenu(instance: BrowserInstance) {
+    if (browserActionMenuId === instance.id) {
+      await closeBrowserActionMenu();
+      return;
+    }
+    browserActionMenuId = instance.id;
+    browserLayoutRevision += 1;
+    const revision = browserLayoutRevision;
+    await tick();
+    await queueBrowserNativeLayout(() => hideEmbeddedBrowser(instance.id));
+    // If another card menu was open, restore that card while the newly selected
+    // card remains hidden behind its menu.
+    scheduleEmbeddedBrowserSync();
+    if (revision !== browserLayoutRevision) return;
+  }
+
+  async function runBrowserActionMenuItem(
+    instance: BrowserInstance,
+    action: "repair" | "close" | "open",
+  ) {
+    await closeBrowserActionMenu(false);
+    if (action === "repair") {
+      await repairBrowserLogin(instance);
+      return;
+    }
+    if (action === "close") {
+      await openBrowserCloseConfirm(instance);
+      return;
+    }
+    await openBrowserInstance(instance);
+  }
+
   async function cancelBrowserCloseConfirm() {
     if (browserClosingId) return;
     browserPendingClose = null;
@@ -5893,13 +6039,15 @@
 		updateBrowserRuntimeState(instance.id, admission.state, admission.queue_position ?? 0);
 		if (!admission.granted) return false;
 		runtimeAcquired = true;
-		if (!apiWasEnabled) {
-			const updated = await engineRequest<AccountItem>("account.set_red_packet_api_enabled", {
-				account_id: account.id,
-				enabled: true,
-			});
-			accounts = accounts.map((item) => item.id === account.id ? updated : item);
-		}
+		// Prepare the live-room page BEFORE enabling the red-packet API. The
+		// engine's dispatcher gates only on red_packet_api_enabled — it has no
+		// idea whether this account's page is in a live room yet — so enabling
+		// it first opens a window (navigation plus login-ready wait) in which a
+		// detected packet is dispatched to an account still sitting on the
+		// Douyin feed. The join then goes out from the wrong page context and
+		// Douyin soft-denies it, which is how 参与失败 records appeared before
+		// any card had even entered a live room.
+		//
 		// Bounded wait: inside a batch the alternative to waiting out a slow page
 		// is simply handing the rotation slot to the next account, and the packet
 		// window is only a minute or two. A manual 准备页面上下文 keeps the long wait.
@@ -5909,8 +6057,15 @@
 			resultOnly: false,
 			allowChallengeRecovery: false,
 			batchActivityId: batchActivityID,
-			readyTimeoutSeconds: Math.max(4, Number(participationSettings.prepare_timeout_seconds) || 10),
+			readyTimeoutSeconds: Math.max(4, Number(participationSettings.prepare_timeout_seconds) || 18),
 		});
+		if (!apiWasEnabled) {
+			const updated = await engineRequest<AccountItem>("account.set_red_packet_api_enabled", {
+				account_id: account.id,
+				enabled: true,
+			});
+			accounts = accounts.map((item) => item.id === account.id ? updated : item);
+		}
 		if (!browserRedPacketContextIds.includes(instance.id)) {
 			browserRedPacketContextIds = [...browserRedPacketContextIds, instance.id];
 		}
@@ -6694,7 +6849,10 @@
                           data-tooltip="停止本批次"
                           data-tooltip-placement="bottom"
                           disabled={Boolean(stoppingSidebarActivityID)}
-                          onclick={() => void stopSidebarParticipationBatch(activity.id, activity.accountIDs)}
+                          onclick={(event) => {
+                            const source = sidebarActivities.find((item) => item.id === activity.id);
+                            if (source) void requestStopParticipationBatch(source, event);
+                          }}
                         >
                           {#if stoppingSidebarActivityID === activity.id}<ArrowClockwise class="spinning" size={11} />{:else}<Pause size={11} weight="fill" />{/if}
                         </button>
@@ -6866,30 +7024,42 @@
               </span>
             </span>
             {#if !participationTaskMenuOpen && (participationBatchRunning || participationRotationRunning || browserParticipationRuntime.accounts > 0)}
-              <button
-                class="browser-participation-runtime topbar-participation-runtime"
-                aria-label="查看实际红包参与情况"
-                data-tooltip="查看参与记录"
-                data-tooltip-placement="bottom"
-                onclick={() => openManagementTab("participation-records")}
-              >
-                <span class="browser-participation-runtime-state"><i></i>{participationBatchRunning && browserParticipationRuntime.accounts === 0 ? "正在准备参与上下文" : "参与任务进行中"}</span>
-                {#if browserParticipationRuntime.accounts > 0}
-                  <span>{browserParticipationRuntime.accounts} 个账号</span>
-                  <span>就绪 {browserParticipationRuntime.prepared}/{browserParticipationRuntime.accounts}</span>
-                  <span>可参与 {browserParticipationRuntime.accepting}</span>
-                  <span>已参与 {browserParticipationRuntime.joined}</span>
-                  <span>待开奖 {browserParticipationRuntime.pending}</span>
-                  <span>中奖 {browserParticipationRuntime.won}</span>
-                {/if}
-                {#if participationRotationRunning && participationRotationTotal > participationRotationLimit()}
-                  <span
-                    >轮换 {participationRotationDone}/{participationRotationTotal}{participationRotationQueue.length > 0
-                      ? ` · 排队 ${participationRotationQueue.length}`
-                      : ""}</span
-                  >
-                {/if}
-              </button>
+              <div class="browser-participation-runtime topbar-participation-runtime" role="group" aria-label="红包参与任务状态与操作">
+                <button
+                  class="topbar-participation-runtime-main"
+                  aria-label="查看实际红包参与情况"
+                  data-tooltip="查看参与记录"
+                  data-tooltip-placement="bottom"
+                  onclick={() => openManagementTab("participation-records")}
+                >
+                  <span class="browser-participation-runtime-state"><i></i>{participationBatchRunning && browserParticipationRuntime.accounts === 0 ? "正在准备参与上下文" : "参与任务进行中"}</span>
+                  {#if browserParticipationRuntime.accounts > 0}
+                    <span>{browserParticipationRuntime.accounts} 个账号</span>
+                    <span>就绪 {browserParticipationRuntime.prepared}/{browserParticipationRuntime.accounts}</span>
+                    <span>可参与 {browserParticipationRuntime.accepting}</span>
+                    <span>已参与 {browserParticipationRuntime.joined}</span>
+                    <span>待开奖 {browserParticipationRuntime.pending}</span>
+                    <span>中奖 {browserParticipationRuntime.won}</span>
+                  {/if}
+                  {#if participationRotationRunning && participationRotationTotal > participationRotationLimit()}
+                    <span
+                      >轮换 {participationRotationDone}/{participationRotationTotal}{participationRotationQueue.length > 0
+                        ? ` · 排队 ${participationRotationQueue.length}`
+                        : ""}</span
+                    >
+                  {/if}
+                </button>
+                <button
+                  class="topbar-participation-stop"
+                  aria-label="停止当前红包参与任务"
+                  data-tooltip="停止任务"
+                  data-tooltip-placement="bottom"
+                  disabled={Boolean(stoppingSidebarActivityID)}
+                  onclick={requestStopActiveParticipationBatch}
+                >
+                  {#if stoppingSidebarActivityID}<ArrowClockwise class="spinning" size={9} />{:else}<Stop size={9} weight="fill" />{/if}
+                </button>
+              </div>
             {/if}
           {/if}
         </div>
@@ -7261,53 +7431,66 @@
                         {/if}
                       </button>
                     {/if}
-                    {#if isImportAccountInstance(item)}
+                    <div class="menu-anchor browser-card-action-anchor">
                       <button
-                        class="secondary-button browser-chrome-repair-button"
-                        aria-label={isChromeRepairRunning(item) ? "显示 Chrome 修复窗口" : "用 Chrome 修复登录"}
-                        data-tooltip={isChromeRepairRunning(item)
-                          ? "显示 Chrome 修复窗口（登录成功后自动同步 CK）"
-                          : "用系统 Chrome 修复登录（导入 Cookie 注入失败时）"}
+                        class="secondary-button browser-action-menu-trigger"
+                        class:open={browserActionMenuId === item.id}
+                        aria-label="实例操作"
+                        aria-haspopup="menu"
+                        aria-expanded={browserActionMenuId === item.id}
+                        data-tooltip={browserActionMenuId === item.id ? undefined : "实例操作"}
                         data-tooltip-placement="left"
-                        disabled={browserOpeningId === item.id || browserClosingId === item.id}
-                        onclick={() => repairBrowserLogin(item)}
+                        disabled={browserClosingId === item.id}
+                        onclick={() => toggleBrowserActionMenu(item)}
                       >
-                        {#if browserOpeningId === item.id}
-                          <ArrowClockwise class="spinning" size={13} />
-                        {:else}
-                          <GoogleChromeLogo size={13} />
-                        {/if}
+                        <DotsThree size={17} weight="bold" />
                       </button>
-                    {/if}
-                    <button
-                      class="secondary-button browser-close-button"
-                      aria-label="关闭实例"
-                      data-tooltip="关闭实例"
-                      data-tooltip-placement="left"
-                      disabled={browserClosingId === item.id}
-                      onclick={() => openBrowserCloseConfirm(item)}
-                    >
-                      {#if browserClosingId === item.id}<ArrowClockwise class="spinning" size={13} />
-                      {:else}<X size={13} weight="bold" />{/if}
-                    </button>
-                    <button
-                      class="secondary-button browser-open-button"
-                      aria-label={item.status === "online" && browserIndependentWindowIds.includes(item.id)
-                        ? "重新打开实例"
-                        : "打开实例"}
-                      data-tooltip={item.status === "online" && browserIndependentWindowIds.includes(item.id)
-                        ? "重新打开实例"
-                        : "打开实例"}
-                      data-tooltip-placement="left"
-                      disabled={browserOpeningId === item.id || browserClosingId === item.id || isChromeRepairRunning(item)}
-                      onclick={() => openBrowserInstance(item)}
-                    >
-                      {#if browserOpeningId === item.id}
-                        <ArrowClockwise class="spinning" size={14} />
-                      {:else}
-                        <ArrowSquareOut size={14} />
+                      {#if browserActionMenuId === item.id}
+                        <div class="floating-menu browser-card-action-menu" role="menu" aria-label={`${item.account_name}的实例操作`}>
+                          <button
+                            role="menuitem"
+                            class="browser-card-action-menu-item chrome"
+                            disabled={!isImportAccountInstance(item) || browserOpeningId === item.id || browserClosingId === item.id}
+                            onclick={() => runBrowserActionMenuItem(item, "repair")}
+                          >
+                            {#if browserOpeningId === item.id}
+                              <ArrowClockwise class="spinning" size={13} />
+                            {:else}
+                              <GoogleChromeLogo size={13} />
+                            {/if}
+                            <span>{isChromeRepairRunning(item) ? "显示 Chrome 修复窗口" : "Chrome 修复登录"}</span>
+                          </button>
+                          <button
+                            role="menuitem"
+                            class="browser-card-action-menu-item danger"
+                            disabled={browserClosingId === item.id}
+                            onclick={() => runBrowserActionMenuItem(item, "close")}
+                          >
+                            {#if browserClosingId === item.id}
+                              <ArrowClockwise class="spinning" size={13} />
+                            {:else}
+                              <X size={13} weight="bold" />
+                            {/if}
+                            <span>关闭实例</span>
+                          </button>
+                          <button
+                            role="menuitem"
+                            class="browser-card-action-menu-item"
+                            disabled={browserOpeningId === item.id || browserClosingId === item.id || isChromeRepairRunning(item)}
+                            onclick={() => runBrowserActionMenuItem(item, "open")}
+                          >
+                            {#if browserOpeningId === item.id}
+                              <ArrowClockwise class="spinning" size={14} />
+                            {:else}
+                              <ArrowSquareOut size={14} />
+                            {/if}
+                            <span>{item.status === "online" && browserIndependentWindowIds.includes(item.id)
+                              ? "重新打开实例"
+                              : "打开实例"}</span>
+                          </button>
+                        </div>
                       {/if}
-                    </button>
+                    </div>
                   </div>
                 </div>
               </article>
@@ -7674,7 +7857,9 @@
 						<span>{event.room_name || event.streamer_name || `直播间 ${event.web_rid || event.room_id}`}</span>
 						<ArrowSquareOut size={11} />
 					  </button>
-					  <small>{event.streamer_name || "尚未读取主播"} · {redPacketEventFromCenter(event) ? "中心库同步" : `账号 ${event.account_name || event.account_id || "待解析"}`}</small>
+					  <small>
+						{event.streamer_name || "尚未读取主播"}{#if !redPacketEventFromCenter(event)} · 账号 {event.account_name || event.account_id || "待解析"}{/if}
+					  </small>
                     </div>
 					<div class="red-packet-event-prize">
 					  <span class="red-packet-event-prize-line">
@@ -7999,7 +8184,12 @@
                             <small>{record.room_name || record.streamer_name || `直播间 ${record.web_rid || record.room_id || "未知"}`} · {record.prize || "奖品待解析"}</small>
                           </div>
                           <div class="participation-record-result">
-                            <span class={`participation-result-pill ${result.tone}`} data-tooltip={record.message || result.label} data-tooltip-placement="top">{result.label}</span>
+                            <span
+                              class={`participation-result-pill ${result.tone}`}
+                              use:portalTooltip={record.message || result.label}
+                              data-tooltip={record.message || result.label}
+                              data-tooltip-placement="top"
+                            >{result.label}</span>
                             <small>{record.status === "not_won" ? "已开奖" : record.message || "等待结果"}</small>
                           </div>
                           <div class="participation-record-endpoint">
@@ -8433,7 +8623,7 @@
             <span
               ><strong>参与准备超时</strong
               ><small
-                >批量/轮换启动时，等待单个账号的直播间页面就绪的上限；超时即让位给下一个账号。抢包窗口只有一两分钟，等一个慢页面不如换下一个。手动「准备页面上下文」不受此限制</small
+                >批量/轮换启动时，等待单个账号的直播间页面就绪的上限。<strong>调低有风险</strong>：超时后 prepare 会带着尚未水合完成的页面注册上下文，此时 bdms.js 还没装好重签钩子，join 会以未签名的形式发出并被直接软拒。除非确认页面能更快就绪，否则不要低于默认值</small
               ></span
             >
             <span class="number-field"><input type="number" min="4" max="60" step="1" bind:value={participationSettings.prepare_timeout_seconds} /><em>秒</em></span>
@@ -9226,6 +9416,19 @@
     busy={roomRecycleBusyId === "__clear_all__"}
     onCancel={() => !roomRecycleBusyId && (roomPendingClearRecycleBin = false)}
     onConfirm={permanentlyClearRecycleBin}
+  />
+{/if}
+
+{#if participationStopConfirmActivity}
+  <ConfirmDialog
+    title="停止红包参与任务"
+    message={`确定停止当前红包参与任务吗？\n本批次 ${Math.max(participationStopConfirmActivity.account_ids?.length ?? 0, browserParticipationRuntime.accounts)} 个账号将停止接收后续红包；已经发出的单次参与请求不会被强行中断。`}
+    confirmText="确认停止"
+    busyText="正在停止…"
+    icon="close"
+    busy={stoppingSidebarActivityID === participationStopConfirmActivity.id}
+    onCancel={closeParticipationStopConfirm}
+    onConfirm={confirmStopActiveParticipationBatch}
   />
 {/if}
 
