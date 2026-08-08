@@ -601,16 +601,12 @@ func (s *Store) SetLiveResultHandler(handler func(roomID, status string, checked
 }
 
 func (s *Store) load() error {
-	b, err := os.ReadFile(s.path)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	payload, present, err := loadPersistedStoreFile(s.path)
 	if err != nil {
-		return fmt.Errorf("读取红包监测数据失败: %w", err)
+		return err
 	}
-	var payload file
-	if err := json.Unmarshal(b, &payload); err != nil {
-		return fmt.Errorf("解析红包监测数据失败: %w", err)
+	if !present {
+		return nil
 	}
 	for _, monitor := range payload.Monitors {
 		if monitor != nil && monitor.ID != "" {
@@ -861,20 +857,7 @@ func (s *Store) saveLocked() error {
 		s.mu.Lock()
 		return fmt.Errorf("序列化红包监测数据失败: %w", err)
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, payload, 0o600); err != nil {
-		s.saveMu.Unlock()
-		s.mu.Lock()
-		return fmt.Errorf("写入红包监测临时文件失败: %w", err)
-	}
-	if err := os.Chmod(tmp, 0o600); err != nil {
-		_ = os.Remove(tmp)
-		s.saveMu.Unlock()
-		s.mu.Lock()
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	if err := writePersistedStoreFile(path, payload); err != nil {
 		s.saveMu.Unlock()
 		s.mu.Lock()
 		return fmt.Errorf("保存红包监测数据失败: %w", err)

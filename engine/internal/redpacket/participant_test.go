@@ -159,6 +159,21 @@ func (e *fakePageParticipationExecutor) Execute(_ context.Context, task PagePart
 	return e.response
 }
 
+func waitForParticipantAttemptRelease(t *testing.T, participant *Participant, key string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		participant.mu.Lock()
+		_, reserved := participant.attempted[key]
+		participant.mu.Unlock()
+		if !reserved {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("participant reservation %q was not released", key)
+}
+
 func (p *fakePoster) PostSigned(_ context.Context, endpoint string, _ map[string]string) (*http.Response, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -871,14 +886,22 @@ func TestPageParticipantRiskControlStopsNativeContextAndTask(t *testing.T) {
 		t.Fatalf("rush_spam must become risk_control: %+v", store.records)
 	}
 	store.mu.Unlock()
-	executor.mu.Lock()
-	stopped := append([]string(nil), executor.stopped...)
-	executor.mu.Unlock()
+	deadline := time.Now().Add(time.Second)
+	var stopped []string
+	for time.Now().Before(deadline) {
+		executor.mu.Lock()
+		stopped = append([]string(nil), executor.stopped...)
+		executor.mu.Unlock()
+		if len(stopped) == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if len(stopped) != 1 || stopped[0] != "account-risk" {
 		t.Fatalf("risk control must stop native account context: %+v", stopped)
 	}
-	deadline := time.Now().Add(time.Second)
-	for recordStore.GetParticipationState("account-risk", time.Now()).Active && time.Now().Before(deadline) {
+	taskDeadline := time.Now().Add(time.Second)
+	for recordStore.GetParticipationState("account-risk", time.Now()).Active && time.Now().Before(taskDeadline) {
 		time.Sleep(time.Millisecond)
 	}
 	state := recordStore.GetParticipationState("account-risk", time.Now())
@@ -924,7 +947,7 @@ func TestPageParticipantStoppedBeforeRequestReleasesReservation(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	time.Sleep(10 * time.Millisecond)
+	waitForParticipantAttemptRelease(t, participant, "account-stopped\x00monitor:stopped-event")
 	if records := recordStore.ParticipationRecords(); len(records) != 0 {
 		t.Fatalf("stopped task left a misleading participation record: %+v", records)
 	}

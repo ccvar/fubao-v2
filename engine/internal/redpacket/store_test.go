@@ -1667,6 +1667,142 @@ func TestPersistFlushDelayGrowsWithTheMonitorStore(t *testing.T) {
 	}
 }
 
+func TestStoreRepairsNULPaddedCanonicalJSON(t *testing.T) {
+	dataDir := t.TempDir()
+	path := filepath.Join(dataDir, "red_packet_monitors.json")
+	valid := []byte(`{"version":20,"monitors":[{"id":"room_123","room_id":"123","name":"Windows 恢复直播间"}]}`)
+	corrupted := append([]byte{0, 0}, valid...)
+	corrupted = append(corrupted, 0, 0)
+	if err := os.WriteFile(path, corrupted, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := store.List()
+	if len(items) != 1 || items[0].RoomID != "123" {
+		t.Fatalf("NUL-padded store was not recovered: %+v", items)
+	}
+	repaired, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !json.Valid(repaired) || bytes.Contains(repaired, []byte{0}) {
+		t.Fatalf("canonical store was not rewritten as clean JSON: %q", repaired)
+	}
+	corruptFiles, err := filepath.Glob(path + ".corrupt-*")
+	if err != nil || len(corruptFiles) != 1 {
+		t.Fatalf("damaged original must be retained, files=%v err=%v", corruptFiles, err)
+	}
+}
+
+func TestStoreRepairsCombinedNULAndUTF8BOM(t *testing.T) {
+	dataDir := t.TempDir()
+	path := filepath.Join(dataDir, "red_packet_monitors.json")
+	valid := []byte(`{"version":20,"monitors":[{"id":"room_bom","room_id":"bom"}]}`)
+	corrupted := append([]byte{0, 0, 0xEF, 0xBB, 0xBF}, valid...)
+	corrupted = append(corrupted, 0)
+	if err := os.WriteFile(path, corrupted, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if items := store.List(); len(items) != 1 || items[0].RoomID != "bom" {
+		t.Fatalf("combined BOM/NUL store was not recovered: %+v", items)
+	}
+}
+
+func TestStoreRecoversInvalidCanonicalFromBackup(t *testing.T) {
+	dataDir := t.TempDir()
+	path := filepath.Join(dataDir, "red_packet_monitors.json")
+	if err := os.WriteFile(path, []byte{0, 0, 0, 0}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backup := []byte(`{"version":20,"monitors":[{"id":"room_456","room_id":"456","name":"备份直播间"}]}`)
+	if err := os.WriteFile(path+".bak", backup, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := store.List()
+	if len(items) != 1 || items[0].RoomID != "456" {
+		t.Fatalf("backup store was not recovered: %+v", items)
+	}
+	repaired, err := os.ReadFile(path)
+	if err != nil || !json.Valid(repaired) {
+		t.Fatalf("canonical store is not valid after backup recovery: %q err=%v", repaired, err)
+	}
+}
+
+func TestStoreQuarantinesUnrecoverableCanonicalAndStaysUsable(t *testing.T) {
+	dataDir := t.TempDir()
+	path := filepath.Join(dataDir, "red_packet_monitors.json")
+	if err := os.WriteFile(path, []byte{0, 0, 0, 0}, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatalf("an unrecoverable optional store must not disable the UI: %v", err)
+	}
+	if items := store.List(); len(items) != 0 {
+		t.Fatalf("rebuilt store should be empty, got %+v", items)
+	}
+	rebuilt, err := os.ReadFile(path)
+	if err != nil || !json.Valid(rebuilt) {
+		t.Fatalf("rebuilt canonical store is invalid: %q err=%v", rebuilt, err)
+	}
+	corruptFiles, err := filepath.Glob(path + ".corrupt-*")
+	if err != nil || len(corruptFiles) != 1 {
+		t.Fatalf("unrecoverable original must be retained, files=%v err=%v", corruptFiles, err)
+	}
+}
+
+func TestStoreSaveRotatesPreviousValidJSONToBackup(t *testing.T) {
+	dataDir := t.TempDir()
+	store, err := NewStore(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.mu.Lock()
+	store.monitors["room_first"] = &Monitor{ID: "room_first", RoomID: "first"}
+	if err := store.saveLocked(); err != nil {
+		store.mu.Unlock()
+		t.Fatal(err)
+	}
+	store.monitors["room_second"] = &Monitor{ID: "room_second", RoomID: "second"}
+	if err := store.saveLocked(); err != nil {
+		store.mu.Unlock()
+		t.Fatal(err)
+	}
+	store.mu.Unlock()
+
+	path := filepath.Join(dataDir, "red_packet_monitors.json")
+	current, err := os.ReadFile(path)
+	if err != nil || !json.Valid(current) {
+		t.Fatalf("current store is invalid: %q err=%v", current, err)
+	}
+	backup, err := os.ReadFile(path + ".bak")
+	if err != nil || !json.Valid(backup) {
+		t.Fatalf("previous valid store backup is missing: %q err=%v", backup, err)
+	}
+	var previous file
+	if err := json.Unmarshal(backup, &previous); err != nil {
+		t.Fatal(err)
+	}
+	if len(previous.Monitors) != 1 || previous.Monitors[0].ID != "room_first" {
+		t.Fatalf("backup does not contain the previous committed snapshot: %+v", previous.Monitors)
+	}
+}
+
 func TestLegacyFixedGlobalPaceMigratesToAuto(t *testing.T) {
 	dataDir := t.TempDir()
 	store, err := NewStore(dataDir)

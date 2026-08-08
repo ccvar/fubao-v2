@@ -268,6 +268,8 @@ Every successful followed-live account snapshot is authoritative only for that a
 
 Windows in-app upgrades follow Pilot/Tauri Updater behavior: launch the NSIS package in passive update mode with `/P /R /UPDATE`, never as a normal installer that shows the “Already Installed” uninstall-choice wizard. Keep the PowerShell update helper hidden, wait for the current client to exit, preserve local application data, and let the installer relaunch the upgraded client.
 
+Windows 读取 `red_packet_monitors.json` 遇到 BOM、NUL 填充或中断写入时，必须在 Go 层依次尝试修复主文件、未完成临时快照和上一份有效备份；无法恢复时保留带时间戳的损坏原文件并安全空载，不得让红包池、直播间和参与记录整页失效。每次保存使用同目录唯一临时文件，落盘后再轮换主文件，并始终保留一份上次有效 JSON 备份。
+
 Before a Windows updater install begins, explicitly stop the bundled Go sidecar and wait for its process handle to signal exit so NSIS can replace `fubao-engine.exe`; never ship a new frontend against a locked stale sidecar. During repair of a frontend/engine protocol skew, new paged room and monitor list calls may fall back only when the engine explicitly reports that method as unimplemented; other errors must remain visible.
 
 Keep the native Windows title bar and system minimize/maximize/close controls. On Windows, remove the macOS-only web title strip entirely so primary navigation starts directly below the native title bar, and disable sidebar collapsing rather than placing a toggle in the content topbar. Preserve the normal page icon before the content title and keep the Windows topbar slightly more vertically relaxed than the macOS chrome. Preserve the existing macOS title strip, collapsible behavior, traffic-light alignment, page-title icon, and right-opening toggle Tooltip.
