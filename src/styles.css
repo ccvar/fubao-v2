@@ -3828,6 +3828,38 @@ label.browser-column-control[data-tooltip]:focus-within {
   font-size: 10px;
 }
 
+.red-packet-event-identity .red-packet-event-source-meta {
+  display: flex;
+  overflow: visible;
+  min-width: 0;
+  align-items: center;
+  gap: 3px;
+}
+
+.red-packet-event-source-id {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.red-packet-event-source-meta > span:not(.red-packet-event-source-id) {
+  flex: 0 0 auto;
+}
+
+.red-packet-center-source-icon {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  color: #3b9678;
+  line-height: 1;
+  outline: none;
+}
+
 .red-packet-event-prize {
 	display: grid;
 	min-width: 0;

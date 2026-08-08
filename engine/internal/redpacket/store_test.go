@@ -1542,7 +1542,7 @@ func TestPollOnceDispatchesCenterEventAfterLocalRequestMetadataIsEnriched(t *tes
 
 	select {
 	case event := <-handled:
-		if event.DataSource != "" || event.MonitorID != "room_room-center" || event.ActualRoomID != "7000000000000000001" || event.JoinBoxID != "7669047909329177395" {
+		if event.DataSource != "" || !event.CenterSourced || event.MonitorID != "room_room-center" || event.ActualRoomID != "7000000000000000001" || event.JoinBoxID != "7669047909329177395" {
 			t.Fatalf("enriched center event missing native participation metadata: %+v", event)
 		}
 	case <-time.After(time.Second):
@@ -1596,7 +1596,7 @@ func TestMergeCenterDispatchesAndPersistsNativeParticipationMetadata(t *testing.
 		t.Fatal(err)
 	}
 	events := reloaded.EventsAll()
-	if len(events) != 1 || events[0].ActualRoomID != item.ActualRoomID || events[0].JoinBoxID != item.JoinBoxID || events[0].DelayTime != item.DelayTime {
+	if len(events) != 1 || !events[0].CenterSourced || events[0].ActualRoomID != item.ActualRoomID || events[0].JoinBoxID != item.JoinBoxID || events[0].DelayTime != item.DelayTime {
 		t.Fatalf("native participation metadata did not survive reload: %+v", events)
 	}
 }

@@ -166,6 +166,83 @@ func TestSnapshotOutboxContainsOnlySafeRoomAndPacketData(t *testing.T) {
 	}
 }
 
+func TestSnapshotDropsExpiredPacketsAndPrioritizesOpenPackets(t *testing.T) {
+	dataDir := t.TempDir()
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	roomItem, err := makeItem(syncprotocol.ItemRoomState, "room:queued", now.Format(time.RFC3339Nano), syncprotocol.RoomState{
+		WebRID: "queued", UpdatedAt: now.Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.enqueue([]syncprotocol.BatchItem{roomItem}); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SyncSnapshot(nil, nil, []redpacket.Event{
+		{WebRID: "expired", PacketID: "packet-expired", DetectedAt: now.Add(-time.Minute).Format(time.RFC3339Nano), ExpiresAt: now.Add(-time.Second).Format(time.RFC3339Nano)},
+		{WebRID: "open", PacketID: "packet-open", DetectedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(manager.outbox) != 2 {
+		t.Fatalf("outbox = %+v, want one open packet and one room", manager.outbox)
+	}
+	if manager.outbox[0].Type != syncprotocol.ItemRedPacket || manager.outbox[0].IdempotencyKey != "red_packet:open:packet-open" {
+		t.Fatalf("open packet was not prioritized: %+v", manager.outbox)
+	}
+	for _, item := range manager.outbox {
+		if item.IdempotencyKey == "red_packet:expired:packet-expired" {
+			t.Fatal("expired packet entered the upload queue")
+		}
+	}
+}
+
+func TestManagerPrunesExpiredRecoveredOutbox(t *testing.T) {
+	dataDir := t.TempDir()
+	now := time.Now().UTC()
+	expired, err := makeItem(syncprotocol.ItemRedPacket, "red_packet:expired:1", now.Add(-time.Minute).Format(time.RFC3339Nano), syncprotocol.RedPacket{
+		WebRID: "expired", PacketID: "1", DetectedAt: now.Add(-time.Minute).Format(time.RFC3339Nano), ExpiresAt: now.Add(-time.Second).Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	open, err := makeItem(syncprotocol.ItemRedPacket, "red_packet:open:2", now.Format(time.RFC3339Nano), syncprotocol.RedPacket{
+		WebRID: "open", PacketID: "2", DetectedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	room, err := makeItem(syncprotocol.ItemRoomState, "room:1", now.Format(time.RFC3339Nano), syncprotocol.RoomState{WebRID: "1", UpdatedAt: now.Format(time.RFC3339Nano)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(outboxFile{Version: configVersion, Items: []syncprotocol.BatchItem{room, expired, open}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dataDir, "remote_sync_outbox.json"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := New(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manager.Status().Pending != 2 || manager.outbox[0].IdempotencyKey != open.IdempotencyKey {
+		t.Fatalf("recovered queue was not pruned/prioritized: %+v", manager.outbox)
+	}
+	stored, err := os.ReadFile(filepath.Join(dataDir, "remote_sync_outbox.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(stored, []byte(expired.IdempotencyKey)) {
+		t.Fatal("expired recovered item remained on disk")
+	}
+}
+
 func TestSnapshotSkipsRoomsWithoutLocalObservedLive(t *testing.T) {
 	dataDir := t.TempDir()
 	content, _ := json.Marshal(Config{Version: configVersion, Enabled: true, Endpoint: syncprotocol.DefaultEndpoint, DeviceToken: "device-test-token"})

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -119,6 +120,67 @@ type RedPacket struct {
 	ParticipantCount int     `json:"participant_count,omitempty"`
 	TotalDiamonds    float64 `json:"total_diamonds,omitempty"`
 	ShareCount       int     `json:"share_count,omitempty"`
+}
+
+// RedPacketDeadline returns the earliest authoritative draw deadline carried
+// by a red-packet record. Native send_time + delay_time is included because a
+// republished expires_at must never keep an already-drawn packet alive.
+func RedPacketDeadline(packet RedPacket) (time.Time, bool) {
+	deadlines := make([]time.Time, 0, 3)
+	if deadline, ok := redPacketNativeDeadline(packet.SendTime, packet.DelayTime); ok {
+		deadlines = append(deadlines, deadline)
+	}
+	for _, value := range []string{packet.ExpiresAt, packet.DrawAt} {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if parsed, err := time.Parse(time.RFC3339Nano, value); err == nil {
+			deadlines = append(deadlines, parsed)
+			continue
+		}
+		if parsed, err := time.Parse(time.RFC3339, value); err == nil {
+			deadlines = append(deadlines, parsed)
+		}
+	}
+	if len(deadlines) == 0 {
+		return time.Time{}, false
+	}
+	earliest := deadlines[0]
+	for _, deadline := range deadlines[1:] {
+		if deadline.Before(earliest) {
+			earliest = deadline
+		}
+	}
+	return earliest, true
+}
+
+// RedPacketExpiredAt reports only a definite expiry. Records without any
+// parseable deadline remain eligible so incomplete live captures are not lost.
+func RedPacketExpiredAt(packet RedPacket, now time.Time) bool {
+	deadline, ok := RedPacketDeadline(packet)
+	return ok && !now.Before(deadline)
+}
+
+func redPacketNativeDeadline(sendTime, delayTime string) (time.Time, bool) {
+	sendNumeric, sendErr := strconv.ParseFloat(strings.TrimSpace(sendTime), 64)
+	delaySeconds, delayErr := strconv.ParseFloat(strings.TrimSpace(delayTime), 64)
+	if sendErr != nil || delayErr != nil || sendNumeric <= 0 || delaySeconds < 0 {
+		return time.Time{}, false
+	}
+	for sendNumeric > 1e12 {
+		sendNumeric /= 1000
+	}
+	if sendNumeric > 1e11 {
+		sendNumeric /= 1000
+	}
+	seconds := int64(sendNumeric)
+	nanos := int64((sendNumeric - float64(seconds)) * float64(time.Second))
+	base := time.Unix(seconds, nanos)
+	if base.Year() < 2020 {
+		return time.Time{}, false
+	}
+	return base.Add(time.Duration(delaySeconds * float64(time.Second))), true
 }
 
 // CenterRoomExclusion is a server-authoritative tombstone for a room that must

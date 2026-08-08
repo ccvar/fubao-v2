@@ -1,6 +1,7 @@
 package syncserver
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -83,6 +84,92 @@ func TestOpenStoreMigratesLegacyDevicesToFullAccess(t *testing.T) {
 	}
 	if authorization.ClientID != "desktop_legacy" || authorization.AccessMode != syncprotocol.DeviceAccessFull {
 		t.Fatalf("unexpected migrated authorization: %+v", authorization)
+	}
+}
+
+func TestApplyBatchRejectsExpiredPacketsButKeepsOpenPackets(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	store.now = func() time.Time { return now }
+	packetItem := func(id string, expiresAt time.Time) syncprotocol.BatchItem {
+		t.Helper()
+		packet := syncprotocol.RedPacket{
+			WebRID: "721652357894", PacketID: id, DetectedAt: now.Format(time.RFC3339Nano), ExpiresAt: expiresAt.Format(time.RFC3339Nano),
+		}
+		payload, marshalErr := json.Marshal(packet)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		return syncprotocol.BatchItem{Type: syncprotocol.ItemRedPacket, IdempotencyKey: "red_packet:721652357894:" + id, OccurredAt: now.Format(time.RFC3339Nano), Payload: payload}
+	}
+	request := syncprotocol.BatchRequest{
+		Version: syncprotocol.Version, RequestID: "expiry-filter", ClientID: "desktop_expiry",
+		SentAt: now.Format(time.RFC3339Nano),
+		Items:  []syncprotocol.BatchItem{packetItem("expired", now.Add(-time.Second)), packetItem("open", now.Add(time.Minute))},
+	}
+	if _, err := store.ApplyBatch(context.Background(), request.ClientID, request); err != nil {
+		t.Fatal(err)
+	}
+	stats, err := store.Stats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.RedPacket != 1 {
+		t.Fatalf("server stored %d packets, want only the open packet", stats.RedPacket)
+	}
+	changes, err := store.GetChangesByType(context.Background(), 0, syncprotocol.MaxChanges, syncprotocol.ItemRedPacket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes.Changes) != 1 || !bytes.Contains(changes.Changes[0].Payload, []byte(`"packet_id":"open"`)) {
+		t.Fatalf("unexpected center changes: %+v", changes)
+	}
+}
+
+func TestGetChangesSkipsLegacyExpiredPacketsAndAdvancesCursor(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "sync.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now().UTC()
+	store.now = func() time.Time { return now }
+	insert := func(entityKey string, packet syncprotocol.RedPacket) {
+		t.Helper()
+		payload, marshalErr := json.Marshal(packet)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		if _, execErr := store.db.Exec(`
+			INSERT INTO sync_changes(item_type, entity_key, origin_client_id, changed_at, payload_json)
+			VALUES(?, ?, ?, ?, ?)`, syncprotocol.ItemRedPacket, entityKey, "legacy-client", now.Format(time.RFC3339Nano), string(payload)); execErr != nil {
+			t.Fatal(execErr)
+		}
+	}
+	insert("expired", syncprotocol.RedPacket{
+		WebRID: "1", PacketID: "expired", DetectedAt: now.Add(-time.Minute).Format(time.RFC3339Nano), ExpiresAt: now.Add(-time.Second).Format(time.RFC3339Nano),
+	})
+	insert("open", syncprotocol.RedPacket{
+		WebRID: "2", PacketID: "open", DetectedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(time.Minute).Format(time.RFC3339Nano),
+	})
+
+	first, err := store.GetChangesByType(context.Background(), 0, 1, syncprotocol.ItemRedPacket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Changes) != 0 || !first.HasMore || first.NextCursor <= 0 {
+		t.Fatalf("expired page did not advance safely: %+v", first)
+	}
+	second, err := store.GetChangesByType(context.Background(), first.NextCursor, 1, syncprotocol.ItemRedPacket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(second.Changes) != 1 || second.HasMore || !bytes.Contains(second.Changes[0].Payload, []byte(`"packet_id":"open"`)) {
+		t.Fatalf("open packet was not returned after expired history: %+v", second)
 	}
 }
 

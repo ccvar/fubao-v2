@@ -219,6 +219,11 @@ func (s *Store) ApplyBatch(ctx context.Context, clientID string, req syncprotoco
 			if err := json.Unmarshal(item.Payload, &payload); err != nil {
 				return syncprotocol.BatchResponse{}, errors.New("红包同步数据无效")
 			}
+			// Expired packets are acknowledged so old clients can drain their
+			// queues, but are never admitted to the shared center library.
+			if syncprotocol.RedPacketExpiredAt(payload, s.now()) {
+				continue
+			}
 			accepted, err := upsertRedPacket(ctx, tx, s.driver, clientID, payload, s.now().UTC().Format(time.RFC3339Nano))
 			if err != nil {
 				return syncprotocol.BatchResponse{}, err
@@ -515,22 +520,33 @@ func (s *Store) GetChangesByType(ctx context.Context, cursor int64, limit int, i
 	}
 	defer rows.Close()
 	result := syncprotocol.ChangesResponse{Version: syncprotocol.Version, NextCursor: cursor, Changes: make([]syncprotocol.Change, 0, limit)}
+	scanned := 0
 	for rows.Next() {
+		if scanned == limit {
+			result.HasMore = true
+			break
+		}
+		scanned++
 		var change syncprotocol.Change
 		var payload []byte
 		if err := rows.Scan(&change.Cursor, &change.Type, &change.OriginClientID, &change.ChangedAt, &payload); err != nil {
 			return syncprotocol.ChangesResponse{}, err
 		}
-		if len(result.Changes) == limit {
-			result.HasMore = true
-			break
-		}
 		if !json.Valid(payload) {
 			return syncprotocol.ChangesResponse{}, errors.New("中心库增量数据损坏")
 		}
+		result.NextCursor = change.Cursor
+		if change.Type == syncprotocol.ItemRedPacket {
+			var packet syncprotocol.RedPacket
+			if err := json.Unmarshal(payload, &packet); err != nil {
+				return syncprotocol.ChangesResponse{}, errors.New("中心库红包增量数据损坏")
+			}
+			if syncprotocol.RedPacketExpiredAt(packet, s.now()) {
+				continue
+			}
+		}
 		change.Payload = append(json.RawMessage(nil), payload...)
 		result.Changes = append(result.Changes, change)
-		result.NextCursor = change.Cursor
 	}
 	if err := rows.Err(); err != nil {
 		return syncprotocol.ChangesResponse{}, err

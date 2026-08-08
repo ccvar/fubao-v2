@@ -396,8 +396,9 @@
     title?: string;
     prize?: string;
 	condition?: string;
-    source: string;
+	source: string;
 	data_source?: string;
+	center_sourced?: boolean;
     detected_at: string;
     draw_at?: string;
 	expires_at?: string;
@@ -2436,6 +2437,10 @@
 
   function redPacketEventIsDiamond(event: RedPacketEvent) {
     return (event.title || "").includes("钻石");
+  }
+
+  function redPacketEventFromCenter(event: RedPacketEvent) {
+    return event.data_source === "center" || event.center_sourced === true;
   }
 
   function redPacketEventExpiryParts(event: RedPacketEvent, clock = Date.now()) {
@@ -7642,7 +7647,21 @@
                       </span>
                       <div>
                         <strong>{event.title || "直播间红包"}</strong>
-						<small>{event.packet_id || "红包事件"} · {event.data_source === "center" ? "来源于中心库" : event.source === "luckybox_api" ? "红包接口" : "实时检测"}</small>
+						<small class="red-packet-event-source-meta">
+						  <span class="red-packet-event-source-id">{event.packet_id || "红包事件"}</span>
+						  <span aria-hidden="true">·</span>
+						  {#if redPacketEventFromCenter(event)}
+							<span
+							  class="red-packet-center-source-icon"
+							  data-tooltip="来源于中心库"
+							  data-tooltip-placement="top"
+							  aria-label="来源于中心库"
+							  role="img"
+							><CloudArrowDown size={12} weight="bold" /></span>
+						  {:else}
+							<span>{event.source === "luckybox_api" ? "红包接口" : "实时检测"}</span>
+						  {/if}
+						</small>
                       </div>
                     </div>
                     <div class="red-packet-event-room">
@@ -7655,7 +7674,7 @@
 						<span>{event.room_name || event.streamer_name || `直播间 ${event.web_rid || event.room_id}`}</span>
 						<ArrowSquareOut size={11} />
 					  </button>
-					  <small>{event.streamer_name || "尚未读取主播"} · {event.data_source === "center" ? "中心库同步" : `账号 ${event.account_name || event.account_id || "待解析"}`}</small>
+					  <small>{event.streamer_name || "尚未读取主播"} · {redPacketEventFromCenter(event) ? "中心库同步" : `账号 ${event.account_name || event.account_id || "待解析"}`}</small>
                     </div>
 					<div class="red-packet-event-prize">
 					  <span class="red-packet-event-prize-line">

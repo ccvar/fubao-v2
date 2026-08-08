@@ -205,12 +205,25 @@ func (m *Manager) loadOutbox() error {
 	if !loaded {
 		return nil
 	}
+	now := time.Now()
+	normalized := false
 	for _, item := range payload.Items {
 		if item.IdempotencyKey == "" || !json.Valid(item.Payload) {
+			normalized = true
+			continue
+		}
+		if batchItemExpiredAt(item, now) {
+			normalized = true
 			continue
 		}
 		m.outbox = append(m.outbox, item)
 		m.lastHashes[item.IdempotencyKey] = itemHash(item)
+	}
+	if prioritizeRedPackets(m.outbox) {
+		normalized = true
+	}
+	if normalized {
+		return m.saveOutboxLocked()
 	}
 	return nil
 }
@@ -365,6 +378,12 @@ func (m *Manager) Configure(ctx context.Context, enabled bool, enrollmentToken s
 
 func (m *Manager) flushOnce(ctx context.Context) (bool, error) {
 	m.mu.Lock()
+	if m.pruneExpiredOutboxLocked(time.Now()) {
+		if err := m.saveOutboxLocked(); err != nil {
+			m.mu.Unlock()
+			return false, err
+		}
+	}
 	if len(m.outbox) == 0 || m.config.DeviceToken == "" {
 		m.mu.Unlock()
 		return false, nil
@@ -663,6 +682,9 @@ func redPacketItem(event redpacket.Event) (syncprotocol.BatchItem, bool, error) 
 		ExpiresAt: event.ExpiresAt, ParticipantCount: event.ParticipantCount,
 		TotalDiamonds: event.TotalDiamonds, ShareCount: event.ShareCount,
 	}
+	if syncprotocol.RedPacketExpiredAt(payload, time.Now()) {
+		return syncprotocol.BatchItem{}, false, nil
+	}
 	item, err := makeItem(syncprotocol.ItemRedPacket, "red_packet:"+webRID+":"+packetID, event.DetectedAt, payload)
 	return item, err == nil, err
 }
@@ -803,7 +825,7 @@ func (m *Manager) pullType(ctx context.Context, roomStore *rooms.Store, redPacke
 			m.recordError(err)
 			return err
 		}
-		if response.Version != syncprotocol.Version || response.NextCursor < cursor {
+		if response.Version != syncprotocol.Version || response.NextCursor < cursor || (response.HasMore && response.NextCursor <= cursor) {
 			err := errors.New("中心库增量响应无效")
 			m.recordError(err)
 			return err
@@ -832,6 +854,9 @@ func (m *Manager) pullType(ctx context.Context, roomStore *rooms.Store, redPacke
 				var item syncprotocol.RedPacket
 				if err := json.Unmarshal(change.Payload, &item); err != nil {
 					return fmt.Errorf("解析中心库红包失败: %w", err)
+				}
+				if syncprotocol.RedPacketExpiredAt(item, time.Now()) {
+					continue
 				}
 				centerEvents = append(centerEvents, redpacket.CenterEvent{
 					WebRID: item.WebRID, PacketID: item.PacketID,
@@ -875,7 +900,7 @@ func (m *Manager) pullType(ctx context.Context, roomStore *rooms.Store, redPacke
 		}
 		m.mu.Unlock()
 		m.recordSuccess()
-		if !response.HasMore || len(response.Changes) == 0 {
+		if !response.HasMore {
 			return nil
 		}
 	}
@@ -885,6 +910,8 @@ func (m *Manager) pullType(ctx context.Context, roomStore *rooms.Store, redPacke
 func (m *Manager) enqueue(items []syncprotocol.BatchItem) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	now := time.Now()
+	changed := m.pruneExpiredOutboxLocked(now)
 	index := make(map[string]int, len(m.outbox))
 	roomCount := 0
 	for i, item := range m.outbox {
@@ -893,8 +920,10 @@ func (m *Manager) enqueue(items []syncprotocol.BatchItem) error {
 			roomCount++
 		}
 	}
-	changed := false
 	for _, item := range items {
+		if batchItemExpiredAt(item, now) {
+			continue
+		}
 		hash := itemHash(item)
 		if m.lastHashes[item.IdempotencyKey] == hash {
 			continue
@@ -915,10 +944,73 @@ func (m *Manager) enqueue(items []syncprotocol.BatchItem) error {
 		}
 		changed = true
 	}
+	if prioritizeRedPackets(m.outbox) {
+		changed = true
+	}
 	if !changed {
 		return nil
 	}
 	return m.saveOutboxLocked()
+}
+
+func (m *Manager) pruneExpiredOutboxLocked(now time.Time) bool {
+	if len(m.outbox) == 0 {
+		return false
+	}
+	kept := m.outbox[:0]
+	changed := false
+	for _, item := range m.outbox {
+		if batchItemExpiredAt(item, now) {
+			delete(m.lastHashes, item.IdempotencyKey)
+			changed = true
+			continue
+		}
+		kept = append(kept, item)
+	}
+	m.outbox = kept
+	return changed
+}
+
+func batchItemExpiredAt(item syncprotocol.BatchItem, now time.Time) bool {
+	if item.Type != syncprotocol.ItemRedPacket {
+		return false
+	}
+	var packet syncprotocol.RedPacket
+	if err := json.Unmarshal(item.Payload, &packet); err != nil {
+		return false
+	}
+	return syncprotocol.RedPacketExpiredAt(packet, now)
+}
+
+// Keep live red packets ahead of bulk room snapshots. This matters after a
+// server migration, where thousands of room rows can otherwise delay a packet
+// until after its short participation window has closed.
+func prioritizeRedPackets(items []syncprotocol.BatchItem) bool {
+	if len(items) < 2 {
+		return false
+	}
+	ordered := make([]syncprotocol.BatchItem, 0, len(items))
+	for _, item := range items {
+		if item.Type == syncprotocol.ItemRedPacket {
+			ordered = append(ordered, item)
+		}
+	}
+	redPacketCount := len(ordered)
+	for _, item := range items {
+		if item.Type != syncprotocol.ItemRedPacket {
+			ordered = append(ordered, item)
+		}
+	}
+	if redPacketCount == 0 || redPacketCount == len(items) {
+		return false
+	}
+	for index := range items {
+		if items[index].IdempotencyKey != ordered[index].IdempotencyKey {
+			copy(items, ordered)
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Manager) deviceAccessLocked() string {

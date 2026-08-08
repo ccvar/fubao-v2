@@ -118,20 +118,24 @@ type Monitor struct {
 }
 
 type Event struct {
-	ID               string  `json:"id"`
-	MonitorID        string  `json:"monitor_id"`
-	AccountID        string  `json:"account_id,omitempty"`
-	AccountName      string  `json:"account_name,omitempty"`
-	RoomID           string  `json:"room_id"`
-	RoomName         string  `json:"room_name,omitempty"`
-	StreamerName     string  `json:"streamer_name,omitempty"`
-	WebRID           string  `json:"web_rid,omitempty"`
-	PacketID         string  `json:"packet_id"`
-	Title            string  `json:"title,omitempty"`
-	Prize            string  `json:"prize,omitempty"`
-	Condition        string  `json:"condition,omitempty"`
-	Source           string  `json:"source"`
-	DataSource       string  `json:"data_source,omitempty"`
+	ID           string `json:"id"`
+	MonitorID    string `json:"monitor_id"`
+	AccountID    string `json:"account_id,omitempty"`
+	AccountName  string `json:"account_name,omitempty"`
+	RoomID       string `json:"room_id"`
+	RoomName     string `json:"room_name,omitempty"`
+	StreamerName string `json:"streamer_name,omitempty"`
+	WebRID       string `json:"web_rid,omitempty"`
+	PacketID     string `json:"packet_id"`
+	Title        string `json:"title,omitempty"`
+	Prize        string `json:"prize,omitempty"`
+	Condition    string `json:"condition,omitempty"`
+	Source       string `json:"source"`
+	DataSource   string `json:"data_source,omitempty"`
+	// CenterSourced is durable provenance. DataSource may be cleared after a
+	// local monitor enriches the same event, but the UI must still be able to
+	// state that this client learned the packet from the shared center.
+	CenterSourced    bool    `json:"center_sourced,omitempty"`
 	DetectedAt       string  `json:"detected_at"`
 	DrawAt           string  `json:"draw_at,omitempty"`
 	ExpiresAt        string  `json:"expires_at,omitempty"`
@@ -646,6 +650,9 @@ func (s *Store) load() error {
 	}
 	for _, event := range payload.Events {
 		if event != nil && event.ID != "" {
+			if event.DataSource == "center" {
+				event.CenterSourced = true
+			}
 			if metadata, ok := payload.NativeParticipation[event.ID]; ok {
 				event.ActualRoomID = metadata.ActualRoomID
 				event.JoinBoxID = metadata.JoinBoxID
@@ -2740,12 +2747,16 @@ func (s *Store) MergeCenter(items []CenterEvent) (int, error) {
 			sum := sha256.Sum256([]byte(webRID + "\x00" + packetID))
 			existing = &Event{
 				ID: "center:" + hex.EncodeToString(sum[:16]), RoomID: webRID, WebRID: webRID,
-				PacketID: packetID, Source: firstNonEmpty(item.Source, "center_sync"), DataSource: "center",
+				PacketID: packetID, Source: firstNonEmpty(item.Source, "center_sync"), DataSource: "center", CenterSourced: true,
 				DetectedAt: firstNonEmpty(item.DetectedAt, time.Now().Format(time.RFC3339Nano)),
 			}
 			s.events[existing.ID] = existing
 			changed = true
 			imported++
+		}
+		if !existing.CenterSourced {
+			existing.CenterSourced = true
+			changed = true
 		}
 		wasParticipationReady := eventParticipationMetadataReady(existing)
 		centerOwned := existing.DataSource == "center"
