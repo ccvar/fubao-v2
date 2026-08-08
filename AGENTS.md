@@ -344,7 +344,7 @@ On Windows, retain the native caption and system window controls. Keep the sideb
 
 浏览器实例页的标题副文案在“本机运行”后紧凑显示实时 CPU 与内存占用百分比；资源数据由 Go 原生层采样并随现有容量轮询刷新，详细内存用量使用共享暗色 Tooltip 展示。
 
-远程同步服务与桌面客户端保留在同一个仓库，但使用独立的 `fubao-sync-server` Go 二进制、`server-v*` 版本和 GitHub 构建发布流程。客户端默认只与 `https://fbv2.ccvar.com/api/v1` 通信，通过权限受限的 Go 私有配置保存设备令牌，并使用可恢复的本地 Outbox 非阻塞地同步直播间状态与红包事件。远程协议只允许经过白名单定义的安全字段；Cookie、签名、请求头、原始接口响应、参与账号凭证以及不必要的本地账号标识不得离开 Go 原生层。服务端由 systemd 运行、Caddy 终止 HTTPS、SQLite 持久化，并以幂等键处理客户端至少一次投递。
+远程同步服务与桌面客户端保留在同一个仓库，但使用独立的 `fubao-sync-server` Go 二进制、`server-v*` 版本和 GitHub 构建发布流程。客户端默认只与 `https://fbv2.ccvar.com/api/v1` 通信，通过权限受限的 Go 私有配置保存设备令牌，并使用可恢复的本地 Outbox 非阻塞地同步直播间状态与红包事件。远程协议只允许经过白名单定义的安全字段；Cookie、签名、请求头、原始接口响应、参与账号凭证以及不必要的本地账号标识不得离开 Go 原生层。服务端由 systemd 运行、Caddy 终止 HTTPS，存储默认使用 SQLite、安装时可选 MySQL；安装器选择 MySQL 时先检测本机服务，缺失时经用户确认使用系统软件源自动安装，已有服务只收集并验证账号密码。已有部署重复安装必须保留原存储类型，禁止在没有数据迁移的情况下静默切库。数据库密码只留在原生权限文件，不进入 systemd 命令行、服务日志或前端，并以幂等键处理客户端至少一次投递。
 
 远程同步客户端先以 `https://fbv2.ccvar.com/healthz` 验证标准入口；健康检查或后续服务请求不可用时，自动降级到 `https://fbv2.ccvar.com:8087/healthz` 与对应的 `/api/v1` 入口。备用入口稳定后短期保持使用，随后自动重试标准入口；鉴权或参数类 4xx 错误不得通过切换端口掩盖。服务端 Caddy 配置必须同时提供标准 HTTPS 和 HTTPS 8087，安装提示明确要求放行 TCP 8087。
 

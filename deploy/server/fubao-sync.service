@@ -1,12 +1,13 @@
 [Unit]
 Description=Fubao remote room and red-packet sync service
-After=network-online.target
+After=network-online.target mysql.service mariadb.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=fubao-sync
 Group=fubao-sync
+EnvironmentFile=-/etc/fubao-sync/database.env
 ExecStart=/usr/local/bin/fubao-sync-server -listen 127.0.0.1:8788 -data /var/lib/fubao-sync/fubao-sync.db -enrollment-token-file /etc/fubao-sync/enrollment.token
 Restart=on-failure
 RestartSec=5s

@@ -5,11 +5,46 @@ import (
 	"database/sql"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"fubao.ccvar.com/engine/internal/syncprotocol"
 )
+
+func TestOpenStoreRejectsUnknownStorage(t *testing.T) {
+	store, err := OpenStoreWithOptions(StoreOptions{Driver: "postgres"})
+	if err == nil {
+		_ = store.Close()
+		t.Fatal("expected unsupported storage error")
+	}
+	if !strings.Contains(err.Error(), "不支持的同步存储类型") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMySQLDialectUsesNativeUpserts(t *testing.T) {
+	checks := map[string]string{
+		registerDeviceQuery(StorageMySQL, true): "ON DUPLICATE KEY UPDATE",
+		upsertRoomQuery(StorageMySQL):           "GREATEST",
+		upsertRedPacketQuery(StorageMySQL):      "LEAST",
+		insertLiveSessionQuery(StorageMySQL):    "INSERT IGNORE",
+		deleteRoomChangesQuery(StorageMySQL):    "JSON_UNQUOTE",
+		previousChangeQuery(StorageMySQL):       "FOR UPDATE",
+	}
+	for query, expected := range checks {
+		if !strings.Contains(query, expected) {
+			t.Fatalf("MySQL query should contain %q: %s", expected, query)
+		}
+		if strings.Contains(query, "ON CONFLICT") || strings.Contains(query, "INSERT OR IGNORE") {
+			t.Fatalf("MySQL query contains SQLite-only syntax: %s", query)
+		}
+	}
+	statements := mysqlMigrationStatements()
+	if len(statements) == 0 || !strings.Contains(strings.Join(statements, "\n"), "AUTO_INCREMENT") {
+		t.Fatal("MySQL migrations must use AUTO_INCREMENT")
+	}
+}
 
 func TestOpenStoreMigratesLegacyDevicesToFullAccess(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy-sync.db")

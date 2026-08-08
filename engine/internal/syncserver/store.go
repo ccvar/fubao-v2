@@ -10,18 +10,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"fubao.ccvar.com/engine/internal/syncprotocol"
-	_ "modernc.org/sqlite"
 )
 
 type Store struct {
-	db  *sql.DB
-	now func() time.Time
+	db     *sql.DB
+	driver string
+	now    func() time.Time
 }
 
 type Stats struct {
@@ -38,147 +36,29 @@ type DeviceAuthorization struct {
 
 const centerServerOriginClientID = "center-server"
 
-func OpenStore(path string) (*Store, error) {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return nil, errors.New("同步数据库路径为空")
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		return nil, fmt.Errorf("创建同步数据目录失败: %w", err)
-	}
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, fmt.Errorf("打开同步数据库失败: %w", err)
-	}
-	db.SetMaxOpenConns(1)
-	store := &Store{db: db, now: time.Now}
-	if err := store.migrate(context.Background()); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	return store, nil
-}
-
 func (s *Store) Close() error {
 	return s.db.Close()
 }
 
 func (s *Store) migrate(ctx context.Context) error {
-	statements := []string{
-		`PRAGMA journal_mode=WAL`,
-		`PRAGMA busy_timeout=5000`,
-		`PRAGMA foreign_keys=ON`,
-		`CREATE TABLE IF NOT EXISTS devices (
-			client_id TEXT PRIMARY KEY,
-			client_name TEXT NOT NULL DEFAULT '',
-			platform TEXT NOT NULL DEFAULT '',
-			app_version TEXT NOT NULL DEFAULT '',
-			token_hash TEXT NOT NULL UNIQUE,
-			access_mode TEXT NOT NULL DEFAULT 'full',
-			created_at TEXT NOT NULL,
-			last_seen_at TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS rooms (
-			web_rid TEXT PRIMARY KEY,
-			actual_room_id TEXT NOT NULL DEFAULT '',
-			title TEXT NOT NULL DEFAULT '',
-			streamer_name TEXT NOT NULL DEFAULT '',
-			monitor_status TEXT NOT NULL DEFAULT '',
-			connection_status TEXT NOT NULL DEFAULT '',
-			live_status TEXT NOT NULL DEFAULT '',
-			live_status_source TEXT NOT NULL DEFAULT '',
-			live_started_at TEXT NOT NULL DEFAULT '',
-			last_seen_live_at TEXT NOT NULL DEFAULT '',
-			last_checked_at TEXT NOT NULL DEFAULT '',
-			last_red_packet_checked_at TEXT NOT NULL DEFAULT '',
-			last_event_at TEXT NOT NULL DEFAULT '',
-			metrics_version INTEGER NOT NULL DEFAULT 1,
-			live_session_count INTEGER NOT NULL DEFAULT 0,
-			red_packet_count INTEGER NOT NULL DEFAULT 0,
-			updated_at TEXT NOT NULL,
-			last_client_id TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS room_live_sessions (
-			web_rid TEXT NOT NULL,
-			session_key TEXT NOT NULL,
-			first_seen_at TEXT NOT NULL,
-			PRIMARY KEY (web_rid, session_key),
-			FOREIGN KEY (web_rid) REFERENCES rooms(web_rid) ON DELETE CASCADE
-		)`,
-		`CREATE TABLE IF NOT EXISTS red_packet_events (
-			web_rid TEXT NOT NULL,
-			packet_id TEXT NOT NULL,
-			actual_room_id TEXT NOT NULL DEFAULT '',
-			join_box_id TEXT NOT NULL DEFAULT '',
-			anchor_id TEXT NOT NULL DEFAULT '',
-			box_type TEXT NOT NULL DEFAULT '',
-			send_time TEXT NOT NULL DEFAULT '',
-			delay_time TEXT NOT NULL DEFAULT '',
-			room_name TEXT NOT NULL DEFAULT '',
-			streamer_name TEXT NOT NULL DEFAULT '',
-			title TEXT NOT NULL DEFAULT '',
-			prize TEXT NOT NULL DEFAULT '',
-			participation_condition TEXT NOT NULL DEFAULT '',
-			source TEXT NOT NULL DEFAULT '',
-			detected_at TEXT NOT NULL,
-			draw_at TEXT NOT NULL DEFAULT '',
-			expires_at TEXT NOT NULL DEFAULT '',
-			participant_count INTEGER NOT NULL DEFAULT 0,
-			total_diamonds REAL NOT NULL DEFAULT 0,
-			share_count INTEGER NOT NULL DEFAULT 0,
-			last_seen_at TEXT NOT NULL,
-			last_client_id TEXT NOT NULL,
-			PRIMARY KEY (web_rid, packet_id)
-		)`,
-		`CREATE TABLE IF NOT EXISTS sync_requests (
-			client_id TEXT NOT NULL,
-			request_id TEXT NOT NULL,
-			received_at TEXT NOT NULL,
-			item_count INTEGER NOT NULL,
-			PRIMARY KEY (client_id, request_id)
-		)`,
-		`CREATE TABLE IF NOT EXISTS sync_changes (
-			seq INTEGER PRIMARY KEY AUTOINCREMENT,
-			item_type TEXT NOT NULL,
-			entity_key TEXT NOT NULL,
-			origin_client_id TEXT NOT NULL,
-			changed_at TEXT NOT NULL,
-			payload_json TEXT NOT NULL,
-			UNIQUE(item_type, entity_key)
-		)`,
-		`CREATE TABLE IF NOT EXISTS room_exclusions (
-			web_rid TEXT PRIMARY KEY,
-			actual_room_id TEXT NOT NULL DEFAULT '',
-			name TEXT NOT NULL DEFAULT '',
-			streamer_name TEXT NOT NULL DEFAULT '',
-			reason TEXT NOT NULL DEFAULT '',
-			excluded_at TEXT NOT NULL,
-			excluded_by_client_id TEXT NOT NULL
-		)`,
-		`CREATE INDEX IF NOT EXISTS red_packet_detected_at_idx ON red_packet_events(detected_at DESC)`,
-		`CREATE INDEX IF NOT EXISTS rooms_live_status_idx ON rooms(live_status, updated_at DESC)`,
-		`CREATE INDEX IF NOT EXISTS sync_changes_seq_idx ON sync_changes(seq)`,
-		`CREATE INDEX IF NOT EXISTS sync_changes_entity_idx ON sync_changes(item_type, entity_key, seq DESC)`,
-		`CREATE INDEX IF NOT EXISTS room_exclusions_actual_room_idx ON room_exclusions(actual_room_id)`,
-		`CREATE INDEX IF NOT EXISTS room_live_sessions_room_idx ON room_live_sessions(web_rid)`,
-	}
+	statements := s.migrationStatements()
 	for _, statement := range statements {
 		if _, err := s.db.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("初始化同步数据库失败: %w", err)
 		}
 	}
-	if err := s.ensureColumn(ctx, "devices", "access_mode", "TEXT NOT NULL DEFAULT 'full'"); err != nil {
+	if err := s.ensureColumn(ctx, "devices", "access_mode", s.textColumnDefinition(20, "full")); err != nil {
 		return err
 	}
-	for _, column := range []string{"actual_room_id", "join_box_id", "anchor_id", "box_type", "send_time", "delay_time", "participation_condition"} {
-		if err := s.ensureColumn(ctx, "red_packet_events", column, "TEXT NOT NULL DEFAULT ''"); err != nil {
+	for column, size := range map[string]int{"actual_room_id": 32, "join_box_id": 32, "anchor_id": 32, "box_type": 16, "send_time": 32, "delay_time": 32, "participation_condition": 200} {
+		if err := s.ensureColumn(ctx, "red_packet_events", column, s.textColumnDefinition(size, "")); err != nil {
 			return err
 		}
 	}
 	for column, definition := range map[string]string{
-		"metrics_version":    "INTEGER NOT NULL DEFAULT 1",
-		"live_session_count": "INTEGER NOT NULL DEFAULT 0",
-		"red_packet_count":   "INTEGER NOT NULL DEFAULT 0",
+		"metrics_version":    s.integerColumnDefinition(1),
+		"live_session_count": s.integerColumnDefinition(0),
+		"red_packet_count":   s.integerColumnDefinition(0),
 	} {
 		if err := s.ensureColumn(ctx, "rooms", column, definition); err != nil {
 			return err
@@ -190,16 +70,10 @@ func (s *Store) migrate(ctx context.Context) error {
 		), metrics_version = 1`); err != nil {
 		return fmt.Errorf("回填中心库直播间统计失败: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `
-		INSERT OR IGNORE INTO room_live_sessions(web_rid, session_key, first_seen_at)
-		SELECT web_rid, 'started:' || live_started_at, COALESCE(NULLIF(last_seen_live_at, ''), updated_at)
-		FROM rooms WHERE live_status = 'live' AND live_started_at <> ''`); err != nil {
+	if _, err := s.db.ExecContext(ctx, s.backfillLiveSessionsQuery()); err != nil {
 		return fmt.Errorf("回填中心库开播场次失败: %w", err)
 	}
-	if _, err := s.db.ExecContext(ctx, `
-		UPDATE rooms SET live_session_count = MAX(live_session_count, (
-			SELECT COUNT(*) FROM room_live_sessions WHERE room_live_sessions.web_rid = rooms.web_rid
-		))`); err != nil {
+	if _, err := s.db.ExecContext(ctx, s.backfillLiveSessionCountsQuery()); err != nil {
 		return fmt.Errorf("回填中心库开播次数失败: %w", err)
 	}
 	if err := s.backfillChanges(ctx); err != nil {
@@ -209,24 +83,34 @@ func (s *Store) migrate(ctx context.Context) error {
 }
 
 func (s *Store) ensureColumn(ctx context.Context, table, column, definition string) error {
-	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid, notNull, primaryKey int
-		var name, dataType string
-		var defaultValue any
-		if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+	if s.driver == StorageMySQL {
+		var count int
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?`, table, column).Scan(&count); err != nil {
 			return err
 		}
-		if name == column {
+		if count > 0 {
 			return nil
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
+	} else {
+		rows, err := s.db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var cid, notNull, primaryKey int
+			var name, dataType string
+			var defaultValue any
+			if err := rows.Scan(&cid, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+				return err
+			}
+			if name == column {
+				return nil
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
 	}
 	if _, err := s.db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+column+" "+definition); err != nil {
 		return fmt.Errorf("升级同步数据库字段失败: %w", err)
@@ -255,22 +139,7 @@ func (s *Store) registerDevice(ctx context.Context, req syncprotocol.RegisterReq
 		return syncprotocol.RegisterResponse{}, err
 	}
 	now := s.now().UTC().Format(time.RFC3339Nano)
-	query := `
-		INSERT INTO devices(client_id, client_name, platform, app_version, token_hash, access_mode, created_at, last_seen_at)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(client_id) DO NOTHING`
-	if replace {
-		query = `
-			INSERT INTO devices(client_id, client_name, platform, app_version, token_hash, access_mode, created_at, last_seen_at)
-			VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(client_id) DO UPDATE SET
-				client_name=excluded.client_name,
-				platform=excluded.platform,
-				app_version=excluded.app_version,
-				token_hash=excluded.token_hash,
-				access_mode=excluded.access_mode,
-				last_seen_at=excluded.last_seen_at`
-	}
+	query := registerDeviceQuery(s.driver, replace)
 	result, err := s.db.ExecContext(ctx, query,
 		clientID, safeText(req.ClientName, 160), safeText(req.Platform, 80), safeText(req.AppVersion, 40), tokenHash(token), accessMode, now, now)
 	if err != nil {
@@ -331,7 +200,7 @@ func (s *Store) ApplyBatch(ctx context.Context, clientID string, req syncprotoco
 			if err := json.Unmarshal(item.Payload, &payload); err != nil {
 				return syncprotocol.BatchResponse{}, errors.New("直播间同步数据无效")
 			}
-			accepted, err := upsertRoom(ctx, tx, clientID, payload)
+			accepted, err := upsertRoom(ctx, tx, s.driver, clientID, payload)
 			if err != nil {
 				return syncprotocol.BatchResponse{}, err
 			}
@@ -342,7 +211,7 @@ func (s *Store) ApplyBatch(ctx context.Context, clientID string, req syncprotoco
 			if err != nil {
 				return syncprotocol.BatchResponse{}, err
 			}
-			if err := appendChangeTx(ctx, tx, syncprotocol.ItemRoomState, canonical.WebRID, centerServerOriginClientID, canonical.UpdatedAt, canonical); err != nil {
+			if err := appendChangeTx(ctx, tx, s.driver, syncprotocol.ItemRoomState, canonical.WebRID, centerServerOriginClientID, canonical.UpdatedAt, canonical); err != nil {
 				return syncprotocol.BatchResponse{}, err
 			}
 		case syncprotocol.ItemRedPacket:
@@ -350,7 +219,7 @@ func (s *Store) ApplyBatch(ctx context.Context, clientID string, req syncprotoco
 			if err := json.Unmarshal(item.Payload, &payload); err != nil {
 				return syncprotocol.BatchResponse{}, errors.New("红包同步数据无效")
 			}
-			accepted, err := upsertRedPacket(ctx, tx, clientID, payload, s.now().UTC().Format(time.RFC3339Nano))
+			accepted, err := upsertRedPacket(ctx, tx, s.driver, clientID, payload, s.now().UTC().Format(time.RFC3339Nano))
 			if err != nil {
 				return syncprotocol.BatchResponse{}, err
 			}
@@ -361,12 +230,12 @@ func (s *Store) ApplyBatch(ctx context.Context, clientID string, req syncprotoco
 			if err != nil {
 				return syncprotocol.BatchResponse{}, err
 			}
-			if err := appendChangeTx(ctx, tx, syncprotocol.ItemRedPacket, canonical.WebRID+"\x00"+canonical.PacketID, clientID, s.now().UTC().Format(time.RFC3339Nano), canonical); err != nil {
+			if err := appendChangeTx(ctx, tx, s.driver, syncprotocol.ItemRedPacket, canonical.WebRID+"\x00"+canonical.PacketID, clientID, s.now().UTC().Format(time.RFC3339Nano), canonical); err != nil {
 				return syncprotocol.BatchResponse{}, err
 			}
 			room, err := readRoomTx(ctx, tx, canonical.WebRID)
 			if err == nil {
-				if err := appendChangeTx(ctx, tx, syncprotocol.ItemRoomState, room.WebRID, centerServerOriginClientID, s.now().UTC().Format(time.RFC3339Nano), room); err != nil {
+				if err := appendChangeTx(ctx, tx, s.driver, syncprotocol.ItemRoomState, room.WebRID, centerServerOriginClientID, s.now().UTC().Format(time.RFC3339Nano), room); err != nil {
 					return syncprotocol.BatchResponse{}, err
 				}
 			} else if !errors.Is(err, sql.ErrNoRows) {
@@ -387,7 +256,7 @@ func (s *Store) ApplyBatch(ctx context.Context, clientID string, req syncprotoco
 	return syncprotocol.BatchResponse{Version: syncprotocol.Version, RequestID: req.RequestID, Accepted: len(req.Items), Acked: acked}, nil
 }
 
-func upsertRoom(ctx context.Context, tx *sql.Tx, clientID string, room syncprotocol.RoomState) (bool, error) {
+func upsertRoom(ctx context.Context, tx *sql.Tx, driver, clientID string, room syncprotocol.RoomState) (bool, error) {
 	room.WebRID = strings.TrimSpace(room.WebRID)
 	if room.WebRID == "" || len(room.WebRID) > 32 {
 		return false, errors.New("直播间标识无效")
@@ -407,37 +276,19 @@ func upsertRoom(ctx context.Context, tx *sql.Tx, clientID string, room syncproto
 		return false, priorErr
 	}
 	stateAccepted := errors.Is(priorErr, sql.ErrNoRows) || room.UpdatedAt >= priorUpdatedAt
+	if !stateAccepted {
+		return false, nil
+	}
 	seedLiveSessionCount := max(0, room.LiveSessionCount)
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO rooms(web_rid, actual_room_id, title, streamer_name, monitor_status, connection_status, live_status, live_status_source, live_started_at, last_seen_live_at, last_checked_at, last_red_packet_checked_at, last_event_at, metrics_version, live_session_count, red_packet_count, updated_at, last_client_id)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, (SELECT COUNT(*) FROM red_packet_events WHERE web_rid = ?), ?, ?)
-		ON CONFLICT(web_rid) DO UPDATE SET
-			actual_room_id=COALESCE(NULLIF(excluded.actual_room_id, ''), rooms.actual_room_id),
-			title=COALESCE(NULLIF(excluded.title, ''), rooms.title),
-			streamer_name=COALESCE(NULLIF(excluded.streamer_name, ''), rooms.streamer_name),
-			monitor_status=excluded.monitor_status,
-			connection_status=excluded.connection_status,
-			live_status=excluded.live_status,
-			live_status_source=excluded.live_status_source,
-			live_started_at=COALESCE(NULLIF(excluded.live_started_at, ''), rooms.live_started_at),
-			last_seen_live_at=COALESCE(NULLIF(excluded.last_seen_live_at, ''), rooms.last_seen_live_at),
-			last_checked_at=COALESCE(NULLIF(excluded.last_checked_at, ''), rooms.last_checked_at),
-			last_red_packet_checked_at=COALESCE(NULLIF(excluded.last_red_packet_checked_at, ''), rooms.last_red_packet_checked_at),
-			last_event_at=COALESCE(NULLIF(excluded.last_event_at, ''), rooms.last_event_at),
-			metrics_version=1,
-			live_session_count=MAX(rooms.live_session_count, excluded.live_session_count),
-			red_packet_count=MAX(rooms.red_packet_count, excluded.red_packet_count),
-			updated_at=excluded.updated_at,
-			last_client_id=excluded.last_client_id
-		WHERE excluded.updated_at >= rooms.updated_at`,
+	_, err = tx.ExecContext(ctx, upsertRoomQuery(driver),
 		room.WebRID, safeText(room.ActualRoomID, 64), safeText(room.Title, 500), safeText(room.StreamerName, 200), safeText(room.MonitorStatus, 40), safeText(room.ConnectionStatus, 40), safeText(room.LiveStatus, 40), safeText(room.LiveStatusSource, 80), room.LiveStartedAt, room.LastSeenLiveAt, room.LastCheckedAt, room.LastRedPacketCheckedAt, room.LastEventAt, seedLiveSessionCount, room.WebRID, room.UpdatedAt, clientID)
-	if err != nil || !stateAccepted || strings.ToLower(strings.TrimSpace(room.LiveStatus)) != "live" {
+	if err != nil || strings.ToLower(strings.TrimSpace(room.LiveStatus)) != "live" {
 		return err == nil, err
 	}
 	newSession := false
 	startedAt := strings.TrimSpace(room.LiveStartedAt)
 	if startedAt != "" {
-		result, insertErr := tx.ExecContext(ctx, `INSERT OR IGNORE INTO room_live_sessions(web_rid, session_key, first_seen_at) VALUES(?, ?, ?)`, room.WebRID, "started:"+startedAt, room.UpdatedAt)
+		result, insertErr := tx.ExecContext(ctx, insertLiveSessionQuery(driver), room.WebRID, "started:"+startedAt, room.UpdatedAt)
 		if insertErr != nil {
 			return false, insertErr
 		}
@@ -457,27 +308,27 @@ func upsertRoom(ctx context.Context, tx *sql.Tx, clientID string, room syncproto
 	return true, nil
 }
 
-func appendChangeTx(ctx context.Context, tx *sql.Tx, itemType syncprotocol.ItemType, entityKey, clientID, changedAt string, payload any) error {
+func appendChangeTx(ctx context.Context, tx *sql.Tx, driver string, itemType syncprotocol.ItemType, entityKey, clientID, changedAt string, payload any) error {
 	content, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}
 	var previous string
-	err = tx.QueryRowContext(ctx, `SELECT payload_json FROM sync_changes WHERE item_type = ? AND entity_key = ? ORDER BY seq DESC LIMIT 1`, itemType, entityKey).Scan(&previous)
+	err = tx.QueryRowContext(ctx, previousChangeQuery(driver), itemType, entityKey).Scan(&previous)
 	if err == nil && previous == string(content) {
 		return nil
 	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO sync_changes(item_type, entity_key, origin_client_id, changed_at, payload_json)
-		VALUES(?, ?, ?, ?, ?)
-		ON CONFLICT(item_type, entity_key) DO UPDATE SET
-			seq=excluded.seq,
-			origin_client_id=excluded.origin_client_id,
-			changed_at=excluded.changed_at,
-			payload_json=excluded.payload_json`, itemType, entityKey, clientID, changedAt, string(content))
+	if driver == StorageMySQL {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM sync_changes WHERE item_type = ? AND entity_key = ?`, itemType, entityKey); err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO sync_changes(item_type, entity_key, origin_client_id, changed_at, payload_json) VALUES(?, ?, ?, ?, ?)`, itemType, entityKey, clientID, changedAt, string(content))
+		return err
+	}
+	_, err = tx.ExecContext(ctx, appendChangeSQLiteQuery(), itemType, entityKey, clientID, changedAt, string(content))
 	return err
 }
 
@@ -511,7 +362,7 @@ func readRedPacketTx(ctx context.Context, tx *sql.Tx, webRID, packetID string) (
 	return packet, err
 }
 
-func upsertRedPacket(ctx context.Context, tx *sql.Tx, clientID string, packet syncprotocol.RedPacket, seenAt string) (bool, error) {
+func upsertRedPacket(ctx context.Context, tx *sql.Tx, driver, clientID string, packet syncprotocol.RedPacket, seenAt string) (bool, error) {
 	packet.WebRID = strings.TrimSpace(packet.WebRID)
 	packet.PacketID = strings.TrimSpace(packet.PacketID)
 	if packet.WebRID == "" || packet.PacketID == "" || len(packet.WebRID) > 32 || len(packet.PacketID) > 256 {
@@ -524,30 +375,7 @@ func upsertRedPacket(ctx context.Context, tx *sql.Tx, clientID string, packet sy
 	if err != nil || excluded {
 		return false, err
 	}
-	_, err = tx.ExecContext(ctx, `
-		INSERT INTO red_packet_events(web_rid, packet_id, actual_room_id, join_box_id, anchor_id, box_type, send_time, delay_time, room_name, streamer_name, title, prize, participation_condition, source, detected_at, draw_at, expires_at, participant_count, total_diamonds, share_count, last_seen_at, last_client_id)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(web_rid, packet_id) DO UPDATE SET
-			actual_room_id=COALESCE(NULLIF(excluded.actual_room_id, ''), red_packet_events.actual_room_id),
-			join_box_id=COALESCE(NULLIF(excluded.join_box_id, ''), red_packet_events.join_box_id),
-			anchor_id=COALESCE(NULLIF(excluded.anchor_id, ''), red_packet_events.anchor_id),
-			box_type=COALESCE(NULLIF(excluded.box_type, ''), red_packet_events.box_type),
-			send_time=COALESCE(NULLIF(excluded.send_time, ''), red_packet_events.send_time),
-			delay_time=COALESCE(NULLIF(excluded.delay_time, ''), red_packet_events.delay_time),
-			room_name=COALESCE(NULLIF(excluded.room_name, ''), red_packet_events.room_name),
-			streamer_name=COALESCE(NULLIF(excluded.streamer_name, ''), red_packet_events.streamer_name),
-			title=COALESCE(NULLIF(excluded.title, ''), red_packet_events.title),
-			prize=COALESCE(NULLIF(excluded.prize, ''), red_packet_events.prize),
-			participation_condition=COALESCE(NULLIF(excluded.participation_condition, ''), red_packet_events.participation_condition),
-			source=COALESCE(NULLIF(excluded.source, ''), red_packet_events.source),
-			detected_at=MIN(red_packet_events.detected_at, excluded.detected_at),
-			draw_at=COALESCE(NULLIF(excluded.draw_at, ''), red_packet_events.draw_at),
-			expires_at=COALESCE(NULLIF(excluded.expires_at, ''), red_packet_events.expires_at),
-			participant_count=MAX(red_packet_events.participant_count, excluded.participant_count),
-			total_diamonds=MAX(red_packet_events.total_diamonds, excluded.total_diamonds),
-			share_count=MAX(red_packet_events.share_count, excluded.share_count),
-			last_seen_at=excluded.last_seen_at,
-			last_client_id=excluded.last_client_id`,
+	_, err = tx.ExecContext(ctx, upsertRedPacketQuery(driver),
 		packet.WebRID, packet.PacketID,
 		safeNumericText(packet.ActualRoomID, 32), safeNumericText(packet.JoinBoxID, 32), safeNumericText(packet.AnchorID, 32),
 		safeNumericText(packet.BoxType, 16), safeNumericText(packet.SendTime, 32), safeNumericText(packet.DelayTime, 32),
@@ -618,16 +446,7 @@ func (s *Store) ExcludeCenterRooms(ctx context.Context, clientID string, items [
 		if _, err := time.Parse(time.RFC3339Nano, item.ExcludedAt); err != nil {
 			return errors.New("中心库排除时间无效")
 		}
-		if _, err := tx.ExecContext(ctx, `
-			INSERT INTO room_exclusions(web_rid, actual_room_id, name, streamer_name, reason, excluded_at, excluded_by_client_id)
-			VALUES(?, ?, ?, ?, ?, ?, ?)
-			ON CONFLICT(web_rid) DO UPDATE SET
-				actual_room_id=COALESCE(NULLIF(excluded.actual_room_id, ''), room_exclusions.actual_room_id),
-				name=COALESCE(NULLIF(excluded.name, ''), room_exclusions.name),
-				streamer_name=COALESCE(NULLIF(excluded.streamer_name, ''), room_exclusions.streamer_name),
-				reason=COALESCE(NULLIF(excluded.reason, ''), room_exclusions.reason),
-				excluded_at=MAX(room_exclusions.excluded_at, excluded.excluded_at),
-				excluded_by_client_id=excluded.excluded_by_client_id`,
+		if _, err := tx.ExecContext(ctx, upsertRoomExclusionQuery(s.driver),
 			item.WebRID, safeNumericText(item.ActualRoomID, 32), safeText(item.Name, 500), safeText(item.StreamerName, 200), safeText(item.Reason, 500), item.ExcludedAt, clientID); err != nil {
 			return err
 		}
@@ -637,12 +456,7 @@ func (s *Store) ExcludeCenterRooms(ctx context.Context, clientID string, items [
 		if _, err := tx.ExecContext(ctx, `DELETE FROM red_packet_events WHERE web_rid = ? OR (? <> '' AND actual_room_id = ?)`, item.WebRID, item.ActualRoomID, item.ActualRoomID); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM sync_changes
-			WHERE (item_type = ? AND entity_key = ?)
-			   OR (item_type = ? AND (
-				json_extract(payload_json, '$.web_rid') = ?
-				OR (? <> '' AND json_extract(payload_json, '$.actual_room_id') = ?)
-			))`, syncprotocol.ItemRoomState, item.WebRID, syncprotocol.ItemRedPacket,
+		if _, err := tx.ExecContext(ctx, deleteRoomChangesQuery(s.driver), syncprotocol.ItemRoomState, item.WebRID, syncprotocol.ItemRedPacket,
 			item.WebRID, item.ActualRoomID, item.ActualRoomID); err != nil {
 			return err
 		}
@@ -794,7 +608,7 @@ func (s *Store) backfillChanges(ctx context.Context) error {
 	}
 	defer tx.Rollback()
 	for _, item := range seeds {
-		if err := appendChangeTx(ctx, tx, item.itemType, item.entityKey, item.clientID, item.at, item.payload); err != nil {
+		if err := appendChangeTx(ctx, tx, s.driver, item.itemType, item.entityKey, item.clientID, item.at, item.payload); err != nil {
 			return err
 		}
 	}
@@ -841,7 +655,7 @@ func (s *Store) refreshRoomMetricChanges(ctx context.Context) error {
 	defer tx.Rollback()
 	changedAt := s.now().UTC().Format(time.RFC3339Nano)
 	for _, change := range changes {
-		if err := appendChangeTx(ctx, tx, syncprotocol.ItemRoomState, change.room.WebRID, centerServerOriginClientID, changedAt, change.room); err != nil {
+		if err := appendChangeTx(ctx, tx, s.driver, syncprotocol.ItemRoomState, change.room.WebRID, centerServerOriginClientID, changedAt, change.room); err != nil {
 			return err
 		}
 	}

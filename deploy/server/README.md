@@ -10,7 +10,21 @@
 curl -fsSL https://raw.githubusercontent.com/ccvar/fubao-v2-releases/main/install-sync-server.sh | sudo sh
 ```
 
-安装器会安装服务端、官方 Caddy 软件包、systemd 单元和 `fbv2.ccvar.com` 反向代理。安装前需要把域名 A/AAAA 记录指向服务器，并开放 TCP 80、443、8087。标准 HTTPS 入口不可用时，客户端会通过健康检查自动降级到 HTTPS 8087 入口。
+安装器会询问存储类型：
+
+- `SQLite`：默认选项，免配置，适合单机和中小规模部署。
+- `MySQL`：先检测本机 MySQL/MariaDB 服务。未安装时可由安装器通过系统软件源自动安装，并自动创建 `fubao_sync` 数据库和权限受限的服务账号；已经安装时只需按提示提供 MySQL 管理账号和密码，安装器会验证连接并创建服务专用账号。已有服务重复执行安装命令时会沿用原存储类型，不会自动切库。
+
+随后安装器会安装服务端、官方 Caddy 软件包、systemd 单元和 `fbv2.ccvar.com` 反向代理。安装前需要把域名 A/AAAA 记录指向服务器，并开放 TCP 80、443、8087。标准 HTTPS 入口不可用时，客户端会通过健康检查自动降级到 HTTPS 8087 入口。
+
+无交互环境可显式选择存储；`FUBAO_SYNC_STORAGE` 支持 `sqlite` 或 `mysql`：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ccvar/fubao-v2-releases/main/install-sync-server.sh \
+  | sudo env FUBAO_SYNC_STORAGE=mysql FUBAO_SYNC_MYSQL_AUTO_INSTALL=1 sh
+```
+
+连接已有 MySQL 时可通过 `FUBAO_SYNC_MYSQL_ADMIN_USER` 和 `FUBAO_SYNC_MYSQL_ADMIN_PASSWORD` 提供管理凭据，也可预先提供具有建库权限的 `FUBAO_SYNC_MYSQL_USER`、`FUBAO_SYNC_MYSQL_PASSWORD`。为避免密码进入 shell 历史，日常安装优先使用交互提示。
 
 安装完成后终端会输出一次客户端注册令牌。客户端 Go 数据目录中的 `remote_sync.json` 使用以下结构：
 
@@ -36,7 +50,7 @@ curl -fsSL https://raw.githubusercontent.com/ccvar/fubao-v2-releases/main/instal
 curl -fsSL https://raw.githubusercontent.com/ccvar/fubao-v2-releases/main/install-sync-server.sh | sudo sh
 ```
 
-升级器会通过 SQLite 在线备份在 `/var/lib/fubao-sync/backups/` 创建升级前快照、保留现有数据库与注册令牌，原子替换二进制后明确重启 systemd 服务。新版本需要的数据库表会在首次启动时自动迁移，无需手工导入。
+升级器会按当前存储类型在 `/var/lib/fubao-sync/backups/` 创建升级前快照：SQLite 使用在线 `.backup`，MySQL 使用事务一致的压缩 SQL 备份。安装器保留现有数据库、存储选择与注册令牌，原子替换二进制后明确重启 systemd 服务。新版本需要的数据库表会在首次启动时自动迁移，无需手工导入。
 
 升级后确认版本和服务状态：
 
@@ -54,7 +68,7 @@ curl https://fbv2.ccvar.com/healthz
 curl https://fbv2.ccvar.com:8087/healthz
 ```
 
-SQLite 数据库位于 `/var/lib/fubao-sync/fubao-sync.db`，Caddy 配置片段位于 `/etc/caddy/conf.d/fbv2.caddy`。
+存储选择保存在 `/etc/fubao-sync/database.env`。SQLite 数据库位于 `/var/lib/fubao-sync/fubao-sync.db`；MySQL 密码单独保存在仅 root 与 `fubao-sync` 组可读的 `/etc/fubao-sync/mysql.password`，不会出现在 systemd 命令行和服务日志中。Caddy 配置片段位于 `/etc/caddy/conf.d/fbv2.caddy`。
 
 查看同步概况：
 
@@ -76,4 +90,6 @@ sqlite3 -header -column /var/lib/fubao-sync/fubao-sync.db \
   "SELECT web_rid, packet_id, title, prize, detected_at, expires_at FROM red_packet_events ORDER BY detected_at DESC LIMIT 30;"
 ```
 
-明细数据库只允许在服务器本机读取。不要把 SQLite 文件、设备令牌或注册令牌放到公开下载目录。
+MySQL 模式可使用安装时创建的服务账号在服务器本机查询；连接参数见 `/etc/fubao-sync/database.env`，密码见权限受限的 `/etc/fubao-sync/mysql.password`。不要把密码拼进公开脚本或命令历史。
+
+明细数据库只允许在服务器本机读取。不要把 SQLite 文件、MySQL 备份/密码、设备令牌或注册令牌放到公开下载目录。
